@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+
+# Private machine-specific development workspace
+/.local/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*.log
+
+# Sensitive local configuration and generated data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.sqlite-shm
+*.sqlite-wal
+
+# Never commit local captures or runtime data
+/local-data/
+/session-dumps/
+/session-exports/
+/agent-logs/
+
+# Rust app Cargo.lock is deliberately tracked.
