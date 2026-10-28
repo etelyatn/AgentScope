@@ -29,7 +29,15 @@ A web dashboard, multi-device hub, cloud sync, MCP server, agent control, Hermes
 
 See [Product requirements](docs/PRODUCT.md), [Architecture](docs/ARCHITECTURE.md), and [Contributing](CONTRIBUTING.md).
 
-The executable currently prints an under-development notice and exits. A library component reads bounded JSONL records from a caller-supplied buffered source, reporting malformed, oversized, and incomplete lines with byte offsets. It retains partial lines for subsequent reads, but does not discover sessions, interpret provider records, or detect truncation or rotation. Monitoring, usage accounting, and the TUI are not implemented. Use a stable Rust toolchain with `rustfmt` and `clippy`:
+The experimental `inspect` command reads an explicitly supplied Codex JSONL file and displays session IDs and supported user and assistant response text:
+
+```bash
+cargo run -- inspect path/to/session.jsonl
+```
+
+The command escapes terminal controls and applies best-effort masking of common credential patterns; it cannot identify every secret. Output can contain sensitive session content. It reports malformed, incomplete, or over-1-MiB records with byte offsets. It currently ignores tool calls, images, event-only messages, and unsupported formats; provider format compatibility has only been tested with synthetic records. It does not discover sessions, refresh an open file, or detect truncation or rotation. Monitoring, usage accounting, and the TUI are not implemented.
+
+Use a stable Rust toolchain with `rustfmt` and `clippy`:
 
 ```bash
 cargo run

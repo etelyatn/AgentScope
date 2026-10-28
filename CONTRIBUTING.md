@@ -17,7 +17,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The GitHub Actions workflow runs these checks on a Linux runner for pushes and pull requests. Its presence is not a claim of a passing CI run. Include a short verification summary with any PR. `cargo run` currently prints an under-development notice and exits.
+The GitHub Actions workflow runs these checks on a Linux runner for pushes and pull requests. Its presence is not a claim of a passing CI run. Include a short verification summary with any PR. `cargo run -- inspect <jsonl-file>` exercises the experimental reader; use synthetic data for testing.
 
 ## Pull requests
 
