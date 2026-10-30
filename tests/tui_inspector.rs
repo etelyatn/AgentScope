@@ -996,3 +996,20 @@ fn escape_returns_to_the_roster() {
     let out = draw(&app, 110, 30);
     assert!(out.contains("AgentScope"), "{out}");
 }
+
+#[test]
+fn opencode_shaped_activity_counts_surface_arrivals_before_the_baseline() {
+    // OpenCode publishes a message-activity total, not displayed rows: 10
+    // messages here expand to 20 loaded events.
+    let mut app = app_with(summary(10));
+    open(&mut app, forward_page(0..20, true));
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected a baseline CountAfter, got {requests:?}");
+    };
+    // Three messages arrive before the baseline count executes.
+    app.apply_roster(vec![summary(13)], vec![]);
+    assert!(app.apply_events_after(*request_id, 83));
+    assert_eq!(app.new_event_count(), 3, "not 0 and not 1");
+    assert!(draw(&app, 110, 30).contains("3 new"));
+}

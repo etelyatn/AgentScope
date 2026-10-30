@@ -314,6 +314,7 @@ struct Row {
     tokens: TokenCategories,
     cost: Option<f64>,
     idle_outcome: Option<String>,
+    activity: usize,
 }
 
 struct Pass {
@@ -723,7 +724,11 @@ impl OpenCodeScanner {
             last_persisted_at: Some(row.updated.max(row.message_updated.unwrap_or(i64::MIN))),
             last_completion: evidence.last_completion,
             unfinished_work: evidence.unfinished,
-            displayed_event_count: 0,
+            // Provider activity count (messages for v2, legacy messages for the
+            // legacy schema), not exact displayed rows: OpenCode rows expand into
+            // a different number of events. It is monotonic across appends and
+            // feeds only the `N new` arrival delta.
+            displayed_event_count: row.activity,
             hidden_records: 0,
             source_available: true,
             archived: row.archived.is_some(),
@@ -894,7 +899,8 @@ fn read_page(
             substr(s.version, 1, {VERSION_CHARS}), \
             s.time_created, s.time_updated, s.time_archived, \
             (SELECT max(m.time_updated) FROM {m} m WHERE m.session_id = s.id), \
-            {usage_cols}, {idle_col} \
+            {usage_cols}, {idle_col}, \
+            (SELECT count(*) FROM {m} c WHERE c.session_id = s.id) \
          FROM {t} s {project_join} \
          WHERE {eligible} AND (s.time_updated < ?1 OR (s.time_updated = ?1 AND s.id < ?2)) \
          ORDER BY s.time_updated DESC, s.id DESC LIMIT ?3",
@@ -938,6 +944,7 @@ fn read_page(
             },
             cost: float(r.get_ref(19).map_err(map_error)?),
             idle_outcome: lossy(r.get_ref(20).map_err(map_error)?),
+            activity: usize::try_from(r.get::<_, i64>(21).map_err(map_error)?).unwrap_or(0),
         };
         bytes = bytes.saturating_add(row_bytes(&row));
         rows.push(row);

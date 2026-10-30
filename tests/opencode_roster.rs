@@ -378,6 +378,30 @@ fn in_place_message_update_advances_last_persisted_at() {
 }
 
 #[test]
+fn displayed_event_count_is_a_monotonic_message_activity_count() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    let writer = create_v2(&db);
+    insert_session(&writer, &Session::new("s", 100, 200));
+    insert_message(&writer, "m0", "s", 110, 120);
+    let mut scanner = scanner_for(&db);
+    let first = scan(&mut scanner, BIG);
+    assert_eq!(first.sessions["s"].displayed_event_count, 1);
+
+    // Appends advance the count even though OpenCode rows expand to a different
+    // number of transcript events: it is an activity count, not displayed rows.
+    let mut last = 1;
+    for (i, id) in ["m1", "m2", "m3"].into_iter().enumerate() {
+        insert_message(&writer, id, "s", 130 + i as i64, 140 + i as i64);
+        let next = scan(&mut scanner, BIG);
+        let count = next.sessions["s"].displayed_event_count;
+        assert!(count > last, "{count} should exceed {last}");
+        last = count;
+    }
+    assert_eq!(last, 4);
+}
+
+#[test]
 fn roster_pages_within_budget_and_honours_session_cap() {
     let dir = tmp();
     let db = dir.path().join("opencode.db");
