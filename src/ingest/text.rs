@@ -7,7 +7,7 @@
 use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::domain::BoundedText;
 
@@ -146,7 +146,7 @@ static BEARER: LazyLock<Regex> =
 static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"(?i)(\b[\w-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)["']?\s*[:=]\s*)"#,
-        r#"("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;"'=(){}\[\]<>&$|]\S*)"#,
+        r#"("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s,;"'=(){}\[\]<>&$|][^\s,;"'&|]*)"#,
     ))
     .expect("valid regex")
 });
@@ -182,14 +182,29 @@ pub fn display_safe(input: &str) -> String {
 pub fn preview(input: &str, max_bytes: usize, max_cols: usize) -> BoundedText {
     let safe = display_safe(input);
     let mut end = 0usize;
-    let mut cols = 0usize;
+    let mut base = 0usize; // columns consumed before the current line segment
+    let mut seg_start = 0usize;
     for (i, c) in safe.char_indices() {
-        let w = if c == '\n' { 1 } else { c.width().unwrap_or(0) };
-        if i + c.len_utf8() > max_bytes || cols + w > max_cols {
+        let next = i + c.len_utf8();
+        if next > max_bytes {
             break;
         }
-        cols += w;
-        end = i + c.len_utf8();
+        // Width of a sequence (e.g. heart + VS16) is not the sum of its chars,
+        // so measure the retained line segment as a string after each char.
+        let seg_cols = safe[seg_start..i].width();
+        let total = if c == '\n' {
+            base + seg_cols + 1
+        } else {
+            base + safe[seg_start..next].width()
+        };
+        if total > max_cols {
+            break;
+        }
+        if c == '\n' {
+            base = total;
+            seg_start = next;
+        }
+        end = next;
     }
     BoundedText {
         truncated: end < safe.len(),

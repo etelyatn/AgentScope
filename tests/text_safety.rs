@@ -185,3 +185,31 @@ fn preview_debug_is_content_free() {
     let dbg = format!("{p:?}");
     assert!(!dbg.contains("SENTINEL"), "{dbg}");
 }
+
+#[test]
+fn escaped_quotes_do_not_end_a_quoted_credential() {
+    let out = redact(r#"{"password":"ab\"SECRET_SUFFIX"} {'token': 'x\'TAIL'}"#);
+    assert!(!out.contains("SECRET_SUFFIX"), "{out}");
+    assert!(!out.contains("TAIL"), "{out}");
+}
+
+#[test]
+fn exempt_call_does_not_swallow_later_assignments() {
+    let out = redact(r#"token=compute();password="hunter2""#);
+    assert!(out.contains("compute()"), "{out}");
+    assert!(!out.contains("hunter2"), "{out}");
+    let out = redact("token=compute() password=hunter2");
+    assert!(!out.contains("hunter2"), "{out}");
+}
+
+#[test]
+fn preview_uses_sequence_aware_width() {
+    // U+2764 (width 1) + VS16 renders as width 2.
+    let p = preview("\u{2764}\u{fe0f}x", 100, 1);
+    assert!(!p.preview.contains('\u{fe0f}'), "{:?}", p.preview);
+    assert!(p.truncated);
+    let p = preview("\u{2764}\u{fe0f}x", 100, 2);
+    assert_eq!(p.preview, "\u{2764}\u{fe0f}");
+    let p = preview("ab\ncd", 100, 3);
+    assert_eq!(p.preview, "ab\n");
+}
