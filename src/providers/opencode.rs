@@ -21,9 +21,11 @@ use crate::domain::{
     Actor, BoundedText, DiagnosticEntry, Event, EventKind, Lifecycle, Lineage, LocatorKind,
     ModelDetail, PageAnchor, PageDirection, PageRequest, ProcessAssociation, Provenance, Provider,
     RefreshBudget, ScanProgress, SessionKey, SessionLink, SessionSummary, SourceKey, SourceLocator,
-    Timestamp, ToolInteraction, ToolStatus, TranscriptPage, Warning, WarningKey, WarningKind,
+    Timestamp, TokenCategories, ToolInteraction, ToolStatus, TranscriptPage, Warning, WarningKey,
+    WarningKind,
 };
 use crate::ingest::text::{display_safe, preview};
+use crate::usage::{DerivedUsage, OpenCodeDerivation, opencode_summary};
 
 const TITLE_BYTES: usize = 1024;
 const TITLE_COLS: usize = 80;
@@ -54,6 +56,13 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "time_created",
             "time_updated",
             "time_archived",
+            "tokens_input",
+            "tokens_output",
+            "tokens_reasoning",
+            "tokens_cache_read",
+            "tokens_cache_write",
+            "cost",
+            "idle_outcome",
         ],
     ),
     (
@@ -84,7 +93,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     (
         "message",
-        &["id", "session_id", "time_created", "time_updated"],
+        &["id", "session_id", "time_created", "time_updated", "data"],
     ),
     (
         "part",
@@ -94,6 +103,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "session_id",
             "time_created",
             "time_updated",
+            "data",
         ],
     ),
     // Only the table-existence count used to force the WAL/shm handshake on open.
@@ -230,9 +240,23 @@ pub fn detect_schema(conn: &Connection) -> Result<Schema, ProviderError> {
     })
 }
 
+/// Optional columns/tables whose presence is probed once per connection.
+#[derive(Clone, Copy, Default)]
+struct Shape {
+    project: bool,
+    /// `session_v2` token and cost columns.
+    usage: bool,
+    /// `session_v2.idle_outcome`.
+    idle: bool,
+}
+
+#[derive(Clone, Copy)]
 struct Tables {
     session: &'static str,
     message: &'static str,
+    /// Table `transcript_page` reads: `session_message` (v2) or `part` (legacy).
+    transcript: &'static str,
+    legacy: bool,
     /// `session` column expressions that legacy databases lack.
     model: &'static str,
     fork: &'static str,
@@ -244,12 +268,16 @@ impl Tables {
             Schema::V2 => Some(Self {
                 session: "session_v2",
                 message: "session_message",
+                transcript: MESSAGE_TABLE,
+                legacy: false,
                 model: "s.model",
                 fork: "s.fork_session_id",
             }),
             Schema::Legacy => Some(Self {
                 session: "session",
                 message: "message",
+                transcript: "part",
+                legacy: true,
                 model: "NULL",
                 fork: "NULL",
             }),
@@ -273,6 +301,9 @@ struct Row {
     updated: i64,
     archived: Option<i64>,
     message_updated: Option<i64>,
+    tokens: TokenCategories,
+    cost: Option<f64>,
+    idle_outcome: Option<String>,
 }
 
 struct Pass {
@@ -289,9 +320,11 @@ pub struct OpenCodeScanner {
     path: PathBuf,
     connection: Option<Connection>,
     schema: Schema,
-    has_project: bool,
+    shape: Shape,
     pass: Option<Pass>,
     known: HashMap<String, SessionSummary>,
+    /// Per-session lifecycle/usage evidence keyed by the change stamp it was read at.
+    evidence: HashMap<String, ((i64, Option<i64>), Evidence)>,
 }
 
 impl OpenCodeScanner {
@@ -304,9 +337,10 @@ impl OpenCodeScanner {
             path,
             connection: None,
             schema: Schema::Unsupported,
-            has_project: false,
+            shape: Shape::default(),
             pass: None,
             known: HashMap::new(),
+            evidence: HashMap::new(),
         };
         scanner.ensure_open()?;
         Ok(scanner)
@@ -320,7 +354,17 @@ impl OpenCodeScanner {
         conn.busy_timeout(Duration::from_millis(self.config.refresh_busy_timeout_ms))
             .map_err(map_error)?;
         self.schema = detect_schema(&conn)?;
-        self.has_project = shape_present(&conn, "SELECT id, name FROM project LIMIT 0")?;
+        let v2 = self.schema == Schema::V2;
+        self.shape = Shape {
+            project: shape_present(&conn, "SELECT id, name FROM project LIMIT 0")?,
+            usage: v2
+                && shape_present(
+                    &conn,
+                    "SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
+                     tokens_cache_write, cost FROM session_v2 LIMIT 0",
+                )?,
+            idle: v2 && shape_present(&conn, "SELECT idle_outcome FROM session_v2 LIMIT 0")?,
+        };
         self.connection = Some(conn);
         Ok(())
     }
@@ -422,7 +466,7 @@ impl OpenCodeScanner {
             read_page(
                 conn,
                 &tables,
-                self.has_project,
+                self.shape,
                 pass.cursor.as_ref(),
                 limit,
                 &budget,
@@ -434,7 +478,17 @@ impl OpenCodeScanner {
         for row in &rows {
             pass.cursor = Some((row.updated, row.id.clone()));
             pass.seen.insert(row.id.clone());
-            let summary = self.summarize(row, &tables);
+            let stamp = (row.updated, row.message_updated);
+            let evidence = match self.evidence.get(&row.id) {
+                Some((at, cached)) if *at == stamp => cached.clone(),
+                _ => {
+                    let conn = self.connection.as_ref().expect("opened");
+                    let fresh = compute_evidence(conn, &tables, row, self.config.max_record_bytes)?;
+                    self.evidence.insert(row.id.clone(), (stamp, fresh.clone()));
+                    fresh
+                }
+            };
+            let summary = self.summarize(row, &tables, &evidence);
             if self.known.get(&row.id) != Some(&summary) {
                 self.known.insert(row.id.clone(), summary.clone());
                 sessions.push(summary);
@@ -467,8 +521,11 @@ impl OpenCodeScanner {
                             |r| r.get::<_, bool>(0),
                         )
                         .map_err(map_error)?;
-                if !keep && let Some(summary) = self.known.remove(&id) {
-                    removed.push(summary.key);
+                if !keep {
+                    self.evidence.remove(&id);
+                    if let Some(summary) = self.known.remove(&id) {
+                        removed.push(summary.key);
+                    }
                 }
             }
             if pass.oversized > 0 {
@@ -507,13 +564,20 @@ impl OpenCodeScanner {
         })
     }
 
-    fn summarize(&self, row: &Row, tables: &Tables) -> SessionSummary {
+    fn summarize(&self, row: &Row, tables: &Tables, evidence: &Evidence) -> SessionSummary {
         let details: Vec<ModelDetail> = row
             .model
             .as_deref()
             .and_then(model_detail)
             .into_iter()
             .collect();
+        let usage = opencode_summary(
+            details.first().map(|d| d.id.clone()),
+            &row.tokens,
+            row.cost,
+            evidence.derived.as_ref(),
+            &self.config.pricing,
+        );
         let link = |id: &Option<String>, exists: bool| {
             id.as_ref().map(|id| {
                 if exists {
@@ -546,17 +610,17 @@ impl OpenCodeScanner {
             created_at: row.created,
             last_event_at: None,
             last_persisted_at: Some(row.updated.max(row.message_updated.unwrap_or(i64::MIN))),
-            last_completion: None,
-            unfinished_work: false,
+            last_completion: evidence.last_completion,
+            unfinished_work: evidence.unfinished,
             displayed_event_count: 0,
             hidden_records: 0,
             source_available: true,
             archived: row.archived.is_some(),
             context_window: None,
             server_tools: None,
-            lifecycle: Lifecycle::Unknown,
+            lifecycle: evidence.lifecycle,
             process: ProcessAssociation::NotChecked,
-            usage: None,
+            usage,
             lineage: Lineage {
                 parent: link(&row.parent, row.parent_exists),
                 fork: link(&row.fork, row.fork_exists),
@@ -659,7 +723,7 @@ fn row_bytes(row: &Row) -> usize {
 fn read_page(
     conn: &Connection,
     tables: &Tables,
-    has_project: bool,
+    shape: Shape,
     cursor: Option<&(i64, String)>,
     limit: usize,
     budget: &RefreshBudget,
@@ -669,13 +733,25 @@ fn read_page(
         return Ok((Vec::new(), false));
     }
     let deadline = Duration::from_millis(budget.max_millis);
-    let (project_name, project_join) = if has_project {
+    let (project_name, project_join) = if shape.project {
         (
             format!("substr(p.name, 1, {TEXT_CHARS})"),
             "LEFT JOIN project p ON p.id = s.project_id",
         )
     } else {
         ("NULL".to_owned(), "")
+    };
+    let v2 = !tables.legacy;
+    let usage_cols = if shape.usage && v2 {
+        "s.tokens_input, s.tokens_output, s.tokens_reasoning, s.tokens_cache_read, \
+         s.tokens_cache_write, s.cost"
+    } else {
+        "NULL, NULL, NULL, NULL, NULL, NULL"
+    };
+    let idle_col = if shape.idle && v2 {
+        "substr(s.idle_outcome, 1, 64)"
+    } else {
+        "NULL"
     };
     let fork = if tables.fork == "NULL" {
         "NULL".to_owned()
@@ -700,7 +776,8 @@ fn read_page(
             EXISTS(SELECT 1 FROM {t} y WHERE y.id = {fork}), {model}, \
             substr(s.version, 1, {VERSION_CHARS}), \
             s.time_created, s.time_updated, s.time_archived, \
-            (SELECT max(m.time_updated) FROM {m} m WHERE m.session_id = s.id) \
+            (SELECT max(m.time_updated) FROM {m} m WHERE m.session_id = s.id), \
+            {usage_cols}, {idle_col} \
          FROM {t} s {project_join} \
          WHERE {eligible} AND (s.time_updated < ?1 OR (s.time_updated = ?1 AND s.id < ?2)) \
          ORDER BY s.time_updated DESC, s.id DESC LIMIT ?3",
@@ -734,6 +811,16 @@ fn read_page(
             updated: r.get(11).map_err(map_error)?,
             archived: r.get(12).map_err(map_error)?,
             message_updated: r.get(13).map_err(map_error)?,
+            tokens: TokenCategories {
+                input: uint(r.get_ref(14).map_err(map_error)?),
+                output: uint(r.get_ref(15).map_err(map_error)?),
+                reasoning: uint(r.get_ref(16).map_err(map_error)?),
+                cache_read: uint(r.get_ref(17).map_err(map_error)?),
+                cache_write: uint(r.get_ref(18).map_err(map_error)?),
+                ..TokenCategories::default()
+            },
+            cost: float(r.get_ref(19).map_err(map_error)?),
+            idle_outcome: lossy(r.get_ref(20).map_err(map_error)?),
         };
         bytes = bytes.saturating_add(row_bytes(&row));
         rows.push(row);
@@ -766,6 +853,8 @@ struct RawRow {
     ty: String,
     data: Option<String>,
     data_len: Option<i64>,
+    /// Legacy part rows only: the owning message's `role` (empty when unknown).
+    role: Option<String>,
 }
 
 /// The row's change marker. `time_updated` moves whenever the provider rewrites a
@@ -783,44 +872,109 @@ fn lossy(value: rusqlite::types::ValueRef<'_>) -> Option<String> {
     }
 }
 
-/// Streams `session_message` rows of one session in `(time_created, id)` order,
-/// starting at (and including) the anchor's row when given. Keyset comparison on the
+/// What `stream_rows` reads and where it starts.
+struct Scan<'a> {
+    tables: &'a Tables,
+    session: &'a str,
+    record_cap: usize,
+    direction: PageDirection,
+    from: Option<(i64, &'a str)>,
+    /// Legacy only: read `part` rows (with the owning message's role) rather than
+    /// `message` rows.
+    parts: bool,
+    /// v2 only: restrict to `assistant` rows.
+    assistant_only: bool,
+}
+
+/// Streams rows of one session in `(time_created, id)` order, starting at (and
+/// including) the `from` row when given. Keyset comparison on the
 /// `(session_id, time_created, id)` index; no `OFFSET`, no row accumulation: the
 /// callback sees one row at a time and returns `false` to stop.
 fn stream_rows(
     conn: &Connection,
-    session: &str,
-    record_cap: usize,
-    direction: PageDirection,
-    from: Option<(i64, &str)>,
+    scan: Scan<'_>,
     mut each: impl FnMut(RawRow) -> Result<bool, ProviderError>,
 ) -> Result<(), ProviderError> {
-    let (cmp, order) = match direction {
+    let (cmp, order) = match scan.direction {
         PageDirection::Forward => (">=", "ASC"),
         PageDirection::Backward => ("<=", "DESC"),
     };
+    let legacy = scan.tables.legacy;
+    let prefix = if scan.parts { "p." } else { "" };
     // Only static fragments are spliced into the statement; every value is bound.
-    let bound = if from.is_some() {
-        format!(" AND (time_created, id) {cmp} (?4, ?5)")
+    let bound = if scan.from.is_some() {
+        format!(" AND ({prefix}time_created, {prefix}id) {cmp} (?4, ?5)")
     } else {
         String::new()
     };
-    let sql = format!(
-        "SELECT id, time_created, time_updated, substr(type, 1, {TYPE_CHARS}), \
-         CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, length(CAST(data AS BLOB)) \
-         FROM {MESSAGE_TABLE} \
-         WHERE session_id = ?1 AND length(id) <= ?3{bound} \
-         ORDER BY time_created {order}, id {order}"
-    );
-    let cap = i64::try_from(record_cap).unwrap_or(i64::MAX);
+    let sql = if scan.parts {
+        format!(
+            "SELECT p.id, p.time_created, p.time_updated, NULL, \
+             CASE WHEN length(CAST(p.data AS BLOB)) <= ?2 THEN p.data END, \
+             length(CAST(p.data AS BLOB)), \
+             CASE WHEN length(p.message_id) <= {ID_MAX} THEN p.message_id END, \
+             CASE WHEN length(CAST(m.data AS BLOB)) <= ?2 THEN m.data END \
+             FROM part p LEFT JOIN message m ON m.id = p.message_id \
+             WHERE p.session_id = ?1 AND length(p.id) <= ?3{bound} \
+             ORDER BY p.time_created {order}, p.id {order}"
+        )
+    } else {
+        let ty = if legacy {
+            "NULL".to_owned()
+        } else {
+            format!("substr(type, 1, {TYPE_CHARS})")
+        };
+        let only = if scan.assistant_only && !legacy {
+            " AND type = 'assistant'"
+        } else {
+            ""
+        };
+        format!(
+            "SELECT id, time_created, time_updated, {ty}, \
+             CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, \
+             length(CAST(data AS BLOB)), NULL, NULL \
+             FROM {table} \
+             WHERE session_id = ?1 AND length(id) <= ?3{only}{bound} \
+             ORDER BY time_created {order}, id {order}",
+            table = scan.tables.message
+        )
+    };
+    let cap = i64::try_from(scan.record_cap).unwrap_or(i64::MAX);
     let max_id = i64::try_from(ID_MAX).unwrap_or(i64::MAX);
     let mut statement = conn.prepare(&sql).map_err(map_error)?;
-    let mut rows = match from {
-        Some((created, id)) => statement.query(params![session, cap, max_id, created, id]),
-        None => statement.query(params![session, cap, max_id]),
+    let mut rows = match scan.from {
+        Some((created, id)) => statement.query(params![scan.session, cap, max_id, created, id]),
+        None => statement.query(params![scan.session, cap, max_id]),
     }
     .map_err(map_error)?;
+    // Consecutive parts share a message; resolve its role once.
+    let mut last_role: Option<(String, String)> = None;
     while let Some(row) = rows.next().map_err(map_error)? {
+        let role = if scan.parts {
+            let message_id: Option<String> = row.get(6).map_err(map_error)?;
+            let cached = message_id
+                .as_ref()
+                .and_then(|id| last_role.as_ref().filter(|(last, _)| last == id))
+                .map(|(_, role)| role.clone());
+            Some(match cached {
+                Some(role) => role,
+                None => {
+                    let role: String = row
+                        .get_ref(7)
+                        .map_err(map_error)
+                        .map(lossy)?
+                        .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+                        .and_then(|v| str_field(&v, "role").map(|r| r.chars().take(32).collect()))
+                        .unwrap_or_default();
+                    if let Some(id) = message_id {
+                        last_role = Some((id, role.clone()));
+                    }
+                    role
+                }
+            })
+        } else {
+            None
+        };
         let raw = RawRow {
             id: row.get(0).map_err(map_error)?,
             created: row.get(1).map_err(map_error)?,
@@ -832,12 +986,202 @@ fn stream_rows(
                 .unwrap_or_default(),
             data: row.get_ref(4).map_err(map_error).map(lossy)?,
             data_len: row.get(5).map_err(map_error)?,
+            role,
         };
         if !each(raw)? {
             break;
         }
     }
     Ok(())
+}
+
+fn uint(value: rusqlite::types::ValueRef<'_>) -> Option<u64> {
+    match value {
+        rusqlite::types::ValueRef::Integer(i) => u64::try_from(i).ok(),
+        rusqlite::types::ValueRef::Real(f)
+            if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f < 1.0e19 =>
+        {
+            Some(f as u64)
+        }
+        _ => None,
+    }
+}
+
+/// A finite, non-negative number; a reported `0` is kept.
+fn float(value: rusqlite::types::ValueRef<'_>) -> Option<f64> {
+    match value {
+        rusqlite::types::ValueRef::Integer(i) if i >= 0 => Some(i as f64),
+        rusqlite::types::ValueRef::Real(f) if f.is_finite() && f >= 0.0 => Some(f),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle and derived usage evidence.
+// ---------------------------------------------------------------------------
+
+/// Rows examined (newest first) while looking for the latest completed turn.
+const LIFECYCLE_ROWS: usize = 256;
+/// Assistant rows read when deriving usage from messages.
+const DERIVE_ROWS: usize = 100_000;
+
+#[derive(Clone, Debug, PartialEq)]
+struct Evidence {
+    lifecycle: Lifecycle,
+    last_completion: Option<Timestamp>,
+    unfinished: bool,
+    derived: Option<DerivedUsage>,
+}
+
+enum Turn {
+    Complete(Timestamp),
+    Open,
+    Other,
+}
+
+fn row_value(row: &RawRow) -> Option<Value> {
+    row.data
+        .as_deref()
+        .and_then(|d| serde_json::from_str::<Value>(d).ok())
+}
+
+/// v2 rows carry `type`; legacy message rows carry `role` in their data.
+fn row_kind<'a>(row: &'a RawRow, value: Option<&'a Value>) -> Option<&'a str> {
+    if row.ty.is_empty() {
+        value.and_then(|v| str_field(v, "role"))
+    } else {
+        Some(row.ty.as_str())
+    }
+}
+
+/// Turn evidence of one message. A user prompt or `finish: tool-calls` opens
+/// work; `finish: stop` or an `idle` row (outcome absent or `succeeded`) completes
+/// a turn. `unknown`/`length`/null finishes, other idle outcomes, and tool errors
+/// are neutral: never a session failure.
+fn classify(row: &RawRow) -> Turn {
+    let value = row_value(row);
+    let text = |name: &str| {
+        value
+            .as_ref()
+            .and_then(|v| str_field(v, name))
+            .filter(|s| !s.is_empty())
+    };
+    match row_kind(row, value.as_ref()) {
+        Some("user") => Turn::Open,
+        Some("idle") => match text("outcome") {
+            None | Some("succeeded") => Turn::Complete(row.created),
+            Some(_) => Turn::Other,
+        },
+        Some("assistant") => match text("finish") {
+            Some("stop") => Turn::Complete(
+                value
+                    .as_ref()
+                    .and_then(|v| v.get("time")?.get("completed")?.as_i64())
+                    .unwrap_or(row.updated),
+            ),
+            Some("tool-calls") => Turn::Open,
+            _ => Turn::Other,
+        },
+        _ => Turn::Other,
+    }
+}
+
+/// `tokens` of an assistant message: `input`, `output`, `reasoning`, `cache.read`,
+/// `cache.write`. Absent categories stay `None`.
+fn message_tokens(value: &Value) -> TokenCategories {
+    let tokens = value.get("tokens");
+    let field = |v: Option<&Value>, name: &str| v?.get(name)?.as_u64();
+    let cache = tokens.and_then(|t| t.get("cache"));
+    TokenCategories {
+        input: field(tokens, "input"),
+        output: field(tokens, "output"),
+        reasoning: field(tokens, "reasoning"),
+        cache_read: field(cache, "read"),
+        cache_write: field(cache, "write"),
+        ..TokenCategories::default()
+    }
+}
+
+fn has_session_totals(row: &Row) -> bool {
+    let t = &row.tokens;
+    [t.input, t.output, t.reasoning, t.cache_read, t.cache_write]
+        .iter()
+        .any(Option::is_some)
+}
+
+fn compute_evidence(
+    conn: &Connection,
+    tables: &Tables,
+    row: &Row,
+    record_cap: usize,
+) -> Result<Evidence, ProviderError> {
+    let scan = |direction, assistant_only| Scan {
+        tables,
+        session: &row.id,
+        record_cap,
+        direction,
+        from: None,
+        parts: false,
+        assistant_only,
+    };
+    let mut open = false;
+    let mut completion = None;
+    let mut seen = 0usize;
+    stream_rows(conn, scan(PageDirection::Backward, false), |r| {
+        seen += 1;
+        match classify(&r) {
+            Turn::Complete(at) => {
+                completion = Some(at);
+                return Ok(false);
+            }
+            Turn::Open => open = true,
+            Turn::Other => {}
+        }
+        Ok(seen < LIFECYCLE_ROWS)
+    })?;
+    let mut lifecycle = if open {
+        Lifecycle::Ongoing
+    } else if completion.is_some() {
+        Lifecycle::Completed
+    } else {
+        Lifecycle::Unknown
+    };
+    // The session-level outcome has no timestamp; it only fills in when no message
+    // row says anything about the latest turn.
+    if lifecycle == Lifecycle::Unknown && row.idle_outcome.as_deref() == Some("succeeded") {
+        lifecycle = Lifecycle::Completed;
+    }
+
+    let derived = if has_session_totals(row) && row.cost.is_some() {
+        None
+    } else {
+        let mut derivation = OpenCodeDerivation::new();
+        let mut rows = 0usize;
+        stream_rows(conn, scan(PageDirection::Forward, true), |r| {
+            let value = row_value(&r);
+            if row_kind(&r, value.as_ref()) == Some("assistant") {
+                rows += 1;
+                let tokens = value.as_ref().map(message_tokens);
+                let cost = value
+                    .as_ref()
+                    .and_then(|v| v.get("cost")?.as_f64())
+                    .filter(|c| c.is_finite() && *c >= 0.0);
+                derivation.add(&r.id, tokens.as_ref(), cost);
+            }
+            if rows >= DERIVE_ROWS {
+                derivation.mark_truncated();
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Some(derivation.finish())
+    };
+    Ok(Evidence {
+        lifecycle,
+        last_completion: completion,
+        unfinished: open,
+        derived,
+    })
 }
 
 enum Mapped {
@@ -848,6 +1192,8 @@ enum Mapped {
 /// Maps rows to events and diagnostics. `cap` bounds every preview.
 struct Mapper<'a> {
     key: &'a SessionKey,
+    /// Table named by locators: `session_message` (v2) or `part` (legacy).
+    table: &'a str,
     version: Option<&'a str>,
     cap: usize,
 }
@@ -885,7 +1231,7 @@ impl Mapper<'_> {
             session: self.key.clone(),
             generation: Some(generation(row)),
             kind: LocatorKind::DbRow {
-                table: MESSAGE_TABLE.to_owned(),
+                table: self.table.to_owned(),
                 row_id: row.id.clone(),
                 part_index: Some(part),
             },
@@ -961,6 +1307,9 @@ impl Mapper<'_> {
         let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(data) else {
             return vec![self.diag(row, 0, "malformed record")];
         };
+        if let Some(role) = &row.role {
+            return self.map_legacy(row, role, &value);
+        }
         let ty = row.ty.as_str();
         let one = |kind, actor, text: Option<String>| {
             self.event(row, 0, ty.to_owned(), kind, actor, text, None)
@@ -1039,6 +1388,102 @@ impl Mapper<'_> {
             items.push(self.diag(row, 0, "source-only record (nothing to display)"));
         }
         items
+    }
+
+    /// Legacy `part` row: `type` lives in the data, `role` comes from the message.
+    fn map_legacy(&self, row: &RawRow, role: &str, value: &Value) -> Vec<(usize, Mapped)> {
+        let ty = str_field(value, "type").unwrap_or_default();
+        let record_type = format!("part/{ty}");
+        let text = str_field(value, "text").filter(|t| !t.is_empty());
+        let one = |kind, actor, text: Option<String>| {
+            vec![self.event(row, 0, record_type.clone(), kind, actor, text, None)]
+        };
+        let nothing = || vec![self.diag(row, 0, "source-only record (nothing to display)")];
+        match ty {
+            "text" => match (text, role) {
+                (Some(t), "user") => one(EventKind::UserPrompt, Actor::User, Some(t.to_owned())),
+                (Some(t), "assistant") => one(
+                    EventKind::AssistantMessage,
+                    Actor::Assistant,
+                    Some(t.to_owned()),
+                ),
+                (Some(t), _) => one(EventKind::System, Actor::System, Some(t.to_owned())),
+                (None, _) => nothing(),
+            },
+            "reasoning" => match text {
+                Some(t) => one(EventKind::Reasoning, Actor::Assistant, Some(t.to_owned())),
+                None => nothing(),
+            },
+            "compaction" => one(
+                EventKind::Compaction,
+                Actor::System,
+                Some("Context compacted".to_owned()),
+            ),
+            "tool" => vec![self.legacy_tool(row, value)],
+            "file" | "patch" | "agent" | "subtask" => {
+                let mut rest = value.clone();
+                if let Value::Object(map) = &mut rest {
+                    map.remove("type");
+                }
+                one(
+                    EventKind::System,
+                    Actor::System,
+                    Some(format!("{ty}: {rest}")),
+                )
+            }
+            "step-start" | "step-finish" | "snapshot" | "retry" => {
+                vec![self.diag(row, 0, "step marker")]
+            }
+            _ => vec![self.diag(row, 0, "unknown part type")],
+        }
+    }
+
+    fn legacy_tool(&self, row: &RawRow, item: &Value) -> (usize, Mapped) {
+        let locator = self.locator(row, 0);
+        let null = Value::Null;
+        let state = item.get("state").unwrap_or(&null);
+        let status = match str_field(state, "status") {
+            Some("completed") => ToolStatus::Completed,
+            Some("error") => ToolStatus::Error,
+            _ => ToolStatus::Unknown,
+        };
+        let time = state.get("time").unwrap_or(&null);
+        let stamp = |name: &str| time.get(name).and_then(Value::as_i64);
+        let metadata = state.get("metadata").unwrap_or(&null);
+        let exit_code = ["exit", "exitCode", "exit_code"]
+            .iter()
+            .find_map(|k| metadata.get(*k).and_then(Value::as_i64))
+            .and_then(|n| i32::try_from(n).ok());
+        let name = str_field(item, "tool")
+            .filter(|n| !n.is_empty())
+            .unwrap_or("tool");
+        let tool = ToolInteraction {
+            name: preview(name, self.cap, self.cap).preview,
+            call_id: str_field(item, "callID").map(str::to_owned),
+            input: state
+                .get("input")
+                .and_then(value_text)
+                .map(|t| self.bounded(&t, &locator)),
+            output: state
+                .get("output")
+                .or_else(|| state.get("error"))
+                .and_then(content_text)
+                .map(|t| self.bounded(&t, &locator)),
+            status,
+            exit_code,
+            started_at: stamp("start"),
+            completed_at: stamp("end"),
+            orphan: false,
+        };
+        self.event(
+            row,
+            0,
+            "part/tool".to_owned(),
+            EventKind::Tool,
+            Actor::Tool,
+            None,
+            Some(tool),
+        )
     }
 
     fn assistant_part(&self, row: &RawRow, part: usize, item: &Value) -> Option<(usize, Mapped)> {
@@ -1224,12 +1669,11 @@ impl OpenCodeScanner {
         result
     }
 
-    /// Validates a session key and that the transcript generation is readable.
-    fn check_session(&self, conn: &Connection, key: &SessionKey) -> Result<(), ProviderError> {
-        let Some(tables) = Tables::for_schema(self.schema).filter(|_| self.schema == Schema::V2)
-        else {
+    /// Validates a session key and that this schema has a readable transcript.
+    fn check_session(&self, conn: &Connection, key: &SessionKey) -> Result<Tables, ProviderError> {
+        let Some(tables) = Tables::for_schema(self.schema) else {
             return Err(ProviderError::Unsupported(
-                "OpenCode transcripts need the session_v2 generation".into(),
+                "unsupported OpenCode database schema".into(),
             ));
         };
         let valid = key.provider == Provider::OpenCode
@@ -1240,7 +1684,7 @@ impl OpenCodeScanner {
         }
         let exists: i64 = conn
             .query_row(
-                "SELECT count(*) FROM session_v2 WHERE id = ?1",
+                &format!("SELECT count(*) FROM {} WHERE id = ?1", tables.session),
                 params![key.provider_session_id],
                 |r| r.get(0),
             )
@@ -1250,7 +1694,7 @@ impl OpenCodeScanner {
                 "unknown OpenCode session".into(),
             ));
         }
-        Ok(())
+        Ok(tables)
     }
 
     fn version_of(&self, key: &SessionKey) -> Option<&str> {
@@ -1267,11 +1711,12 @@ impl OpenCodeScanner {
         direction: PageDirection,
         request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
-        self.check_session(conn, key)?;
+        let tables = self.check_session(conn, key)?;
         let at = anchor.map(anchor_parts).transpose()?;
         let record_cap = self.config.max_record_bytes;
         let mapper = Mapper {
             key,
+            table: tables.transcript,
             version: self.version_of(key),
             cap: (request.max_bytes / 4).clamp(1, PREVIEW_CAP),
         };
@@ -1288,10 +1733,15 @@ impl OpenCodeScanner {
         let mut has_more = false;
         stream_rows(
             conn,
-            &key.provider_session_id,
-            record_cap,
-            direction,
-            at.as_ref().map(|(created, id, _)| (*created, id.as_str())),
+            Scan {
+                tables: &tables,
+                session: &key.provider_session_id,
+                record_cap,
+                direction,
+                from: at.as_ref().map(|(created, id, _)| (*created, id.as_str())),
+                parts: tables.legacy,
+                assistant_only: false,
+            },
             |row| {
                 let mut items = mapper.map_row(&row, record_cap);
                 if !forward {
@@ -1371,21 +1821,27 @@ impl OpenCodeScanner {
         key: &SessionKey,
         anchor: &PageAnchor,
     ) -> Result<usize, ProviderError> {
-        self.check_session(conn, key)?;
+        let tables = self.check_session(conn, key)?;
         let (created, at_id, at_part) = anchor_parts(anchor)?;
         let record_cap = self.config.max_record_bytes;
         let mapper = Mapper {
             key,
+            table: tables.transcript,
             version: None,
             cap: 1,
         };
         let mut count = 0usize;
         stream_rows(
             conn,
-            &key.provider_session_id,
-            record_cap,
-            PageDirection::Forward,
-            Some((created, at_id.as_str())),
+            Scan {
+                tables: &tables,
+                session: &key.provider_session_id,
+                record_cap,
+                direction: PageDirection::Forward,
+                from: Some((created, at_id.as_str())),
+                parts: tables.legacy,
+                assistant_only: false,
+            },
             |row| {
                 let same = row.created == created && row.id == at_id;
                 count += mapper
@@ -1416,26 +1872,30 @@ impl OpenCodeScanner {
                 "not an OpenCode row locator".into(),
             ));
         };
-        if table != MESSAGE_TABLE {
+        let tables = self.check_session(conn, &locator.session)?;
+        if table != tables.transcript {
             return Err(ProviderError::Unsupported(
                 "locator names a table outside the OpenCode allowlist".into(),
             ));
         }
-        self.check_session(conn, &locator.session)?;
         let session = &locator.session.provider_session_id;
         let record_cap = self.config.max_record_bytes;
         let cap = i64::try_from(record_cap).unwrap_or(i64::MAX);
+        let ty = if tables.legacy {
+            "NULL".to_owned()
+        } else {
+            format!("substr(type, 1, {TYPE_CHARS})")
+        };
         let found = conn
             .query_row(
-                "SELECT session_id, time_created, time_updated, substr(type, 1, ?3), \
-                 CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, length(CAST(data AS BLOB)) \
-                 FROM session_message WHERE id = ?1 AND length(id) <= ?4",
-                params![
-                    row_id,
-                    cap,
-                    i64::try_from(TYPE_CHARS).unwrap_or(0),
-                    i64::try_from(ID_MAX).unwrap_or(i64::MAX)
-                ],
+                &format!(
+                    "SELECT session_id, time_created, time_updated, {ty}, \
+                     CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, \
+                     length(CAST(data AS BLOB)) \
+                     FROM {table} WHERE id = ?1 AND length(id) <= ?3",
+                    table = tables.transcript
+                ),
+                params![row_id, cap, i64::try_from(ID_MAX).unwrap_or(i64::MAX)],
                 |r| {
                     let ty = lossy(r.get_ref(3)?).unwrap_or_default();
                     let data = lossy(r.get_ref(4)?);
@@ -1448,6 +1908,8 @@ impl OpenCodeScanner {
                             ty,
                             data,
                             data_len: r.get(5)?,
+                            // Only the part's own data is shown; the role is not needed.
+                            role: tables.legacy.then(String::new),
                         },
                     ))
                 },
@@ -1474,6 +1936,7 @@ impl OpenCodeScanner {
         }
         let mapper = Mapper {
             key: &locator.session,
+            table: tables.transcript,
             version: None,
             cap: 1,
         };

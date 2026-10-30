@@ -168,6 +168,173 @@ pub fn opencode_total(input: &TokenCategories) -> Option<u64> {
         .checked_add(cache_write_total(input)?)
 }
 
+/// Usage derived from unique OpenCode assistant messages. Only used when the
+/// session row reports no totals; never added to reported totals.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct DerivedUsage {
+    /// Sums over the messages that reported each category (`None` when none did).
+    pub categories: TokenCategories,
+    /// Number of unique assistant messages counted.
+    pub messages: usize,
+    /// Sum of message-reported costs, only when every message reported one.
+    pub cost: Option<f64>,
+    /// False when any message lacked data or the scan hit its row cap.
+    pub complete: bool,
+}
+
+/// Accumulates assistant messages by exact id so a repeated id counts once.
+pub(crate) struct OpenCodeDerivation {
+    seen: HashSet<String>,
+    sums: [Option<u64>; 5],
+    missing: [bool; 5],
+    cost: f64,
+    cost_missing: bool,
+    complete: bool,
+}
+
+impl OpenCodeDerivation {
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            sums: [None; 5],
+            missing: [false; 5],
+            cost: 0.0,
+            cost_missing: false,
+            complete: true,
+        }
+    }
+
+    /// Counts one assistant message. `tokens` is `None` when the record was
+    /// unreadable (oversized or malformed). Repeated ids are ignored.
+    pub(crate) fn add(&mut self, id: &str, tokens: Option<&TokenCategories>, cost: Option<f64>) {
+        if !self.seen.insert(id.to_owned()) {
+            return;
+        }
+        let Some(t) = tokens else {
+            self.missing = [true; 5];
+            self.cost_missing = true;
+            self.complete = false;
+            return;
+        };
+        let values = [t.input, t.output, t.reasoning, t.cache_read, t.cache_write];
+        for (i, value) in values.into_iter().enumerate() {
+            match value {
+                Some(v) => self.sums[i] = Some(self.sums[i].unwrap_or(0).saturating_add(v)),
+                None => self.missing[i] = true,
+            }
+        }
+        match cost {
+            Some(c) => self.cost += c,
+            None => self.cost_missing = true,
+        }
+    }
+
+    /// The scan stopped before the last message.
+    pub(crate) fn mark_truncated(&mut self) {
+        self.complete = false;
+    }
+
+    pub(crate) fn finish(self) -> DerivedUsage {
+        let pick = |i: usize| self.sums[i];
+        let complete = self.complete && !self.missing.iter().any(|m| *m);
+        let messages = self.seen.len();
+        DerivedUsage {
+            categories: TokenCategories {
+                input: pick(0),
+                output: pick(1),
+                reasoning: pick(2),
+                cache_read: pick(3),
+                cache_write: pick(4),
+                ..TokenCategories::default()
+            },
+            messages,
+            cost: (messages > 0 && !self.cost_missing && complete).then_some(self.cost),
+            complete,
+        }
+    }
+}
+
+fn has_all_categories(c: &TokenCategories) -> bool {
+    [c.input, c.output, c.reasoning, c.cache_read, c.cache_write]
+        .iter()
+        .all(Option::is_some)
+}
+
+fn any_category(c: &TokenCategories) -> bool {
+    [c.input, c.output, c.reasoning, c.cache_read, c.cache_write]
+        .iter()
+        .any(Option::is_some)
+}
+
+/// OpenCode session usage. Session columns are authoritative (`Reported`);
+/// message-derived totals are used only when every token column is absent and are
+/// labeled `Derived` (`Partial` when incomplete). Reported cost, including `0`, wins
+/// over everything; otherwise message-reported costs, else a configured price.
+pub(crate) fn opencode_summary(
+    model: Option<String>,
+    session: &TokenCategories,
+    session_cost: Option<f64>,
+    derived: Option<&DerivedUsage>,
+    prices: &PriceSchedule,
+) -> Option<UsageSummary> {
+    let derived = derived.filter(|d| d.messages > 0);
+    let (categories, class) = if any_category(session) {
+        let class = if has_all_categories(session) {
+            AggregationClass::Reported
+        } else {
+            AggregationClass::Partial
+        };
+        (session.clone(), class)
+    } else if let Some(d) = derived.filter(|d| any_category(&d.categories)) {
+        let class = if d.complete && has_all_categories(&d.categories) {
+            AggregationClass::Derived
+        } else {
+            AggregationClass::Partial
+        };
+        (d.categories.clone(), class)
+    } else if session_cost.is_some() || derived.is_some_and(|d| d.cost.is_some()) {
+        (TokenCategories::default(), AggregationClass::Unknown)
+    } else {
+        return None;
+    };
+    // A partial sum is not a total.
+    let total = match class {
+        AggregationClass::Reported | AggregationClass::Derived => opencode_total(&categories),
+        _ => None,
+    };
+    let cost = if let Some(usd) = session_cost {
+        CostEstimate {
+            usd: Some(usd),
+            class: AggregationClass::Reported,
+            as_of: None,
+            note: None,
+        }
+    } else if let Some(usd) = derived.and_then(|d| d.cost) {
+        CostEstimate {
+            usd: Some(usd),
+            class: AggregationClass::Derived,
+            as_of: None,
+            note: Some("sum of unique message-reported costs".into()),
+        }
+    } else if !matches!(
+        class,
+        AggregationClass::Reported | AggregationClass::Derived
+    ) {
+        unknown("token data incomplete")
+    } else if let Some(model) = &model {
+        estimate_cost(Provider::OpenCode, model, &categories, prices)
+    } else {
+        unknown("no model recorded")
+    };
+    Some(UsageSummary {
+        model,
+        categories,
+        total,
+        class,
+        cost,
+    })
+}
+
 /// Cache-write tokens: the single total, else the sum of the TTL split.
 fn cache_write_total(u: &TokenCategories) -> Option<u64> {
     match (u.cache_write, u.cache_write_5m, u.cache_write_1h) {

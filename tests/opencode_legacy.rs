@@ -1,0 +1,323 @@
+mod support;
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use agentscope::domain::{
+    Actor, AggregationClass, EventKind, Lifecycle, LocatorKind, PageDirection, PageRequest,
+    Provider, RefreshBudget, SessionKey, SessionSummary, SourceKey, ToolStatus, Warning,
+    WarningKind,
+};
+use agentscope::providers::opencode::OpenCodeScanner;
+use agentscope::providers::{ProviderError, ProviderReader};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+use support::NOW;
+use support::opencode::*;
+
+const BIG: RefreshBudget = RefreshBudget {
+    max_records: 100_000,
+    max_bytes: 100_000_000,
+    max_millis: 60_000,
+};
+
+const ALL: PageRequest = PageRequest {
+    max_events: 10_000,
+    max_bytes: 10_000_000,
+};
+
+fn scan(scanner: &mut OpenCodeScanner) -> (HashMap<String, SessionSummary>, Vec<Warning>) {
+    let mut sessions = HashMap::new();
+    let mut warnings = Vec::new();
+    loop {
+        let delta = scanner.scan_roster(NOW, BIG).expect("scan");
+        for s in delta.sessions {
+            sessions.insert(s.key.provider_session_id.clone(), s);
+        }
+        warnings.extend(delta.warnings);
+        if delta.scan.done {
+            return (sessions, warnings);
+        }
+    }
+}
+
+fn scanner_for(db: &Path) -> OpenCodeScanner {
+    OpenCodeScanner::new(&config_for_db(db)).expect("scanner")
+}
+
+fn legacy_key(id: &str) -> SessionKey {
+    SessionKey {
+        provider: Provider::OpenCode,
+        provider_session_id: id.to_owned(),
+        source: SourceKey::DbRow {
+            table: "session".into(),
+            id: id.to_owned(),
+        },
+    }
+}
+
+fn message(conn: &Connection, session: &str, id: &str, at: i64, data: Value) {
+    conn.execute(
+        "INSERT INTO message(id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?3, ?4)",
+        params![id, session, at, data.to_string()],
+    )
+    .expect("insert message");
+}
+
+fn part(conn: &Connection, session: &str, message: &str, id: &str, at: i64, data: Value) {
+    conn.execute(
+        "INSERT INTO part(id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        params![id, message, session, at, data.to_string()],
+    )
+    .expect("insert part");
+}
+
+fn legacy_conversation(conn: &Connection) {
+    insert_legacy_session(conn, &Session::new("old", 10, 100));
+    message(conn, "old", "m1", 10, json!({"role": "user"}));
+    part(
+        conn,
+        "old",
+        "m1",
+        "p1",
+        10,
+        json!({"type": "text", "text": "fix it"}),
+    );
+    message(
+        conn,
+        "old",
+        "m2",
+        20,
+        json!({"role": "assistant", "finish": "stop", "cost": 0.5,
+               "tokens": {"input": 10, "output": 4, "reasoning": 1,
+                          "cache": {"read": 2, "write": 3}}}),
+    );
+    part(conn, "old", "m2", "p2", 20, json!({"type": "step-start"}));
+    part(
+        conn,
+        "old",
+        "m2",
+        "p3",
+        21,
+        json!({"type": "reasoning", "text": "hmm"}),
+    );
+    part(
+        conn,
+        "old",
+        "m2",
+        "p4",
+        22,
+        json!({"type": "tool", "callID": "c1", "tool": "bash",
+               "state": {"status": "completed", "input": {"cmd": "ls"}, "output": "a.rs",
+                         "metadata": {"exit": 0}, "time": {"start": 22, "end": 23}}}),
+    );
+    part(
+        conn,
+        "old",
+        "m2",
+        "p5",
+        24,
+        json!({"type": "text", "text": "done"}),
+    );
+}
+
+#[test]
+fn legacy_schema_falls_back_when_v2_is_absent_or_empty() {
+    // Absent: legacy tables only.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let only = dir.path().join("only.db");
+    {
+        let conn = create_legacy(&only);
+        legacy_conversation(&conn);
+    }
+    let mut scanner = scanner_for(&only);
+    let (sessions, warnings) = scan(&mut scanner);
+    let old = &sessions["old"];
+    assert!(warnings.is_empty(), "no v2 shape means no fallback warning");
+    assert!(old.models.is_empty(), "legacy model JSON stays unset");
+    assert_eq!(old.lifecycle, Lifecycle::Completed);
+    assert_eq!(old.last_completion, Some(20));
+    let usage = old.usage.as_ref().expect("derived usage");
+    assert_eq!(usage.class, AggregationClass::Derived);
+    assert_eq!(usage.total, Some(20));
+    assert_eq!(usage.cost.usd, Some(0.5));
+    assert_eq!(usage.cost.class, AggregationClass::Derived);
+
+    let page = scanner
+        .transcript_page(&legacy_key("old"), None, PageDirection::Forward, ALL)
+        .expect("legacy page");
+    let rows: Vec<_> = page
+        .events
+        .iter()
+        .map(|e| (e.id.as_str(), e.kind, e.actor))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("p1#0", EventKind::UserPrompt, Actor::User),
+            ("p3#0", EventKind::Reasoning, Actor::Assistant),
+            ("p4#0", EventKind::Tool, Actor::Tool),
+            ("p5#0", EventKind::AssistantMessage, Actor::Assistant),
+        ]
+    );
+    assert_eq!(page.diagnostics.len(), 1, "the step marker stays reachable");
+    let tool = page.events[2].tool.as_ref().expect("tool");
+    assert_eq!(tool.name, "bash");
+    assert_eq!(tool.call_id.as_deref(), Some("c1"));
+    assert_eq!(tool.status, ToolStatus::Completed);
+    assert_eq!(tool.exit_code, Some(0));
+    assert_eq!(
+        tool.output.as_ref().map(|o| o.preview.as_str()),
+        Some("a.rs")
+    );
+    assert_eq!((tool.started_at, tool.completed_at), (Some(22), Some(23)));
+
+    // Paging by anchor never repeats or skips.
+    let mut seen = Vec::new();
+    let mut anchor = None;
+    loop {
+        let p = scanner
+            .transcript_page(
+                &legacy_key("old"),
+                anchor.clone(),
+                PageDirection::Forward,
+                PageRequest {
+                    max_events: 1,
+                    max_bytes: 10_000,
+                },
+            )
+            .expect("page");
+        seen.extend(p.events.iter().map(|e| e.id.clone()));
+        if !p.has_more {
+            break;
+        }
+        anchor = p.next;
+    }
+    assert_eq!(seen, ["p1#0", "p3#0", "p4#0", "p5#0"]);
+
+    // The locator addresses the exact part row.
+    let locator = page.events[2].provenance.locator.clone();
+    assert!(matches!(
+        &locator.kind,
+        LocatorKind::DbRow { table, row_id, .. } if table == "part" && row_id == "p4"
+    ));
+    let record = scanner.source_record(&locator).expect("record");
+    assert!(record.raw.contains("\"callID\""));
+    assert!(record.unavailable.is_none());
+
+    // Empty v2 tables with legacy rows: legacy wins, with a warning.
+    let both = dir.path().join("both.db");
+    {
+        let conn = create(&both, &format!("{V2_SCHEMA}{}", legacy_tables_only()));
+        legacy_conversation(&conn);
+    }
+    let (sessions, warnings) = scan(&mut scanner_for(&both));
+    assert!(sessions.contains_key("old"));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.key.kind == WarningKind::Unsupported && w.message.contains("legacy"))
+    );
+}
+
+/// Legacy tables without the ones `V2_SCHEMA` already defines (`project`, `account`).
+fn legacy_tables_only() -> &'static str {
+    "
+CREATE TABLE session(
+    id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, title TEXT, directory TEXT,
+    version TEXT, share_url TEXT, time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL, time_archived INTEGER);
+CREATE TABLE message(
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT);
+CREATE TABLE part(
+    id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT);
+"
+}
+
+#[test]
+fn populated_v2_is_never_mixed_with_legacy_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("mixed.db");
+    {
+        let conn = create(&db, &format!("{V2_SCHEMA}{}", legacy_tables_only()));
+        legacy_conversation(&conn);
+        let mut v2 = Session::new("new", 5, 500);
+        v2.tokens = Some([1, 1, 1, 1, 1]);
+        insert_session(&conn, &v2);
+        insert_message(&conn, "m-new", "new", 6, 6);
+    }
+    let mut scanner = scanner_for(&db);
+    let (sessions, warnings) = scan(&mut scanner);
+    assert!(sessions.contains_key("new"));
+    assert!(
+        !sessions.contains_key("old"),
+        "legacy rows stay out of a v2 roster"
+    );
+    assert!(warnings.is_empty());
+    let err = scanner
+        .transcript_page(&legacy_key("old"), None, PageDirection::Forward, ALL)
+        .expect_err("legacy key is not valid against v2");
+    assert!(matches!(err, ProviderError::Unsupported(_)));
+}
+
+#[test]
+fn legacy_lifecycle_and_usage_follow_message_finish_and_tokens() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = create_legacy(&db);
+        insert_legacy_session(&conn, &Session::new("busy", 1, 50));
+        message(&conn, "busy", "b1", 10, json!({"role": "user"}));
+        message(
+            &conn,
+            "busy",
+            "b2",
+            20,
+            json!({"role": "assistant", "finish": "tool-calls", "tokens": {"input": 1}}),
+        );
+        insert_legacy_session(&conn, &Session::new("bare", 1, 40));
+        message(&conn, "bare", "c1", 10, json!({"role": "user"}));
+    }
+    let (sessions, _) = scan(&mut scanner_for(&db));
+    let busy = &sessions["busy"];
+    assert_eq!(busy.lifecycle, Lifecycle::Ongoing);
+    assert!(busy.unfinished_work);
+    let usage = busy.usage.as_ref().expect("usage");
+    assert_eq!(
+        usage.class,
+        AggregationClass::Partial,
+        "missing token categories are never zero"
+    );
+    assert_eq!(usage.total, None);
+    assert!(sessions["bare"].usage.is_none());
+}
+
+#[test]
+fn unsupported_schema_lists_nothing_and_refuses_transcripts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("odd.db");
+    {
+        let conn = create(
+            &db,
+            "CREATE TABLE session(id TEXT); CREATE TABLE message(id TEXT);",
+        );
+        conn.execute("INSERT INTO session VALUES ('x')", [])
+            .expect("insert");
+    }
+    let mut scanner = scanner_for(&db);
+    let (sessions, warnings) = scan(&mut scanner);
+    assert!(sessions.is_empty());
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.key.kind == WarningKind::Unsupported)
+    );
+    let err = scanner
+        .transcript_page(&legacy_key("x"), None, PageDirection::Forward, ALL)
+        .expect_err("unsupported");
+    assert!(matches!(err, ProviderError::Unsupported(_)));
+}

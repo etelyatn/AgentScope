@@ -13,7 +13,8 @@ CREATE TABLE session_v2(
     id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, fork_session_id TEXT,
     title TEXT, directory TEXT, model TEXT, version TEXT, share_url TEXT,
     time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER,
-    idle_outcome TEXT, tokens_input INTEGER, cost REAL);
+    idle_outcome TEXT, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+    tokens_cache_read INTEGER, tokens_cache_write INTEGER, cost REAL);
 CREATE TABLE session_message(
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER,
     time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT);
@@ -75,6 +76,10 @@ pub struct Session<'a> {
     pub created: i64,
     pub updated: i64,
     pub archived: Option<i64>,
+    /// `(input, output, reasoning, cache_read, cache_write)` session totals.
+    pub tokens: Option<[i64; 5]>,
+    pub cost: Option<f64>,
+    pub idle_outcome: Option<&'a str>,
 }
 
 impl<'a> Session<'a> {
@@ -90,6 +95,9 @@ impl<'a> Session<'a> {
             created,
             updated,
             archived: None,
+            tokens: None,
+            cost: None,
+            idle_outcome: None,
         }
     }
 }
@@ -97,11 +105,16 @@ impl<'a> Session<'a> {
 pub fn insert_session(conn: &Connection, s: &Session<'_>) {
     conn.execute(
         "INSERT INTO session_v2(id, project_id, parent_id, fork_session_id, title, directory,
-            model, version, share_url, time_created, time_updated, time_archived)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '2.0.29', 'https://share.invalid/SECRET-SHARE', ?8, ?9, ?10)",
+            model, version, share_url, time_created, time_updated, time_archived,
+            tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+            cost, idle_outcome)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '2.0.29', 'https://share.invalid/SECRET-SHARE', ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             s.id, s.project_id, s.parent_id, s.fork_id, s.title, s.directory, s.model,
-            s.created, s.updated, s.archived
+            s.created, s.updated, s.archived,
+            s.tokens.map(|t| t[0]), s.tokens.map(|t| t[1]), s.tokens.map(|t| t[2]),
+            s.tokens.map(|t| t[3]), s.tokens.map(|t| t[4]), s.cost, s.idle_outcome
         ],
     )
     .expect("insert session");
