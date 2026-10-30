@@ -173,10 +173,10 @@ pub fn render_details(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     };
     let rows = event_rows(event, f.width);
     draw_rows(frame, app, &rows, app.details_scroll(), f.body);
-    let status = if app.redaction_revealed() {
+    let status = if app.revealed_for(&event.provenance.locator) {
         REVEALED_NOTICE
     } else {
-        "Previews are redacted (best-effort); v opens the source record."
+        "Previews are redacted (best-effort); x reloads this record's source unredacted."
     };
     put(
         frame,
@@ -315,10 +315,13 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         frame,
         &f,
         "< Diagnostics: hidden, unknown, and source-only records",
-        if app.redaction_revealed() {
+        if entries
+            .get(app.diagnostics_selected())
+            .is_some_and(|e| app.revealed_for(&e.locator))
+        {
             REVEALED_NOTICE
         } else {
-            "Source records open redacted."
+            "Source records open redacted; x reveals the selected record."
         },
         "j/k move  Enter/v source  Esc back  q quit",
     );

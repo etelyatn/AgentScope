@@ -368,6 +368,7 @@ impl App {
             .as_mut()
             .is_some_and(|t| t.apply_page(request_id, page));
         if applied {
+            self.revalidate_source();
             self.pump_transcript();
             self.probe_transcript();
         }
@@ -452,6 +453,7 @@ impl App {
         }
         let request = transcript.select_request(id);
         self.transcript = Some(transcript);
+        self.revalidate_source();
         self.outbox.push(request);
     }
 

@@ -446,7 +446,7 @@ fn revealed_source_keeps_terminal_sanitization_and_is_bounded() {
         page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
     );
     app.toggle_redaction();
-    assert!(app.open_selected_source());
+    assert_eq!(app.screen, Screen::Source);
     let (id, _) = source_request(&mut app);
     let raw = format!("\u{1b}[31mred{}", "a".repeat(200_000));
     assert!(app.apply_source(id, record(&raw)));
@@ -496,4 +496,118 @@ fn toggling_redaction_after_the_record_left_the_window_does_not_request() {
         "stale locator is not requested"
     );
     assert!(draw(&app).contains("no longer part of the loaded transcript"));
+}
+
+#[test]
+fn x_in_inspector_reloads_the_selected_record_and_reveal_is_scoped_to_it() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(
+            vec![
+                event(0, EventKind::AssistantMessage, "a"),
+                event(1, EventKind::AssistantMessage, "b"),
+            ],
+            vec![],
+        ),
+    );
+    let raw = format!("key {SECRET}");
+    app.toggle_redaction();
+    assert_eq!(app.screen, Screen::Source);
+    let (id, loc) = source_request(&mut app);
+    assert_eq!(loc, locator(0));
+    assert!(app.apply_source(id, record(&raw)));
+    assert!(draw(&app).contains(SECRET));
+    assert!(app.close_overlay());
+    assert!(!app.redaction_revealed());
+
+    // Another selection is never revealed by the earlier x.
+    app.inspector_move(1);
+    assert!(app.open_selected_source());
+    let (id, loc) = source_request(&mut app);
+    assert_eq!(loc, locator(100));
+    assert!(app.apply_source(id, record(&raw)));
+    assert!(!draw(&app).contains(SECRET));
+    assert!(!app.revealed_for(&locator(0)));
+
+    // x in Details and Diagnostics also reloads immediately.
+    app.close_overlay();
+    assert!(app.open_details());
+    app.toggle_redaction();
+    assert_eq!(app.screen, Screen::Source);
+    assert_eq!(source_request(&mut app).1, locator(100));
+    assert!(app.close_overlay());
+    assert_eq!(app.screen, Screen::Details);
+}
+
+#[test]
+fn a_transcript_reload_invalidates_the_open_source_and_stale_responses() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(vec![event(0, EventKind::AssistantMessage, "hello")], vec![]),
+    );
+    assert!(app.open_selected_source());
+    let (pending, _) = source_request(&mut app);
+
+    app.invalidate_transcript(&key());
+    let reload_id = app
+        .take_requests()
+        .iter()
+        .find_map(|r| match r {
+            WorkerRequest::LoadPage { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .unwrap();
+    let mut moved = event(0, EventKind::AssistantMessage, "hello");
+    moved.provenance.locator = locator_for(key(), 0, Some(4));
+    assert!(app.apply_transcript(reload_id, page(vec![moved], vec![])));
+    app.take_requests();
+
+    assert!(!app.apply_source(pending, record("generation 3 content")));
+    let out = draw(&app);
+    assert!(!out.contains("generation 3 content"));
+    assert!(out.contains("no longer part of the loaded transcript"));
+    assert!(matches!(
+        app.source_view().unwrap().state,
+        SourceState::Unavailable(_)
+    ));
+}
+
+#[test]
+fn diagnostics_selection_is_clamped_after_the_list_shrinks() {
+    let mut app = app();
+    open(
+        &mut app,
+        page(
+            vec![event(0, EventKind::AssistantMessage, "hello")],
+            vec![
+                diagnostic(500, "a", false),
+                diagnostic(600, "b", false),
+                diagnostic(700, "c", false),
+            ],
+        ),
+    );
+    assert!(app.open_diagnostics());
+    app.diagnostics_move(2);
+    app.invalidate_transcript(&key());
+    let reload_id = app
+        .take_requests()
+        .iter()
+        .find_map(|r| match r {
+            WorkerRequest::LoadPage { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(app.apply_transcript(
+        reload_id,
+        page(
+            vec![event(0, EventKind::AssistantMessage, "hello")],
+            vec![diagnostic(500, "a", false)],
+        )
+    ));
+    app.take_requests();
+    assert_eq!(app.diagnostics_selected(), 0);
+    assert!(app.open_diagnostic_source());
+    assert_eq!(source_request(&mut app).1, locator(500));
 }

@@ -61,8 +61,8 @@ pub struct SourceView {
 #[derive(Default)]
 pub(super) struct Overlays {
     source: Option<SourceView>,
-    /// Redaction is off for source records. Never persisted.
-    reveal: bool,
+    /// Record whose redaction is off; scoped to that locator, never persisted.
+    reveal: Option<SourceLocator>,
     details_scroll: usize,
     diag_selected: usize,
     /// Largest scroll offset of the last rendered overlay body.
@@ -88,17 +88,23 @@ impl App {
         self.overlays.source.as_ref()
     }
 
-    /// Redaction is currently off (`x`).
+    /// Redaction is off for the open source record.
     pub fn redaction_revealed(&self) -> bool {
-        self.overlays.reveal
+        self.overlays.source.as_ref().is_some_and(|v| v.revealed)
     }
 
     pub fn details_scroll(&self) -> usize {
         self.overlays.details_scroll
     }
 
+    /// The selected diagnostics index, clamped to the current entries; the same
+    /// value is used for display and activation.
     pub fn diagnostics_selected(&self) -> usize {
-        self.overlays.diag_selected
+        let len = self
+            .transcript
+            .as_ref()
+            .map_or(0, |t| t.diagnostics().len());
+        self.overlays.diag_selected.min(len.saturating_sub(1))
     }
 
     /// `d`: details for the selected event.
@@ -134,7 +140,7 @@ impl App {
             .as_ref()
             .map_or(0, |t| t.diagnostics().len());
         let last = len.saturating_sub(1) as isize;
-        let next = (self.overlays.diag_selected as isize)
+        let next = (self.diagnostics_selected() as isize)
             .saturating_add(delta)
             .clamp(0, last);
         self.overlays.diag_selected = next as usize;
@@ -175,11 +181,7 @@ impl App {
 
     /// Enter in the diagnostics overlay: open the selected entry's record.
     pub fn open_diagnostic_source(&mut self) -> bool {
-        let Some(locator) = self.transcript.as_ref().and_then(|t| {
-            t.diagnostics()
-                .get(self.overlays.diag_selected)
-                .map(|d| d.locator.clone())
-        }) else {
+        let Some(locator) = self.selected_diagnostic_locator() else {
             return false;
         };
         self.open_source(locator)
@@ -205,29 +207,54 @@ impl App {
         true
     }
 
-    /// `x`: toggle redaction. An open source record is cleared and requested
-    /// again, so the new form is rebuilt from the source, not from retained
-    /// text. Outside the source overlay the setting applies to the next `v`.
+    /// `x`: toggle redaction for the selected record only. The selection is
+    /// resolved now (open source view, diagnostics entry, or selected event)
+    /// and its source record is reloaded immediately in the new form; nothing
+    /// raw is kept. Reveal is scoped to that locator, so it never carries over
+    /// to another selection.
     pub fn toggle_redaction(&mut self) {
-        if self.transcript.is_none() {
-            return;
-        }
-        self.overlays.reveal = !self.overlays.reveal;
-        if let Some(mut view) = self.overlays.source.take() {
-            if self
+        let Some(locator) = (match self.screen {
+            Screen::Source => self.overlays.source.as_ref().map(|v| v.locator.clone()),
+            Screen::Diagnostics => self.selected_diagnostic_locator(),
+            Screen::Inspector | Screen::Details => self
                 .transcript
                 .as_ref()
-                .is_some_and(|t| t.knows_locator(&view.locator))
-            {
-                self.request_source(view.locator);
-            } else {
-                view.state = SourceState::Unavailable(
-                    "record is no longer part of the loaded transcript".into(),
-                );
-                view.revealed = self.overlays.reveal;
-                self.overlays.source = Some(view);
-            }
+                .and_then(|t| t.selected_event())
+                .map(|e| e.provenance.locator.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        if !self
+            .transcript
+            .as_ref()
+            .is_some_and(|t| t.knows_locator(&locator))
+        {
+            self.revalidate_source();
+            return;
         }
+        self.overlays.reveal = if self.revealed_for(&locator) {
+            None
+        } else {
+            Some(locator.clone())
+        };
+        if self.screen != Screen::Source {
+            self.overlays.source_return = Some(self.screen);
+            self.screen = Screen::Source;
+        }
+        self.request_source(locator);
+    }
+
+    /// Whether redaction is off for exactly this record.
+    pub fn revealed_for(&self, locator: &SourceLocator) -> bool {
+        self.overlays.reveal.as_ref() == Some(locator)
+    }
+
+    fn selected_diagnostic_locator(&self) -> Option<SourceLocator> {
+        let t = self.transcript.as_ref()?;
+        let list = t.diagnostics();
+        list.get(self.overlays.diag_selected.min(list.len().checked_sub(1)?))
+            .map(|d| d.locator.clone())
     }
 
     /// `Esc`/`Backspace` inside an overlay. Returns `false` on the inspector
@@ -236,7 +263,7 @@ impl App {
         match self.screen {
             Screen::Source => {
                 self.overlays.source = None;
-                self.overlays.reveal = false;
+                self.overlays.reveal = None;
                 self.screen = self
                     .overlays
                     .source_return
@@ -255,6 +282,7 @@ impl App {
     /// Accept the worker's source record for the open request. The record is
     /// consumed here; only bounded display text survives.
     pub fn apply_source(&mut self, request_id: u64, record: SourceRecord) -> bool {
+        self.revalidate_source();
         let Some(view) = self
             .overlays
             .source
@@ -292,12 +320,33 @@ impl App {
         }
     }
 
+    /// Drop an open source view whose locator the current transcript no longer
+    /// references: its text is cleared and no pending response can fill it.
+    pub(super) fn revalidate_source(&mut self) {
+        let known = |t: &Option<super::Transcript>, l: &SourceLocator| {
+            t.as_ref().is_some_and(|t| t.knows_locator(l))
+        };
+        if let Some(view) = &mut self.overlays.source
+            && !known(&self.transcript, &view.locator)
+        {
+            view.request_id = 0;
+            view.state = SourceState::Unavailable(
+                "record is no longer part of the loaded transcript".into(),
+            );
+        }
+        let len = self
+            .transcript
+            .as_ref()
+            .map_or(0, |t| t.diagnostics().len());
+        self.overlays.diag_selected = self.overlays.diag_selected.min(len.saturating_sub(1));
+    }
+
     fn request_source(&mut self, locator: SourceLocator) {
         let request_id = self.next_request_id();
         self.overlays.source = Some(SourceView {
+            revealed: self.revealed_for(&locator),
             locator: locator.clone(),
             state: SourceState::Loading,
-            revealed: self.overlays.reveal,
             scroll: 0,
             request_id,
         });
