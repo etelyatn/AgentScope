@@ -60,14 +60,17 @@ struct Chunk {
     diagnostics: Vec<DiagnosticEntry>,
 }
 
-/// A reload in progress: forward pages from the window start, not yet shown.
+/// A reload in progress: backward pages from the newest known end, staged and
+/// not shown until the current selection (and the old window start) is reached.
 struct Reload {
+    /// Staged window in display order; starts as the retained newest event when
+    /// the window does not end at the tail.
     staged: Vec<Event>,
     chunks: Vec<Chunk>,
-    /// Anchor to continue forward from.
+    /// Anchor to continue backward from (`None` = the tail).
     anchor: Option<PageAnchor>,
-    /// The event to keep selected.
-    target: Option<String>,
+    /// Id of the old window's first event; re-reading it refreshes the boundary.
+    boundary: Option<String>,
 }
 
 pub struct Transcript {
@@ -84,9 +87,12 @@ pub struct Transcript {
     /// The last load failed for good; `r` retries it.
     failed: Option<PageKind>,
     expanded: HashSet<String>,
-    /// Events counted after the loaded newest end (`N new`).
+    /// Events counted after the newest observed event (`N new`).
     new_events: usize,
-    /// In-flight count request and how many loaded events follow its anchor.
+    /// Newest-observed boundary: an anchor and how many events were already
+    /// known after it when the newest end was last loaded. Window-independent.
+    mark: Option<(PageAnchor, usize)>,
+    /// In-flight count request and the offset it is relative to.
     count_pending: Option<(u64, usize)>,
     /// Summary at the last probe; a different summary triggers a new count.
     probed: Option<SessionSummary>,
@@ -108,6 +114,7 @@ impl Transcript {
             failed: None,
             expanded: HashSet::new(),
             new_events: 0,
+            mark: None,
             count_pending: None,
             probed,
             loaded: false,
@@ -177,7 +184,6 @@ impl Transcript {
     fn begin(&mut self, request_id: u64, kind: PageKind) {
         self.pending = Some(Pending { request_id, kind });
         self.failed = None;
-        self.count_pending = None;
         if kind != PageKind::Reload {
             self.reload = None;
         }
@@ -191,54 +197,50 @@ impl Transcript {
         }
     }
 
-    /// Request the newest page. A new request supersedes any load in flight.
-    pub(super) fn tail_request(&mut self, request_id: u64) -> WorkerRequest {
-        self.begin(request_id, PageKind::Tail);
+    fn backward_request(&self, request_id: u64, anchor: Option<PageAnchor>) -> WorkerRequest {
         WorkerRequest::LoadPage {
             request_id,
             key: self.key.clone(),
-            anchor: None,
+            anchor,
             direction: PageDirection::Backward,
         }
     }
 
-    /// Re-read from the window start forward, keeping the selected event. The
-    /// window start is retained (it is the anchor event), so the request
-    /// continues from its anchor with nothing skipped or repeated. Returns
-    /// `None` before the first page has arrived.
+    /// Request the newest page. A new request supersedes any load in flight.
+    pub(super) fn tail_request(&mut self, request_id: u64) -> WorkerRequest {
+        self.begin(request_id, PageKind::Tail);
+        self.backward_request(request_id, None)
+    }
+
+    /// Re-read the loaded range after an in-place change, keeping the selected
+    /// event. Pages are read backward from the newest known end (the tail, or
+    /// the window's last event) until both the selection and the old window
+    /// start are re-read, so every event including the boundary is refreshed.
+    /// Returns `None` before the first page has arrived.
     pub(super) fn reload_request(&mut self, request_id: u64) -> Option<WorkerRequest> {
         if !self.loaded {
             return None;
         }
-        let (staged, chunks) = match (&self.older, self.events.first()) {
-            (Some(anchor), Some(first)) => (
-                vec![first.clone()],
+        let (staged, chunks) = match (&self.newer, self.events.last()) {
+            (Some(a), Some(last)) => (
+                vec![last.clone()],
                 vec![Chunk {
                     len: 1,
-                    edge: Edge::First(anchor.clone()),
+                    edge: Edge::Last(a.clone()),
                     diagnostics: Vec::new(),
                 }],
             ),
             _ => (Vec::new(), Vec::new()),
         };
-        let anchor = self.older.clone();
+        let anchor = self.newer.clone();
         self.reload = Some(Reload {
             staged,
             chunks,
             anchor: anchor.clone(),
-            target: self.selected_event().map(|e| e.id.clone()),
+            boundary: self.events.first().map(|e| e.id.clone()),
         });
         self.begin(request_id, PageKind::Reload);
-        Some(self.forward_request(request_id, anchor))
-    }
-
-    fn forward_request(&self, request_id: u64, anchor: Option<PageAnchor>) -> WorkerRequest {
-        WorkerRequest::LoadPage {
-            request_id,
-            key: self.key.clone(),
-            anchor,
-            direction: PageDirection::Forward,
-        }
+        Some(self.backward_request(request_id, anchor))
     }
 
     /// Retry the load that failed for good. `None` when nothing failed or a
@@ -247,14 +249,27 @@ impl Transcript {
         if self.pending.is_some() {
             return None;
         }
-        match self.failed? {
+        let kind = self.failed?;
+        match kind {
             PageKind::Initial => Some(self.select_request(request_id)),
             PageKind::Tail => Some(self.tail_request(request_id)),
             PageKind::Reload => self.reload_request(request_id),
-            PageKind::Older | PageKind::Newer => {
-                // The edge load is re-requested by the next `next_load`.
+            PageKind::Older => {
                 self.failed = None;
-                None
+                let anchor = self.older.clone()?;
+                self.begin(request_id, kind);
+                Some(self.backward_request(request_id, Some(anchor)))
+            }
+            PageKind::Newer => {
+                self.failed = None;
+                let anchor = self.newer.clone()?;
+                self.begin(request_id, kind);
+                Some(WorkerRequest::LoadPage {
+                    request_id,
+                    key: self.key.clone(),
+                    anchor: Some(anchor),
+                    direction: PageDirection::Forward,
+                })
             }
         }
     }
@@ -282,7 +297,7 @@ impl Transcript {
         }
         if let Some(anchor) = self.reload.as_ref().map(|r| r.anchor.clone()) {
             self.begin(request_id, PageKind::Reload);
-            return Some(self.forward_request(request_id, anchor));
+            return Some(self.backward_request(request_id, anchor));
         }
         let (kind, anchor, direction) = if self.selected < NEAR_EDGE && self.older.is_some() {
             (PageKind::Older, self.older.clone(), PageDirection::Backward)
@@ -300,44 +315,31 @@ impl Transcript {
         })
     }
 
-    /// Ask for the number of events after the newest loaded one when `summary`
-    /// differs from the last probe and the window ends at the tail.
+    /// Ask for the number of events after the newest-observed boundary when
+    /// `summary` differs from the last probe. Works while older pages are shown
+    /// and while page loads are in flight: the boundary is independent of the
+    /// window.
     pub(super) fn count_request(
         &mut self,
         request_id: u64,
         summary: &SessionSummary,
     ) -> Option<WorkerRequest> {
         if !self.loaded
-            || self.pending.is_some()
             || self.reload.is_some()
-            || self.newer.is_some()
             || self.count_pending.is_some()
             || self.probed.as_ref() == Some(summary)
         {
             return None;
         }
-        if self.events.is_empty() {
-            // Nothing to anchor a count on: re-read from the start.
-            self.probed = Some(summary.clone());
-            return self.reload_request(request_id);
-        }
-        // Newest chunk with a known anchor, and how many loaded events follow it.
-        let mut start = 0;
-        let mut found = None;
-        for chunk in &self.chunks {
-            if chunk.len > 0 {
-                found = Some((chunk, start));
-            }
-            start += chunk.len;
-        }
-        let (chunk, chunk_start) = found?;
-        let (anchor, loaded_after) = match &chunk.edge {
-            Edge::Last(a) => (a.clone(), 0),
-            Edge::First(a) => (a.clone(), self.events.len() - chunk_start - 1),
-            Edge::Unknown => return None,
-        };
         self.probed = Some(summary.clone());
-        self.count_pending = Some((request_id, loaded_after));
+        let Some((anchor, offset)) = self.mark.clone() else {
+            if self.events.is_empty() && self.pending.is_none() {
+                // Nothing to anchor a count on: re-read from the tail.
+                return self.reload_request(request_id);
+            }
+            return None;
+        };
+        self.count_pending = Some((request_id, offset));
         Some(WorkerRequest::CountAfter {
             request_id,
             key: self.key.clone(),
@@ -348,9 +350,9 @@ impl Transcript {
     /// Apply a count response. Stale responses are ignored.
     pub(super) fn apply_count(&mut self, request_id: u64, count: usize) -> bool {
         match self.count_pending {
-            Some((id, loaded_after)) if id == request_id => {
+            Some((id, offset)) if id == request_id => {
                 self.count_pending = None;
-                self.new_events = count.saturating_sub(loaded_after);
+                self.new_events = count.saturating_sub(offset);
                 true
             }
             _ => false,
@@ -385,11 +387,25 @@ impl Transcript {
         }
     }
 
-    /// The newest end was just (re)loaded: nothing is unread, and any count in
-    /// flight predates it.
+    /// The newest end was just (re)loaded: nothing is unread, any count in
+    /// flight predates it, and the observed boundary moves to the new tail.
     fn newest_refreshed(&mut self) {
         self.new_events = 0;
         self.count_pending = None;
+        let total = self.events.len();
+        let mut start = 0;
+        let mut mark = None;
+        for chunk in &self.chunks {
+            if chunk.len > 0 {
+                match &chunk.edge {
+                    Edge::Last(a) => mark = Some((a.clone(), total - (start + chunk.len))),
+                    Edge::First(a) => mark = Some((a.clone(), total - start - 1)),
+                    Edge::Unknown => {}
+                }
+            }
+            start += chunk.len;
+        }
+        self.mark = mark;
     }
 
     /// Merge a page response. Returns `false` (and changes nothing) when the
@@ -459,37 +475,45 @@ impl Transcript {
         };
         let known: HashSet<&str> = reload.staged.iter().map(|e| e.id.as_str()).collect();
         page.events.retain(|e| !known.contains(e.id.as_str()));
-        reload.chunks.push(Chunk {
-            len: page.events.len(),
-            edge: edge_of(&page, PageDirection::Forward),
-            diagnostics: page.diagnostics,
-        });
-        reload.staged.extend(page.events);
-        let found = reload
-            .target
-            .as_ref()
-            .is_some_and(|t| reload.staged.iter().any(|e| &e.id == t));
-        if continuation.is_some() && !found && reload.staged.len() < MAX_LOADED_EVENTS {
+        reload.chunks.insert(
+            0,
+            Chunk {
+                len: page.events.len(),
+                edge: edge_of(&page, PageDirection::Backward),
+                diagnostics: page.diagnostics,
+            },
+        );
+        reload.staged.splice(0..0, page.events);
+        // The selection may have moved while pages were loading: always chase
+        // the current one.
+        let current = self.selected_event().map(|e| e.id.clone());
+        let has = |id: &Option<String>| {
+            id.as_ref()
+                .is_some_and(|id| reload.staged.iter().any(|e| &e.id == id))
+        };
+        let found_selection = has(&current);
+        let found_boundary = reload.boundary.is_none() || has(&reload.boundary);
+        let capped = reload.staged.len() >= MAX_LOADED_EVENTS;
+        if continuation.is_some() && !(found_selection && found_boundary) && !capped {
             reload.anchor = continuation;
             self.reload = Some(reload);
             return;
         }
-        // The selection is reached (or gone): swap the refreshed window in.
-        let current = self.selected_event().map(|e| e.id.clone());
-        let at = |id: &Option<String>| {
-            id.as_ref()
-                .and_then(|id| reload.staged.iter().position(|e| &e.id == id))
-        };
-        self.selected = at(&current)
-            .or_else(|| at(&reload.target))
+        if continuation.is_some() && !found_selection {
+            // The selection is beyond reach within the window cap: keep what is shown.
+            return;
+        }
+        self.selected = current
+            .and_then(|id| reload.staged.iter().position(|e| e.id == id))
             .unwrap_or(reload.staged.len().saturating_sub(1));
         self.events = reload.staged;
         self.chunks = reload.chunks;
-        self.newer = continuation;
+        self.older = continuation;
         if self.newer.is_none() {
             self.newest_refreshed();
         }
         self.drop_front();
+        self.drop_back();
     }
 
     fn replace(&mut self, page: TranscriptPage, direction: PageDirection) {
