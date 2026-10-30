@@ -361,3 +361,101 @@ fn every_documented_flag_parses_before_the_tty_check() {
         .unwrap();
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires a value"));
 }
+
+fn warning(provider: Provider, msg: &str) -> Warning {
+    Warning {
+        key: WarningKey {
+            provider,
+            source: "s".into(),
+            kind: WarningKind::Io,
+        },
+        message: msg.into(),
+        count: 1,
+    }
+}
+
+fn scan() -> ScanProgress {
+    ScanProgress {
+        provider: Provider::Codex,
+        scanned: 0,
+        total: None,
+        done: true,
+    }
+}
+
+#[test]
+fn startup_notes_merge_with_live_warnings_in_the_banner() {
+    let mut app = populated();
+    app.apply_roster(
+        app.all_rows().iter().map(|r| r.session.clone()).collect(),
+        vec![warning(Provider::Claude, "permission denied")],
+    );
+    let mut c = ctx(false);
+    c.notes = vec![
+        "OpenCode unavailable: no database".into(),
+        "Codex unavailable: bad root".into(),
+    ];
+    let out = text(&draw(&app, &c, 120, 40));
+    assert!(out.contains("OpenCode unavailable"), "{out}");
+    assert!(out.contains("(+2 more)"), "{out}");
+
+    c.notes.clear();
+    let out = text(&draw(&app, &c, 120, 40));
+    assert!(out.contains("Claude: permission denied"), "{out}");
+    assert!(!out.contains("OpenCode unavailable"));
+}
+
+#[test]
+fn respawn_resets_generation_and_stale_state() {
+    let mut app = populated();
+    for generation in 1..=3 {
+        assert!(app.apply_roster_generation(generation, vec![], vec![], scan()));
+    }
+    assert!(!app.apply_roster_generation(1, vec![], vec![], scan()));
+
+    let mut c = ctx(false);
+    c.error = Some("worker thread exited".into());
+    c.notes = vec!["stale".into()];
+    agentscope::ui::reset_for_new_worker(&mut app, &mut c);
+    assert!(c.error.is_none() && c.notes.is_empty() && c.last_refresh.is_none());
+    assert!(app.live);
+    assert!(app.apply_roster_generation(
+        1,
+        vec![],
+        vec![warning(Provider::Codex, "fresh")],
+        scan()
+    ));
+    assert_eq!(app.warnings().len(), 1);
+}
+
+#[test]
+fn lazy_worker_builds_readers_off_the_calling_thread() {
+    use agentscope::config::{CliOverrides, Config};
+    use agentscope::worker::{WorkerEvent, WorkerHandle};
+    let config = Config::load_with_env(
+        &CliOverrides {
+            no_processes: true,
+            ..Default::default()
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = WorkerHandle::spawn_lazy(
+        Box::new(move || {
+            tx.send(std::thread::current().id()).unwrap();
+            Vec::new()
+        }),
+        config,
+    );
+    let built_on = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(built_on, std::thread::current().id());
+    let event = worker.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        event,
+        WorkerEvent::Roster { .. }
+            | WorkerEvent::RefreshFinished { .. }
+            | WorkerEvent::Processes { .. }
+    ));
+    assert!(worker.shutdown());
+}

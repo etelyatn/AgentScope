@@ -297,22 +297,26 @@ fn banner_line(app: &App, ctx: &RosterContext, total: usize) -> Option<String> {
     if total == 0 {
         return None; // The empty state lists every warning.
     }
-    if let Some(note) = ctx.notes.first() {
-        return Some(format!("Warning: {}", display_safe(note)));
-    }
     let warnings = app.warnings();
-    let first = warnings.first()?;
-    let more = warnings.len() - 1;
+    let mut items = ctx
+        .notes
+        .iter()
+        .map(|n| display_safe(n))
+        .chain(warnings.iter().map(|w| {
+            format!(
+                "{}: {}",
+                provider_name(w.key.provider),
+                display_safe(&w.message)
+            )
+        }));
+    let first = items.next()?;
+    let more = items.count();
     let suffix = if more > 0 {
         format!(" (+{more} more)")
     } else {
         String::new()
     };
-    Some(format!(
-        "Warning: {}: {}{suffix}",
-        provider_name(first.key.provider),
-        display_safe(&first.message)
-    ))
+    Some(format!("Warning: {first}{suffix}"))
 }
 
 fn empty_lines(app: &App, ctx: &RosterContext, palette: Palette) -> Vec<Line<'static>> {

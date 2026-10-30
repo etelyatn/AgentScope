@@ -462,3 +462,22 @@ fn stale_generations_are_ignored_and_clock_updates_statuses() {
     assert_ne!(app_status_of(&app, "a"), before);
     assert_eq!(selected_id(&app).as_deref(), Some("a"));
 }
+
+#[test]
+fn reset_generation_accepts_a_restarted_worker() {
+    let scan = ScanProgress {
+        provider: Provider::Codex,
+        scanned: 0,
+        total: None,
+        done: true,
+    };
+    let mut app = app();
+    for g in 1..=4 {
+        assert!(app.apply_roster_generation(g, vec![], vec![], scan));
+    }
+    assert!(!app.apply_roster_generation(1, vec![], vec![], scan));
+    app.reset_generation();
+    assert_eq!(app.generation(), 0);
+    assert!(app.scan().is_none());
+    assert!(app.apply_roster_generation(1, vec![], vec![], scan));
+}

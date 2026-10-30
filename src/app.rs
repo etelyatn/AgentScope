@@ -186,6 +186,13 @@ impl App {
         self.generation
     }
 
+    /// Forget the applied worker generation. Call when the worker is replaced:
+    /// a new worker numbers its publications from 1 again.
+    pub fn reset_generation(&mut self) {
+        self.generation = 0;
+        self.scan = None;
+    }
+
     /// The injected clock value used for status and age display.
     pub fn now(&self) -> Timestamp {
         self.now

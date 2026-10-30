@@ -102,6 +102,9 @@ pub enum WorkerEvent {
 
 type Sampler = Box<dyn FnMut(Timestamp) -> Result<ProcessSnapshot, ProcessError> + Send>;
 
+/// Builds provider readers; runs on the worker thread.
+pub type ReaderFactory = Box<dyn FnOnce() -> Vec<Box<dyn ProviderReader>> + Send>;
+
 pub struct WorkerHandle {
     pub tx: Sender<WorkerRequest>,
     pub rx: Receiver<WorkerEvent>,
@@ -121,13 +124,26 @@ impl WorkerHandle {
         config: Config,
         sampler: Sampler,
     ) -> Self {
+        Self::spawn_inner(Box::new(move || readers), config, sampler)
+    }
+
+    /// Start a worker that builds its readers on the worker thread, so slow
+    /// provider setup (e.g. opening SQLite) never blocks the caller.
+    pub fn spawn_lazy(factory: ReaderFactory, config: Config) -> Self {
+        Self::spawn_inner(factory, config, Box::new(processes::observe_processes))
+    }
+
+    fn spawn_inner(factory: ReaderFactory, config: Config, sampler: Sampler) -> Self {
         let (tx, req_rx) = mpsc::channel();
         let (ev_tx, rx) = mpsc::sync_channel(EVENT_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
-        let worker = Worker::new(readers, config, sampler, req_rx, ev_tx, stop.clone());
+        let worker_stop = stop.clone();
         let join = thread::Builder::new()
             .name("agentscope-worker".into())
-            .spawn(move || worker.run())
+            .spawn(move || {
+                let worker = Worker::new(factory(), config, sampler, req_rx, ev_tx, worker_stop);
+                worker.run()
+            })
             .expect("spawn worker thread");
         Self {
             tx,

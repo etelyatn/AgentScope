@@ -147,7 +147,20 @@ fn run_tui(cli: &CliOverrides) -> ExitCode {
         error: None,
     };
     let worker = WorkerHandle::spawn(readers, config.clone());
-    let respawn = || WorkerHandle::spawn(build_readers(&config).0, config.clone());
+    let respawn = || {
+        let (notes_tx, notes) = std::sync::mpsc::channel();
+        let factory_config = config.clone();
+        // Readers (including the SQLite open) are built on the worker thread.
+        let worker = WorkerHandle::spawn_lazy(
+            Box::new(move || {
+                let (readers, notes) = build_readers(&factory_config);
+                let _ = notes_tx.send(notes);
+                readers
+            }),
+            config.clone(),
+        );
+        ui::Respawned { worker, notes }
+    };
     match ui::run(&mut app, &mut ctx, worker, &respawn) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
