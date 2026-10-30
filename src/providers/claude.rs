@@ -1789,12 +1789,9 @@ impl ProviderReader for ClaudeScanner {
                     (d.timestamp, d.offset) <= (last_anchor.timestamp, last_anchor.source_order)
                 })
             };
-            if stop.saturating_sub(start) > 200 {
-                return Err(ProviderError::Unsupported(
-                    "too many diagnostics in one transcript page".into(),
-                ));
-            }
-            for entry in &index.diag_order[start..stop] {
+            let overflow = stop.saturating_sub(start) > 200;
+            let visible_stop = if overflow { start + 199 } else { stop };
+            for entry in &index.diag_order[start..visible_stop] {
                 let d = &index.diagnostics[*entry];
                 let mut loc = locator(key, d.offset);
                 loc.generation = Some(generation);
@@ -1804,7 +1801,17 @@ impl ProviderReader for ClaudeScanner {
                     hidden: d.hidden,
                 });
             }
-            // An oversized diagnostic interval is rejected instead of silently losing entries.
+            if overflow {
+                let omitted = &index.diagnostics[index.diag_order[visible_stop]];
+                let mut loc = locator(key, omitted.offset);
+                loc.generation = Some(generation);
+                page_diags.push(DiagnosticEntry {
+                    locator: loc,
+                    label: "diagnostics truncated (200-entry limit); first omitted source".into(),
+                    hidden: true,
+                });
+                truncated = true;
+            }
         }
         Ok(TranscriptPage {
             events: page,

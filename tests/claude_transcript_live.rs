@@ -372,17 +372,25 @@ fn enormous_oversized_record_is_indexed_across_bounded_steps() {
 }
 
 #[test]
-fn diagnostics_over_page_limit_are_explicitly_rejected() {
+fn diagnostic_overflow_preserves_events_and_marks_truncation() {
     for visible in [false, true] {
         let mut records = vec![json!({"type":"hidden"}); 201];
         if visible {
             records.push(assistant("a", json!("visible")));
         }
         let (_dir, _, mut scanner, key) = setup(&records);
-        assert!(matches!(
-            scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
-            Err(agentscope::providers::ProviderError::Unsupported(_))
-        ));
+        let page = scanner
+            .transcript_page(&key, None, PageDirection::Forward, PAGE)
+            .unwrap();
+        assert_eq!(page.events.len(), usize::from(visible));
+        if visible {
+            assert_eq!(page.events[0].text.as_ref().unwrap().preview, "visible");
+        }
+        assert!(page.truncated);
+        assert_eq!(page.diagnostics.len(), 200);
+        let marker = page.diagnostics.last().unwrap();
+        assert!(marker.label.contains("diagnostics truncated"));
+        assert!(scanner.source_record(&marker.locator).is_ok());
     }
 }
 
