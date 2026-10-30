@@ -3,6 +3,7 @@
 //! The UI thread only polls terminal input and applies worker events; every
 //! file/database read happens in the worker thread.
 
+mod details;
 mod inspector;
 mod roster;
 pub mod widgets;
@@ -31,7 +32,10 @@ pub use roster::{MIN_HEIGHT, MIN_WIDTH, render_roster};
 pub fn render(frame: &mut ratatui::Frame, app: &App, ctx: &RosterContext) {
     match app.screen {
         Screen::Roster => render_roster(frame, app, ctx),
-        Screen::Inspector | Screen::Details => render_inspector(frame, app, ctx),
+        Screen::Inspector => render_inspector(frame, app, ctx),
+        Screen::Details => details::render_details(frame, app, ctx),
+        Screen::Source => details::render_source(frame, app, ctx),
+        Screen::Diagnostics => details::render_diagnostics(frame, app, ctx),
     }
 }
 
@@ -118,7 +122,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     if key.kind != KeyEventKind::Press {
         return KeyAction::None;
     }
-    let inspector = matches!(app.screen, Screen::Inspector | Screen::Details);
+    let inspector = app.screen != Screen::Roster;
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => KeyAction::Quit,
@@ -157,14 +161,20 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 }
 
 fn page_move(app: &mut App, inspector: bool, delta: isize) {
-    if inspector {
-        app.inspector_move(delta);
-    } else {
-        app.move_selection(delta);
+    match app.screen {
+        Screen::Details | Screen::Source => app.overlay_scroll(delta),
+        Screen::Diagnostics => app.diagnostics_move(delta),
+        _ if inspector => app.inspector_move(delta),
+        _ => app.move_selection(delta),
     }
 }
 
 fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
+    match app.screen {
+        Screen::Details | Screen::Source => return handle_scroll_overlay_key(app, code),
+        Screen::Diagnostics => return handle_diagnostics_key(app, code),
+        _ => {}
+    }
     match code {
         KeyCode::Char('q') => return KeyAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => app.inspector_move(1),
@@ -174,10 +184,66 @@ fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Char('g') | KeyCode::Home => app.inspector_first(),
         KeyCode::Char('G') | KeyCode::End => app.inspector_last(),
         KeyCode::Enter => app.inspector_toggle(),
+        KeyCode::Char('d') => {
+            app.open_details();
+        }
+        KeyCode::Char('v') => {
+            app.open_selected_source();
+        }
+        KeyCode::Char('D') => {
+            app.open_diagnostics();
+        }
+        KeyCode::Char('x') => app.toggle_redaction(),
         KeyCode::Esc | KeyCode::Backspace => app.close_inspector(),
         KeyCode::Char('r') => {
             app.retry_transcript();
             return KeyAction::Refresh;
+        }
+        _ => {}
+    }
+    KeyAction::None
+}
+
+/// Details and source overlays: scroll, and the source/redaction/diagnostics keys.
+fn handle_scroll_overlay_key(app: &mut App, code: KeyCode) -> KeyAction {
+    match code {
+        KeyCode::Char('q') => return KeyAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => app.overlay_scroll(1),
+        KeyCode::Char('k') | KeyCode::Up => app.overlay_scroll(-1),
+        KeyCode::PageDown => app.overlay_scroll(10),
+        KeyCode::PageUp => app.overlay_scroll(-10),
+        KeyCode::Home => app.overlay_scroll(isize::MIN),
+        KeyCode::End => app.overlay_scroll(isize::MAX),
+        KeyCode::Char('x') => app.toggle_redaction(),
+        KeyCode::Char('v') if app.screen == Screen::Details => {
+            app.open_selected_source();
+        }
+        KeyCode::Char('D') if app.screen == Screen::Details => {
+            app.open_diagnostics();
+        }
+        KeyCode::Esc | KeyCode::Backspace => {
+            app.close_overlay();
+        }
+        _ => {}
+    }
+    KeyAction::None
+}
+
+fn handle_diagnostics_key(app: &mut App, code: KeyCode) -> KeyAction {
+    match code {
+        KeyCode::Char('q') => return KeyAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => app.diagnostics_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.diagnostics_move(-1),
+        KeyCode::PageDown => app.diagnostics_move(10),
+        KeyCode::PageUp => app.diagnostics_move(-10),
+        KeyCode::Home => app.diagnostics_move(isize::MIN),
+        KeyCode::End => app.diagnostics_move(isize::MAX),
+        KeyCode::Enter | KeyCode::Char('v') => {
+            app.open_diagnostic_source();
+        }
+        KeyCode::Char('x') => app.toggle_redaction(),
+        KeyCode::Esc | KeyCode::Backspace => {
+            app.close_overlay();
         }
         _ => {}
     }
@@ -214,6 +280,9 @@ fn drain_worker(app: &mut App, ctx: &mut RosterContext, worker: &WorkerHandle) -
                 app.apply_transcript(request_id, page);
             }
             Ok(WorkerEvent::TranscriptInvalidated { key }) => app.invalidate_transcript(&key),
+            Ok(WorkerEvent::Source { request_id, record }) => {
+                app.apply_source(request_id, record);
+            }
             Ok(_) => {}
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Disconnected) => return false,

@@ -12,7 +12,9 @@ use crate::domain::{
 use crate::status::synthesize;
 use crate::worker::WorkerRequest;
 
+mod overlay;
 mod transcript;
+pub use overlay::{MAX_SOURCE_BYTES, SourceState, SourceView};
 pub use transcript::{MAX_LOADED_EVENTS, PageKind, Transcript};
 
 const PROVIDERS: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::OpenCode];
@@ -81,6 +83,8 @@ pub enum Screen {
     Roster,
     Inspector,
     Details,
+    Source,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,6 +121,7 @@ pub struct App {
     transcript: Option<Transcript>,
     request_seq: u64,
     outbox: Vec<WorkerRequest>,
+    overlays: overlay::Overlays,
 }
 
 impl App {
@@ -140,6 +145,7 @@ impl App {
             transcript: None,
             request_seq: 0,
             outbox: Vec::new(),
+            overlays: overlay::Overlays::default(),
         }
     }
 
@@ -326,6 +332,7 @@ impl App {
 
     pub fn close_inspector(&mut self) {
         self.transcript = None;
+        self.overlays = overlay::Overlays::default();
         self.screen = Screen::Roster;
     }
 
@@ -380,6 +387,7 @@ impl App {
         if let Some(t) = &mut self.transcript {
             t.fail_request(request_id);
         }
+        self.fail_source(request_id);
     }
 
     /// `r` in the inspector: retry a failed load.

@@ -11,7 +11,8 @@
 use std::collections::HashSet;
 
 use crate::domain::{
-    DiagnosticEntry, Event, PageAnchor, PageDirection, SessionKey, SessionSummary, TranscriptPage,
+    BoundedText, DiagnosticEntry, Event, PageAnchor, PageDirection, SessionKey, SessionSummary,
+    SourceLocator, TranscriptPage,
 };
 use crate::worker::WorkerRequest;
 
@@ -173,6 +174,28 @@ impl Transcript {
             .iter()
             .flat_map(|c| c.diagnostics.iter())
             .collect()
+    }
+
+    /// Whether `locator` names a record of this session that the loaded window
+    /// (or its diagnostics) currently references. A locator of another session,
+    /// or one from a superseded source generation, is never known.
+    pub fn knows_locator(&self, locator: &SourceLocator) -> bool {
+        if locator.session != self.key {
+            return false;
+        }
+        let text_is =
+            |t: &Option<BoundedText>| t.as_ref().and_then(|t| t.locator.as_ref()) == Some(locator);
+        self.events.iter().any(|e| {
+            &e.provenance.locator == locator
+                || text_is(&e.text)
+                || e.tool
+                    .as_ref()
+                    .is_some_and(|t| text_is(&t.input) || text_is(&t.output))
+        }) || self
+            .chunks
+            .iter()
+            .flat_map(|c| c.diagnostics.iter())
+            .any(|d| &d.locator == locator)
     }
 
     pub fn has_older(&self) -> bool {

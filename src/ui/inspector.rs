@@ -72,7 +72,7 @@ pub fn render_inspector(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             fit(
-                "j/k move  Enter expand  g oldest  G newest  Esc back  q quit",
+                "j/k move  Enter expand  g oldest  G newest  Esc back  q quit  d details  v source  D diagnostics",
                 width,
             ),
             palette.dim(),
@@ -309,7 +309,7 @@ fn render_timeline(frame: &mut Frame, transcript: &Transcript, body: Rect, palet
     frame.render_widget(Paragraph::new(shown), body);
 }
 
-fn actor_label(event: &Event) -> &'static str {
+pub(super) fn actor_label(event: &Event) -> &'static str {
     match event.kind {
         EventKind::UserPrompt => "user",
         EventKind::AssistantMessage => "assistant",
@@ -410,7 +410,7 @@ fn event_lines(
     lines
 }
 
-fn detail_lines(event: &Event) -> Vec<String> {
+pub(super) fn detail_lines(event: &Event) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(tool) = &event.tool {
         out.push(tool_summary(tool));

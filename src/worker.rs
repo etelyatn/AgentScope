@@ -602,6 +602,7 @@ impl Worker {
                     Err(err) => {
                         let warning = failure_warning(provider, "source", &err);
                         self.emit(WorkerEvent::Warning { warning });
+                        self.emit(WorkerEvent::LoadFailed { request_id });
                         None
                     }
                 }
