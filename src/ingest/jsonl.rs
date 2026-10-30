@@ -6,6 +6,33 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Streaming FNV-1a 64: split-independent, so hashing in different chunk sizes
+/// agrees. Integrity check for "is this still the file I read", not cryptographic.
+#[derive(Clone, Copy)]
+pub struct ContentHash(u64);
+
+impl ContentHash {
+    pub fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    pub fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for ContentHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A complete JSON value or a content-free indication of an unusable line.
 pub enum Record {
     Json {
@@ -104,6 +131,7 @@ pub struct JsonlCursor {
     at_eof: bool,
     stamp: Stamp,
     rotations: u64,
+    hash: ContentHash,
 }
 
 fn classify(line: &[u8], offset: u64, max_bytes: usize) -> Record {
@@ -133,12 +161,19 @@ impl JsonlCursor {
             at_eof: false,
             stamp,
             rotations: 0,
+            hash: ContentHash::new(),
         })
     }
 
     /// Bytes consumed from the file so far, including a held partial line.
     pub fn position(&self) -> u64 {
         self.offset
+    }
+
+    /// Hash of every byte consumed so far (including a held partial line), reset on
+    /// rotation. Right after a record is returned it covers exactly `[0, position)`.
+    pub fn content_hash(&self) -> u64 {
+        self.hash.finish()
     }
 
     /// Number of times the source was detected as rotated or truncated and re-read.
@@ -165,6 +200,7 @@ impl JsonlCursor {
             self.too_large = false;
             self.incomplete_reported = false;
             self.rotations += 1;
+            self.hash = ContentHash::new();
         } else {
             self.stamp = current;
         }
@@ -206,6 +242,7 @@ impl JsonlCursor {
                     self.buffer.extend_from_slice(&available[..data_len]);
                 }
             }
+            self.hash.update(&available[..consumed]);
             self.reader.consume(consumed);
             self.offset = self
                 .offset

@@ -10,11 +10,11 @@ use agentscope::domain::{
     PageRequest, RefreshBudget, SessionKey, SessionSummary, SourceKey, SourceLocator, ToolStatus,
     TranscriptPage,
 };
-use agentscope::providers::ProviderReader;
 use agentscope::providers::codex::CodexScanner;
+use agentscope::providers::{ProviderError, ProviderReader};
 use serde_json::json;
 use support::codex::*;
-use support::{NOW, config_for, dated, write_lines};
+use support::{NOW, config_for, dated, set_modified, write_lines};
 
 const BIG: RefreshBudget = RefreshBudget {
     max_records: 100_000,
@@ -761,10 +761,7 @@ fn page_byte_budget_applies_to_the_whole_first_tool_row() {
         let used = tool.name.len()
             + tool.input.as_ref().map_or(0, |t| t.preview.len())
             + tool.output.as_ref().map_or(0, |t| t.preview.len());
-        assert!(
-            used <= budget.max(tool.name.len()),
-            "budget {budget}: {used} bytes"
-        );
+        assert!(used <= budget, "budget {budget}: {used} bytes");
         assert!(tool.input.as_ref().unwrap().truncated);
         assert!(tool.output.as_ref().unwrap().truncated);
         // Progress is still made: the next page starts at the following row.
@@ -1013,4 +1010,257 @@ fn pages_follow_the_anchor_total_order_with_missing_and_decreasing_timestamps() 
             .unwrap(),
         5
     );
+}
+
+#[test]
+fn tool_names_are_cut_to_the_page_budget_and_mark_the_page_truncated() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "name", "/p"),
+        item_completed(
+            "2026-10-29T10:00:01Z",
+            json!({"type": "McpToolCall", "id": "m", "status": "completed",
+                   "server": "s".repeat(30), "tool": "t".repeat(30)}),
+        ),
+        user("2026-10-29T10:00:02Z", "next"),
+    ]);
+    let request = |max_bytes| PageRequest {
+        max_events: 10,
+        max_bytes,
+    };
+    let page = f
+        .scanner
+        .transcript_page(&s.key, None, PageDirection::Forward, request(10))
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert!(page.events[0].tool.as_ref().unwrap().name.len() <= 10);
+    assert!(page.truncated && page.has_more);
+    // A budget that fits the whole name leaves it intact and unmarked.
+    let page = f
+        .scanner
+        .transcript_page(&s.key, None, PageDirection::Forward, request(1000))
+        .unwrap();
+    assert_eq!(page.events[0].tool.as_ref().unwrap().name.len(), 61);
+    assert!(!page.truncated);
+}
+
+#[test]
+fn a_completion_claims_its_own_call_not_a_different_open_one() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "seq", "/p"),
+        custom_call("2026-10-29T10:00:01Z", "A", "shell", "first"),
+        custom_call("2026-10-29T10:00:02Z", "B", "shell", "second"),
+        custom_output("2026-10-29T10:00:03Z", "A", "done A"),
+        item_completed(
+            "2026-10-29T10:00:04Z",
+            command_item("item-a", "first", "done A", 0),
+        ),
+    ]);
+    let page = first(&mut f, &s.key);
+    assert_eq!(
+        page.events.len(),
+        2,
+        "B stays pending beside A's completion"
+    );
+    let pending = page.events[0].tool.as_ref().unwrap();
+    assert_eq!(pending.call_id.as_deref(), Some("B"));
+    assert_eq!(pending.status, ToolStatus::Pending);
+    assert_eq!(
+        page.events[1].tool.as_ref().unwrap().status,
+        ToolStatus::Completed
+    );
+    assert_eq!(s.displayed_event_count, 2);
+
+    // B's own output then its completion: one row each, never a stray orphan.
+    append(
+        &f.path,
+        format!(
+            "{}\n{}\n",
+            custom_output("2026-10-29T10:00:05Z", "B", "done B"),
+            item_completed(
+                "2026-10-29T10:00:06Z",
+                command_item("item-b", "second", "done B", 0)
+            ),
+        )
+        .as_bytes(),
+    );
+    let s = last_summary(&mut f.scanner);
+    assert_eq!(first(&mut f, &s.key).events.len(), 2);
+    assert!(
+        !s.warnings
+            .iter()
+            .any(|w| w.key.source.ends_with("#orphan-tool"))
+    );
+}
+
+fn wide_session() -> Vec<String> {
+    let mut lines = vec![session_meta("2026-10-29T10:00:00Z", "wide", "/p")];
+    for i in 1..=7 {
+        let head = if i == 2 {
+            "marker-two".to_owned()
+        } else {
+            format!("rec{i}")
+        };
+        lines.push(user(
+            &format!("2026-10-29T10:00:{i:02}Z"),
+            &format!("{head} {}", "p".repeat(650)),
+        ));
+    }
+    lines
+}
+
+fn preview_of(e: &Event) -> &str {
+    &e.text.as_ref().unwrap().preview
+}
+
+#[test]
+fn same_length_replacement_outside_any_sample_is_rejected() {
+    let (mut f, s) = open(&wide_session());
+    let page = first(&mut f, &s.key); // builds and caches the index
+    assert_eq!(page.events.len(), 7);
+    let original = std::fs::read_to_string(&f.path).unwrap();
+    let at = original.find("marker-two").unwrap();
+    // Not within the first, middle, or last 512 bytes.
+    assert!(
+        at > 600 && (at as f64) < original.len() as f64 * 0.4,
+        "at {at}"
+    );
+    let locator = page.events[3].provenance.locator.clone();
+
+    std::fs::write(&f.path, original.replacen("marker-two", "MARKER-TWO", 1)).unwrap();
+    set_modified(&f.path, 1_000_000_000);
+    for direction in [PageDirection::Forward, PageDirection::Backward] {
+        assert!(
+            f.scanner
+                .transcript_page(&s.key, None, direction, ALL)
+                .is_err()
+        );
+    }
+    assert!(f.scanner.source_record(&locator).is_err());
+    assert!(
+        f.scanner
+            .count_events_after(&s.key, &anchor_of(&page.events[0]))
+            .is_err()
+    );
+
+    // A refresh restarts the parse and the new bytes are served.
+    let changed = scan(&mut f.scanner);
+    let s2 = changed.last().expect("session re-emitted");
+    assert!(
+        s2.warnings
+            .iter()
+            .any(|w| w.key.source.ends_with("#rotation"))
+    );
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 7);
+    assert!(preview_of(&page.events[1]).starts_with("MARKER-TWO"));
+}
+
+#[test]
+fn rewritten_prefix_followed_by_growth_restarts_the_parse() {
+    let (mut f, s) = open(&wide_session());
+    assert_eq!(first(&mut f, &s.key).events.len(), 7);
+    let original = std::fs::read_to_string(&f.path).unwrap();
+    let grown = format!(
+        "{}{}\n",
+        original.replacen("marker-two", "MARKER-TWO", 1),
+        user("2026-10-29T10:00:30Z", "appended after the rewrite"),
+    );
+    assert!(grown.len() > original.len());
+    std::fs::write(&f.path, grown).unwrap();
+    set_modified(&f.path, 1_000_000_000);
+
+    let changed = scan(&mut f.scanner);
+    let s2 = changed.last().expect("session re-emitted");
+    assert!(
+        s2.warnings
+            .iter()
+            .any(|w| w.key.source.ends_with("#rotation"))
+    );
+    assert_eq!(s2.displayed_event_count, 8);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 8);
+    assert!(preview_of(&page.events[1]).starts_with("MARKER-TWO"));
+    assert_eq!(preview_of(&page.events[7]), "appended after the rewrite");
+
+    // Plain growth with an untouched prefix does not restart.
+    append(
+        &f.path,
+        format!("{}\n", user("2026-10-29T10:00:40Z", "more")).as_bytes(),
+    );
+    let s3 = last_summary(&mut f.scanner);
+    assert_eq!(
+        s3.warnings
+            .iter()
+            .find(|w| w.key.source.ends_with("#rotation"))
+            .map(|w| w.count),
+        Some(1)
+    );
+    assert_eq!(first(&mut f, &s.key).events.len(), 9);
+}
+
+fn numbered(n: usize) -> Vec<String> {
+    let mut lines = vec![session_meta("2026-10-29T10:00:00Z", "many", "/p")];
+    for i in 0..n {
+        lines.push(user(
+            &format!("2026-10-29T10:{:02}:{:02}Z", i / 60, i % 60),
+            &format!("row {i}"),
+        ));
+    }
+    lines
+}
+
+#[test]
+fn index_construction_is_bounded_resumable_and_capped() {
+    // Resumable: each request indexes at most `step` records, then succeeds.
+    let (mut f, s) = open(&numbered(300));
+    f.scanner.set_index_limits(100, 10_000);
+    let mut building = 0;
+    let page = loop {
+        match f
+            .scanner
+            .transcript_page(&s.key, None, PageDirection::Forward, ALL)
+        {
+            Ok(page) => break page,
+            Err(ProviderError::Unavailable(message)) => {
+                assert!(message.contains("index is building"), "{message}");
+                building += 1;
+                assert!(building < 10, "index never finished");
+            }
+            Err(other) => panic!("unexpected {other}"),
+        }
+    };
+    assert_eq!(building, 3, "301 records at 100 per request");
+    assert_eq!(page.events.len(), 300);
+    assert_eq!(preview_of(&page.events[299]), "row 299");
+    let anchor = anchor_of(&page.events[289]);
+    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 10);
+
+    // Hard cap: a clear error, repeated cheaply, never a silent unbounded index.
+    let (mut f, s) = open(&numbered(300));
+    f.scanner.set_index_limits(100, 200);
+    for _ in 0..6 {
+        match f
+            .scanner
+            .transcript_page(&s.key, None, PageDirection::Backward, ALL)
+        {
+            Err(ProviderError::Unavailable(_)) => {}
+            Err(ProviderError::Unsupported(message)) => {
+                assert!(message.contains("200-record index limit"), "{message}");
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    for _ in 0..3 {
+        assert!(matches!(
+            f.scanner
+                .transcript_page(&s.key, None, PageDirection::Forward, ALL),
+            Err(ProviderError::Unsupported(_))
+        ));
+        assert!(matches!(
+            f.scanner
+                .count_events_after(&s.key, &anchor_of(&page.events[0])),
+            Err(ProviderError::Unsupported(_))
+        ));
+    }
 }

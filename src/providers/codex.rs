@@ -8,13 +8,13 @@
 //! offset is the Codex source order and the basis of every [`PageAnchor`].
 //! Duplicate session IDs are never merged: every rollout file is its own row.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs::File;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
 use serde_json::Value;
@@ -29,7 +29,7 @@ use crate::domain::{
     SourceKey, SourceLocator, Timestamp, TokenCategories, ToolInteraction, ToolStatus,
     TranscriptPage, UsageSummary, Warning, WarningKey, WarningKind,
 };
-use crate::ingest::jsonl::{JsonlCursor, Record};
+use crate::ingest::jsonl::{ContentHash, JsonlCursor, Record};
 use crate::ingest::text::{display_safe, preview, sanitize};
 use crate::usage::{codex_total, estimate_cost};
 
@@ -37,6 +37,12 @@ use crate::usage::{codex_total, estimate_cost};
 const MAX_TRACKED: usize = 256;
 /// Superseded call IDs remembered so their late outputs are not orphans.
 const MAX_CLOSED: usize = 1024;
+/// Records indexed per page/count request, and the most entries (24 bytes each) one
+/// session's transcript index may retain.
+const INDEX_STEP: usize = 250_000;
+const INDEX_CAP: usize = 2_000_000;
+/// Consumed prefixes up to this size are re-hashed exactly; larger ones are sampled.
+const PREFIX_VERIFY_MAX: u64 = 32 << 20;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Largest preview kept for one text field of a page event. `preview` is quadratic
 /// in the kept length, and full content is one source-record load away.
@@ -202,6 +208,12 @@ fn classify(value: &Value) -> Class<'_> {
     }
 }
 
+struct Call {
+    id: String,
+    offset: u64,
+    open: bool,
+}
+
 /// Everything learned from one rollout file so far. Usage snapshots are
 /// replaced, never accumulated: both Codex sources are cumulative.
 #[derive(Default)]
@@ -231,8 +243,8 @@ struct Parsed {
     /// Byte offset just past the last complete record consumed. Transcript reads
     /// never go beyond it, so pages and counts agree with the roster.
     end: u64,
-    /// Calls (by call ID) that have no output yet, mapped to their record offset.
-    open_calls: HashMap<String, u64>,
+    /// Calls no completion has claimed yet, oldest first. `open` calls have no output.
+    calls: VecDeque<Call>,
     /// Offsets of unpaired calls and orphan outputs, which render as tool rows.
     /// Every offset here was also counted in `hidden` when it was read.
     shown: BTreeSet<u64>,
@@ -245,7 +257,13 @@ struct Parsed {
     closed: HashSet<String>,
     /// Unique per parse restart; keys the transcript index cache.
     generation: u64,
-    /// `(end, hash)` of the bytes the scan consumed, to detect replaced files.
+    /// `(end, hash)` of every consumed byte, from the cursor's running hash.
+    prefix: Option<(u64, u64)>,
+    /// File identity captured when the scan first stamped this parse.
+    identity: Option<FileId>,
+    /// Length and modified time observed at the last stamp.
+    stamp_meta: Option<(u64, Option<SystemTime>)>,
+    /// Sampled `(end, hash)`, only kept for files too large to re-hash.
     fingerprint: Option<(u64, u64)>,
 }
 
@@ -264,7 +282,7 @@ impl Parsed {
     fn tool_completed(&mut self, item: &Value, ts: Option<Timestamp>) {
         self.display(ts);
         if !item_pending(item) {
-            self.complete_oldest_call();
+            self.claim_oldest_call();
         }
     }
 
@@ -363,14 +381,23 @@ impl Parsed {
         let Some(id) = text_field(p, "call_id") else {
             return;
         };
-        if let Some(previous) = self.open_calls.remove(&id) {
-            self.shown.remove(&previous);
+        if let Some(at) = self.calls.iter().position(|c| c.id == id)
+            && let Some(previous) = self.calls.remove(at)
+        {
+            self.shown.remove(&previous.offset);
         }
-        if self.open_calls.len() >= MAX_TRACKED {
+        while self.calls.len() >= MAX_TRACKED && self.calls.front().is_some_and(|c| !c.open) {
+            self.calls.pop_front();
+        }
+        if self.calls.len() >= MAX_TRACKED {
             self.pairing_overflow = true;
             return;
         }
-        self.open_calls.insert(id, offset);
+        self.calls.push_back(Call {
+            id,
+            offset,
+            open: true,
+        });
         self.shown.insert(offset);
         self.last_event = self.last_event.max(ts);
     }
@@ -380,8 +407,13 @@ impl Parsed {
         let Some(id) = text_field(p, "call_id") else {
             return;
         };
-        if let Some(call) = self.open_calls.remove(&id) {
-            self.shown.remove(&call);
+        if let Some(call) = self.calls.iter_mut().find(|c| c.id == id) {
+            // Resolved by its own output. It keeps its place in the queue until an
+            // `item_completed` claims it, so completions stay aligned with calls.
+            if call.open {
+                call.open = false;
+                self.shown.remove(&call.offset);
+            }
         } else if self.closed.remove(&id) {
             // The authoritative completion already replaced this call; stay source-only.
         } else if !self.pairing_overflow && (self.orphans as usize) < MAX_TRACKED {
@@ -391,32 +423,32 @@ impl Parsed {
         }
     }
 
-    /// An authoritative `item_completed` tool row supersedes the oldest still-open raw
-    /// call: IDs never join (spec §6.3), so completion order is the only evidence.
-    /// Without this a pending row would sit next to its own completed row.
-    fn complete_oldest_call(&mut self) {
-        let Some((id, offset)) = self
-            .open_calls
-            .iter()
-            .min_by_key(|(_, offset)| **offset)
-            .map(|(id, offset)| (id.clone(), *offset))
-        else {
+    /// An authoritative `item_completed` tool row claims the oldest call no earlier
+    /// completion has claimed. Calls already resolved by their raw output are still
+    /// claimed (they just have no pending row to retire), so a completion never
+    /// consumes a different call that is genuinely still open. IDs never join
+    /// (spec 6.3), so completion order is the only evidence.
+    fn claim_oldest_call(&mut self) {
+        let Some(call) = self.calls.pop_front() else {
             return;
         };
-        self.open_calls.remove(&id);
-        self.shown.remove(&offset);
+        if !call.open {
+            return;
+        }
+        self.shown.remove(&call.offset);
         if self.closed.len() >= MAX_CLOSED {
             self.pairing_overflow = true;
         } else {
-            self.closed.insert(id);
+            self.closed.insert(call.id);
         }
     }
 
-    fn set_end(&mut self, end: u64) {
+    fn set_end(&mut self, end: u64, hash: Option<u64>) {
         if self.generation == 0 {
             self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         }
         self.end = end;
+        self.prefix = hash.map(|h| (end, h));
     }
 
     fn usage_record(&mut self, body: &Value) {
@@ -470,12 +502,46 @@ impl FileState {
         self.dirty = true;
     }
 
-    /// Records a fingerprint of the consumed bytes so later transcript reads can
-    /// tell the scanned file from a replacement.
+    /// Records what the scan consumed (metadata, identity, and for very large files
+    /// sampled bytes) so later reads can tell the scanned file from a replacement.
     fn stamp(&mut self) {
-        let end = self.parsed.end;
-        if self.parsed.fingerprint.map(|f| f.0) != Some(end) {
-            self.parsed.fingerprint = fingerprint(&self.source.path, end).map(|hash| (end, hash));
+        let Ok(meta) = fs::metadata(&self.source.path) else {
+            return;
+        };
+        let p = &mut self.parsed;
+        p.stamp_meta = Some((meta.len(), meta.modified().ok()));
+        if p.identity.is_none() {
+            p.identity = Some(file_id(&meta));
+        }
+        if p.end > PREFIX_VERIFY_MAX && p.fingerprint.map(|f| f.0) != Some(p.end) {
+            p.fingerprint = fingerprint(&self.source.path, p.end).map(|hash| (p.end, hash));
+        }
+    }
+
+    /// Whether the file on disk still holds the bytes this parse consumed.
+    fn source_intact(&self) -> bool {
+        let p = &self.parsed;
+        if p.end == 0 {
+            return true;
+        }
+        let (Some((end, hash)), Some(identity)) = (p.prefix, p.identity) else {
+            return false;
+        };
+        let Ok(meta) = fs::metadata(&self.source.path) else {
+            return false;
+        };
+        if file_id(&meta) != identity || meta.len() < end {
+            return false;
+        }
+        if p.stamp_meta == Some((meta.len(), meta.modified().ok())) {
+            return true;
+        }
+        // Appended or rewritten since the scan: the consumed prefix must be unchanged.
+        if end <= PREFIX_VERIFY_MAX {
+            prefix_hash(&self.source.path, end) == Some(hash)
+        } else {
+            p.fingerprint
+                .is_some_and(|(e, h)| e == end && fingerprint(&self.source.path, end) == Some(h))
         }
     }
 
@@ -553,6 +619,7 @@ pub struct CodexScanner {
     pass: Option<Pass>,
     /// Page index of the one session being inspected.
     index: Option<Index>,
+    index_limits: IndexLimits,
 }
 
 impl CodexScanner {
@@ -563,7 +630,20 @@ impl CodexScanner {
             expired: HashSet::new(),
             pass: None,
             index: None,
+            index_limits: IndexLimits {
+                step: INDEX_STEP,
+                cap: INDEX_CAP,
+            },
         })
+    }
+
+    /// Overrides how many records one page/count request indexes and the most one
+    /// session may hold. Beyond the cap, transcript requests fail with a clear error.
+    pub fn set_index_limits(&mut self, step_records: usize, max_entries: usize) {
+        self.index_limits = IndexLimits {
+            step: step_records.max(1),
+            cap: max_entries,
+        };
     }
 
     /// Number of rollout files currently held open (bounded by `KEEP_CURSORS`).
@@ -688,6 +768,16 @@ impl CodexScanner {
         } else {
             state.source = source;
         }
+        if state.cursor.is_some() && !state.source_intact() {
+            // The bytes already consumed changed (replaced or rewritten, possibly
+            // then grown): nothing parsed from them can be trusted, so start over.
+            state.cursor = None;
+            state.parsed = Parsed::default();
+            state.rotations_seen = 0;
+            state.rotation_warnings += 1;
+            state.reached_eof = false;
+            state.dirty = true;
+        }
         if state.cursor.is_none() {
             match JsonlCursor::open(state.source.path.clone(), max_record_bytes) {
                 Ok(cursor) => state.cursor = Some(cursor),
@@ -759,7 +849,8 @@ impl CodexScanner {
                 Record::Invalid { .. } => state.parsed.malformed += 1,
                 Record::TooLarge { .. } => state.parsed.oversized += 1,
             }
-            state.parsed.set_end(after);
+            let hash = state.cursor.as_ref().map(JsonlCursor::content_hash);
+            state.parsed.set_end(after, hash);
             state.dirty = true;
             meter.records += 1;
             if meter.spent() {
@@ -1520,33 +1611,44 @@ impl Limits {
     }
 }
 
-/// Shrinks the previews of one row so the whole interaction (name, input, output)
-/// fits `budget`. Previews are already redacted, so cutting them is safe.
-fn fit(event: &mut Event, budget: usize) {
-    let name = event.tool.as_ref().map_or(0, |t| t.name.len());
-    let mut left = budget.saturating_sub(name);
-    let mut fields: Vec<&mut BoundedText> = Vec::new();
+/// Shrinks one row so the whole interaction (name, input, output, text) fits
+/// `budget` bytes. Previews are already redacted, so cutting them is safe. Returns
+/// whether anything was cut; the tool name has no flag of its own, so the caller
+/// marks the page truncated.
+fn fit(event: &mut Event, budget: usize) -> bool {
+    let mut fields: Vec<(&mut String, Option<&mut bool>)> = Vec::new();
     if let Some(text) = event.text.as_mut() {
-        fields.push(text);
+        fields.push((&mut text.preview, Some(&mut text.truncated)));
     }
     if let Some(tool) = event.tool.as_mut() {
-        fields.extend(tool.input.as_mut());
-        fields.extend(tool.output.as_mut());
+        fields.push((&mut tool.name, None));
+        for part in [tool.input.as_mut(), tool.output.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            fields.push((&mut part.preview, Some(&mut part.truncated)));
+        }
     }
+    let mut cut_any = false;
+    let mut left = budget;
     let mut remaining = fields.len();
-    for field in fields {
+    for (text, flag) in fields {
         let share = left / remaining;
         remaining -= 1;
-        if field.preview.len() > share {
+        if text.len() > share {
             let mut cut = share;
-            while !field.preview.is_char_boundary(cut) {
+            while !text.is_char_boundary(cut) {
                 cut -= 1;
             }
-            field.preview.truncate(cut);
-            field.truncated = true;
+            text.truncate(cut);
+            cut_any = true;
+            if let Some(flag) = flag {
+                *flag = true;
+            }
         }
-        left -= field.preview.len();
+        left -= text.len();
     }
+    cut_any
 }
 
 fn empty_page() -> TranscriptPage {
@@ -1592,20 +1694,32 @@ impl Ix {
     }
 }
 
-/// Every complete record of one session in `PageAnchor` order. Built lazily for the
-/// session being inspected (one slot), extended on append, rebuilt on replacement.
+/// Records of one session in `PageAnchor` order. Built lazily for the session being
+/// inspected (one slot), a bounded number of records per request, extended on
+/// append, rebuilt on replacement.
 struct Index {
     path: PathBuf,
     generation: u64,
     end: u64,
     entries: Vec<Ix>,
+    /// The session has more records than the cap allows; no entries are kept.
+    over: bool,
+}
+
+#[derive(Clone, Copy)]
+struct IndexLimits {
+    /// Records indexed per page/count request.
+    step: usize,
+    /// Most entries one session may hold.
+    cap: usize,
 }
 
 fn ensure_index<'a>(
     slot: &'a mut Option<Index>,
     state: &FileState,
     max: usize,
-) -> io::Result<&'a Index> {
+    limits: IndexLimits,
+) -> Result<&'a Index, ProviderError> {
     let parsed = &state.parsed;
     let stale = slot.as_ref().is_none_or(|i| {
         i.path != state.source.path || i.generation != parsed.generation || i.end > parsed.end
@@ -1616,13 +1730,29 @@ fn ensure_index<'a>(
             generation: parsed.generation,
             end: 0,
             entries: Vec::new(),
+            over: false,
         });
     }
+    let too_large = || {
+        ProviderError::Unsupported(format!(
+            "session transcript exceeds the {}-record index limit",
+            limits.cap
+        ))
+    };
     let index = slot.as_mut().expect("index slot was just filled");
+    if index.over {
+        return Err(too_large());
+    }
     if index.end < parsed.end {
-        let mut lines = ForwardLines::open(&index.path, index.end, parsed.end, max)?;
+        let mut lines = ForwardLines::open(&index.path, index.end, parsed.end, max)
+            .map_err(|e| io_error(&e))?;
         let mut fresh: Vec<Ix> = Vec::new();
-        while let Some(line) = lines.next_line()? {
+        let mut reached_end = false;
+        for _ in 0..limits.step {
+            let Some(line) = lines.next_line().map_err(|e| io_error(&e))? else {
+                reached_end = true;
+                break;
+            };
             let (ts, kind) = match &line.body {
                 Body::Json(value) => (
                     parse_ts(field(value, "timestamp")),
@@ -1644,7 +1774,16 @@ fn ensure_index<'a>(
                 kind,
             });
         }
-        index.end = parsed.end;
+        index.end = if reached_end {
+            parsed.end
+        } else {
+            lines.offset
+        };
+        if index.entries.len() + fresh.len() > limits.cap {
+            index.entries = Vec::new();
+            index.over = true;
+            return Err(too_large());
+        }
         let ordered = fresh.windows(2).all(|w| w[0].key() <= w[1].key())
             && index
                 .entries
@@ -1654,6 +1793,12 @@ fn ensure_index<'a>(
         index.entries.extend(fresh);
         if !ordered {
             index.entries.sort_unstable_by_key(Ix::key);
+        }
+        if index.end < parsed.end {
+            return Err(ProviderError::Unavailable(format!(
+                "transcript index is building ({} of {} bytes); retry",
+                index.end, parsed.end
+            )));
         }
     }
     Ok(index)
@@ -1746,7 +1891,7 @@ fn page(
             }
             Mapped::Event(event) => {
                 let mut event = *event;
-                fit(&mut event, limits.max_bytes);
+                let cut = fit(&mut event, limits.max_bytes);
                 if limits.full(&events, bytes, &event) {
                     has_more = true;
                     break;
@@ -1757,6 +1902,7 @@ fn page(
                     }
                 }
                 bytes += event_cost(&event);
+                truncated |= cut;
                 events.push(event);
             }
         }
@@ -1784,6 +1930,43 @@ fn page(
         has_more,
         truncated,
     })
+}
+
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(windows)]
+type FileId = u64;
+#[cfg(not(any(unix, windows)))]
+type FileId = ();
+
+#[cfg(unix)]
+fn file_id(meta: &fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(windows)]
+fn file_id(meta: &fs::Metadata) -> FileId {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_meta: &fs::Metadata) -> FileId {}
+
+/// Exact hash of the first `end` bytes, in the same FNV stream the cursor keeps.
+fn prefix_hash(path: &Path, end: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut hash = ContentHash::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut left = end;
+    while left > 0 {
+        let want = usize::try_from(left.min(buf.len() as u64)).ok()?;
+        file.read_exact(&mut buf[..want]).ok()?;
+        hash.update(&buf[..want]);
+        left -= want as u64;
+    }
+    Some(hash.finish())
 }
 
 /// Hash of three samples of the consumed bytes plus their length. A file replaced
@@ -1828,19 +2011,16 @@ fn find<'a>(
     Ok(state)
 }
 
-/// End of the data the roster consumed, provided the file on disk is still the one
-/// that was scanned. A replaced file must not be read through the old offsets.
+/// End of the data the roster consumed, provided the file on disk still holds the
+/// bytes that were scanned. A replaced or rewritten file must not be read through
+/// the old offsets.
 fn verified_end(state: &FileState) -> Result<u64, ProviderError> {
-    let end = state.parsed.end;
-    match state.parsed.fingerprint {
-        Some((scanned, hash))
-            if scanned == end && fingerprint(&state.source.path, end) == Some(hash) =>
-        {
-            Ok(end)
-        }
-        _ => Err(ProviderError::Unavailable(
+    if state.source_intact() {
+        Ok(state.parsed.end)
+    } else {
+        Err(ProviderError::Unavailable(
             "source changed since the last refresh".into(),
-        )),
+        ))
     }
 }
 
@@ -1867,7 +2047,7 @@ impl ProviderReader for CodexScanner {
         let state = find(&self.states, key)?;
         let end = verified_end(state)?;
         let max = self.config.max_record_bytes;
-        let index = ensure_index(&mut self.index, state, max).map_err(|e| io_error(&e))?;
+        let index = ensure_index(&mut self.index, state, max, self.index_limits)?;
         let mapper = Mapper {
             key,
             path: &state.source.path,
@@ -1903,7 +2083,7 @@ impl ProviderReader for CodexScanner {
         let state = find(&self.states, key)?;
         verified_end(state)?;
         let max = self.config.max_record_bytes;
-        let index = ensure_index(&mut self.index, state, max).map_err(|e| io_error(&e))?;
+        let index = ensure_index(&mut self.index, state, max, self.index_limits)?;
         let key = (anchor.timestamp, anchor.source_order);
         let from = index.entries.partition_point(|e| e.key() <= key);
         Ok(index.entries[from..]
