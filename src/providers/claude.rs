@@ -404,6 +404,8 @@ struct State {
     emitted: Option<SessionKey>,
     reopen: bool,
     dirty: bool,
+    /// Content already readable changed; consumed (and cleared) by the next delta.
+    invalidated: bool,
     ledger: ClaudeLedger,
     side_ledger: Option<ClaudeLedger>,
     parent_seen: bool,
@@ -473,6 +475,7 @@ impl State {
             emitted: None,
             reopen: false,
             dirty: true,
+            invalidated: false,
             ledger: ClaudeLedger::new(entries, bytes),
             side_ledger: Some(ClaudeLedger::new(entries, bytes)),
             parent_seen: false,
@@ -741,6 +744,7 @@ impl State {
                             self.summary.displayed_event_count.saturating_sub(displayed);
                         self.summary.hidden_records =
                             self.summary.hidden_records.saturating_sub(old_hidden);
+                        self.invalidated = true;
                     }
                 }
             }
@@ -863,6 +867,7 @@ impl ClaudeScanner {
                     self.config.dedup_ledger_entries,
                     self.config.dedup_ledger_bytes,
                 );
+                state.invalidated = true;
             }
             bytes = bytes.saturating_add(
                 usize::try_from(if rotated {
@@ -989,11 +994,15 @@ impl ClaudeScanner {
                 }
             }
         }
+        let mut invalidated = Vec::new();
         let sessions = self
             .states
             .values_mut()
             .filter_map(|s| {
                 if s.dirty {
+                    if std::mem::take(&mut s.invalidated) {
+                        invalidated.push(s.summary.key.clone());
+                    }
                     if let Some(old) = s.emitted.replace(s.summary.key.clone())
                         && old != s.summary.key
                     {
@@ -1009,6 +1018,7 @@ impl ClaudeScanner {
         Ok(ProviderDelta {
             sessions,
             removed,
+            invalidated,
             warnings,
             scan,
         })

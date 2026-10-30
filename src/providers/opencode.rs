@@ -339,6 +339,8 @@ pub struct OpenCodeScanner {
     /// Evidence collections interrupted by the refresh budget, oldest first.
     jobs: HashMap<String, Job>,
     pending: VecDeque<String>,
+    /// Sessions whose rows changed since evidence was last read; drained per delta.
+    invalidated: Vec<SessionKey>,
 }
 
 impl OpenCodeScanner {
@@ -357,6 +359,7 @@ impl OpenCodeScanner {
             evidence: HashMap::new(),
             jobs: HashMap::new(),
             pending: VecDeque::new(),
+            invalidated: Vec::new(),
         };
         scanner.ensure_open()?;
         Ok(scanner)
@@ -436,6 +439,13 @@ impl OpenCodeScanner {
         out: &mut Vec<SessionSummary>,
     ) {
         let summary = self.summarize(row, tables, &evidence);
+        if self
+            .evidence
+            .get(&row.id)
+            .is_some_and(|(prior, _)| *prior != stamp)
+        {
+            self.invalidated.push(summary.key.clone());
+        }
         self.evidence.insert(row.id.clone(), (stamp, evidence));
         if self.known.get(&row.id) != Some(&summary) {
             self.known.insert(row.id.clone(), summary.clone());
@@ -459,6 +469,7 @@ impl OpenCodeScanner {
             return Ok(ProviderDelta {
                 sessions: vec![],
                 removed: vec![],
+                invalidated: vec![],
                 warnings,
                 scan: ScanProgress {
                     provider: Provider::OpenCode,
@@ -543,6 +554,7 @@ impl OpenCodeScanner {
             return Ok(ProviderDelta {
                 sessions,
                 removed: vec![],
+                invalidated: std::mem::take(&mut self.invalidated),
                 warnings,
                 scan,
             });
@@ -657,6 +669,7 @@ impl OpenCodeScanner {
         Ok(ProviderDelta {
             sessions,
             removed,
+            invalidated: std::mem::take(&mut self.invalidated),
             warnings,
             scan,
         })

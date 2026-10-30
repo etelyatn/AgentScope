@@ -470,6 +470,8 @@ struct FileState {
     /// Unavailable at the end of a completed pass; expires after the next one.
     retained: bool,
     dirty: bool,
+    /// Already-parsed content was rewritten or rotated; consumed by the next delta.
+    invalidated: bool,
     /// Key last sent to consumers, so an ID change can retire the old row.
     emitted: Option<SessionKey>,
     /// Duplicate-ID count and parent link as last emitted.
@@ -488,6 +490,7 @@ impl FileState {
             available: true,
             retained: false,
             dirty: true,
+            invalidated: false,
             emitted: None,
             context: (1, None),
         }
@@ -732,11 +735,12 @@ impl CodexScanner {
         if !done {
             self.pass = Some(pass);
         }
-        let (sessions, retired) = self.emit_changed();
+        let (sessions, retired, invalidated) = self.emit_changed();
         removed.extend(retired);
         Ok(ProviderDelta {
             sessions,
             removed,
+            invalidated,
             warnings,
             scan,
         })
@@ -777,6 +781,7 @@ impl CodexScanner {
             state.rotation_warnings += 1;
             state.reached_eof = false;
             state.dirty = true;
+            state.invalidated = true;
         }
         if state.cursor.is_none() {
             match JsonlCursor::open(state.source.path.clone(), max_record_bytes) {
@@ -813,6 +818,7 @@ impl CodexScanner {
                 state.rotations_seen = rotations;
                 state.rotation_warnings += 1;
                 state.dirty = true;
+                state.invalidated = true;
             }
             let record = match next {
                 Ok(Some(record)) => record,
@@ -861,7 +867,7 @@ impl CodexScanner {
     }
 
     /// Refreshes duplicate-ID and parent-link context, then drains dirty sessions.
-    fn emit_changed(&mut self) -> (Vec<SessionSummary>, Vec<SessionKey>) {
+    fn emit_changed(&mut self) -> (Vec<SessionSummary>, Vec<SessionKey>, Vec<SessionKey>) {
         let mut by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for (path, state) in &self.states {
             by_id.entry(state.id()).or_default().push(path.clone());
@@ -899,9 +905,13 @@ impl CodexScanner {
             .map(|p| self.summarize(&self.states[p]))
             .collect();
         let mut retired = Vec::new();
+        let mut invalidated = Vec::new();
         for state in self.states.values_mut() {
             if state.dirty {
                 let key = state.key();
+                if std::mem::take(&mut state.invalidated) {
+                    invalidated.push(key.clone());
+                }
                 if let Some(old) = state.emitted.replace(key.clone())
                     && old != key
                 {
@@ -910,7 +920,7 @@ impl CodexScanner {
                 state.dirty = false;
             }
         }
-        (summaries, retired)
+        (summaries, retired, invalidated)
     }
 
     /// The most recently persisted source with that ID; a tie at the top is ambiguous.

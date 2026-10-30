@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ struct Script {
     pages: VecDeque<Result<TranscriptPage, ProviderError>>,
     refresh_calls: usize,
     page_calls: usize,
+    page_requests: Vec<(Option<PageAnchor>, PageDirection)>,
     endless: bool,
 }
 
@@ -25,6 +27,8 @@ struct Fake {
     script: Arc<Mutex<Script>>,
     /// When set, every `refresh` call announces itself then waits for a permit.
     gate: Option<(Sender<()>, Receiver<()>)>,
+    /// When set, every `transcript_page` call announces itself then waits.
+    page_gate: Option<(Sender<()>, Receiver<()>)>,
 }
 
 fn key(provider: Provider, id: &str) -> SessionKey {
@@ -90,8 +94,14 @@ fn delta(sessions: Vec<SessionSummary>, warnings: Vec<Warning>, done: bool) -> P
         },
         sessions,
         removed: vec![],
+        invalidated: vec![],
         warnings,
     }
+}
+
+fn with_invalidated(mut d: ProviderDelta, keys: Vec<SessionKey>) -> ProviderDelta {
+    d.invalidated = keys;
+    d
 }
 
 fn empty_page() -> TranscriptPage {
@@ -127,12 +137,17 @@ impl ProviderReader for Fake {
     fn transcript_page(
         &mut self,
         _key: &SessionKey,
-        _anchor: Option<PageAnchor>,
-        _direction: PageDirection,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
         _request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
+        if let Some((entered, gate)) = &self.page_gate {
+            let _ = entered.send(());
+            let _ = gate.recv_timeout(WAIT);
+        }
         let mut s = self.script.lock().unwrap();
         s.page_calls += 1;
+        s.page_requests.push((anchor, direction));
         s.pages.pop_front().unwrap_or_else(|| Ok(empty_page()))
     }
     fn count_events_after(
@@ -164,6 +179,7 @@ fn fake(provider: Provider, script: &Arc<Mutex<Script>>) -> Fake {
         provider,
         script: script.clone(),
         gate: None,
+        page_gate: None,
     }
 }
 
@@ -175,6 +191,7 @@ fn gated(provider: Provider, script: &Arc<Mutex<Script>>) -> (Fake, Receiver<()>
             provider,
             script: script.clone(),
             gate: Some((entered_tx, gate_rx)),
+            page_gate: None,
         },
         entered_rx,
         gate_tx,
@@ -380,14 +397,17 @@ fn opencode_in_place_update_emits_transcript_invalidated_for_selected_session() 
             vec![],
             true,
         )));
-        // Same event count, newer persisted time: rows were edited in place.
-        s.refreshes.push_back(Ok(delta(
-            vec![
-                summary(Provider::OpenCode, "a", 20, 3),
-                summary(Provider::OpenCode, "b", 20, 3),
-            ],
-            vec![],
-            true,
+        // Rows were edited in place; the adapter names the sessions.
+        s.refreshes.push_back(Ok(with_invalidated(
+            delta(
+                vec![
+                    summary(Provider::OpenCode, "a", 20, 3),
+                    summary(Provider::OpenCode, "b", 20, 3),
+                ],
+                vec![],
+                true,
+            ),
+            vec![key(Provider::OpenCode, "a"), key(Provider::OpenCode, "b")],
         )));
     }
     let h = spawn(fake(Provider::OpenCode, &script));
@@ -505,4 +525,153 @@ fn shutdown_joins_without_panicking() {
     let start = Instant::now();
     assert!(h.shutdown());
     assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn invalidation_follows_the_adapter_signal_not_summary_changes() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    {
+        let mut s = script.lock().unwrap();
+        s.refreshes.push_back(Ok(delta(
+            vec![summary(Provider::Claude, "a", 10, 3)],
+            vec![],
+            true,
+        )));
+        // Persisted time and count both moved, but nothing was revised.
+        s.refreshes.push_back(Ok(delta(
+            vec![summary(Provider::Claude, "a", 20, 2)],
+            vec![],
+            true,
+        )));
+        // Same persisted time and count, content revised.
+        s.refreshes.push_back(Ok(with_invalidated(
+            delta(vec![summary(Provider::Claude, "a", 20, 2)], vec![], true),
+            vec![key(Provider::Claude, "a")],
+        )));
+    }
+    let h = spawn(fake(Provider::Claude, &script));
+    until(&h, finished(1));
+    h.tx.send(WorkerRequest::Select {
+        request_id: 1,
+        key: key(Provider::Claude, "a"),
+    })
+    .unwrap();
+    until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    let count = |ev: &[WorkerEvent]| {
+        ev.iter()
+            .filter(|e| matches!(e, WorkerEvent::TranscriptInvalidated { .. }))
+            .count()
+    };
+    h.tx.send(WorkerRequest::Refresh).unwrap();
+    assert_eq!(count(&until(&h, finished(2))), 0);
+    h.tx.send(WorkerRequest::Refresh).unwrap();
+    assert_eq!(count(&until(&h, finished(3))), 1);
+    assert!(h.shutdown());
+}
+
+#[test]
+fn process_sampling_is_not_starved_by_faster_refreshes() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let mut c = config();
+    c.refresh_ms = 40;
+    c.process_ms = 200;
+    c.process_enabled = true;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let sampler = Box::new(move |now| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(ProcessSnapshot {
+            sampled_at: now,
+            processes: vec![],
+        })
+    });
+    let h = WorkerHandle::spawn_with_sampler(
+        vec![Box::new(fake(Provider::Codex, &script))],
+        c,
+        sampler,
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1_100) {
+        let _ = h.rx.recv_timeout(Duration::from_millis(20));
+    }
+    let n = calls.load(Ordering::SeqCst);
+    assert!(n >= 4, "expected periodic samples, got {n}");
+    assert!(h.shutdown());
+}
+
+#[test]
+fn selection_arriving_during_a_page_load_is_served_without_more_messages() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, gate_rx) = mpsc::channel();
+    let mut f = fake(Provider::Codex, &script);
+    f.page_gate = Some((entered_tx, gate_rx));
+    let h = spawn(f);
+    until(&h, finished(1));
+    h.tx.send(WorkerRequest::Select {
+        request_id: 1,
+        key: key(Provider::Codex, "a"),
+    })
+    .unwrap();
+    entered.recv_timeout(WAIT).unwrap(); // request 1 is inside the adapter
+    h.tx.send(WorkerRequest::Select {
+        request_id: 2,
+        key: key(Provider::Codex, "b"),
+    })
+    .unwrap();
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    // No further messages are sent; request 2 must still be answered.
+    let events = until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    assert!(matches!(
+        events.last(),
+        Some(WorkerEvent::Transcript { request_id: 2, .. })
+    ));
+    assert!(h.shutdown());
+}
+
+#[test]
+fn initial_selection_requests_the_oldest_page_forward() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let h = spawn(fake(Provider::Codex, &script));
+    until(&h, finished(1));
+    h.tx.send(WorkerRequest::Select {
+        request_id: 1,
+        key: key(Provider::Codex, "a"),
+    })
+    .unwrap();
+    until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    assert_eq!(
+        script.lock().unwrap().page_requests,
+        vec![(None, PageDirection::Forward)]
+    );
+    assert!(h.shutdown());
+}
+
+#[test]
+fn requests_are_serviced_at_provider_boundaries() {
+    let a = Arc::new(Mutex::new(Script::default()));
+    let b = Arc::new(Mutex::new(Script::default()));
+    let (fa, entered_a, gate_a) = gated(Provider::Codex, &a);
+    let (fb, entered_b, gate_b) = gated(Provider::Claude, &b);
+    let h = WorkerHandle::spawn(vec![Box::new(fa), Box::new(fb)], config());
+    entered_a.recv_timeout(WAIT).unwrap();
+    h.tx.send(WorkerRequest::Select {
+        request_id: 1,
+        key: key(Provider::Codex, "a"),
+    })
+    .unwrap();
+    // Provider A finishes (done) in this single chunk; the page must be
+    // answered before provider B's chunk is released.
+    gate_a.send(()).unwrap();
+    entered_b.recv_timeout(WAIT).unwrap();
+    let events = until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::RefreshFinished { .. }))
+    );
+    gate_b.send(()).unwrap();
+    until(&h, finished(1));
+    assert!(h.shutdown());
 }

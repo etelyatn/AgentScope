@@ -18,6 +18,9 @@ use crate::domain::{
 pub struct ProviderDelta {
     pub sessions: Vec<SessionSummary>,
     pub removed: Vec<SessionKey>,
+    /// Sessions whose already-readable transcript content changed (revised in
+    /// place, rewritten, or rotated) so any loaded page is stale.
+    pub invalidated: Vec<SessionKey>,
     pub warnings: Vec<Warning>,
     pub scan: ScanProgress,
 }

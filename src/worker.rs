@@ -202,6 +202,9 @@ struct Worker {
     selected: Option<(u64, SessionKey)>,
     observation: Option<Result<ProcessSnapshot, ProcessError>>,
     last_scan: Option<ScanProgress>,
+    process_every: Duration,
+    /// Advanced only when a sample is actually taken, never by refresh passes.
+    next_process: Instant,
 }
 
 fn now_ms() -> Timestamp {
@@ -248,6 +251,7 @@ impl Worker {
         stop: Arc<AtomicBool>,
     ) -> Self {
         let states = readers.iter().map(|_| ProviderState::default()).collect();
+        let process_every = Duration::from_millis(config.process_ms.max(1));
         Self {
             readers,
             states,
@@ -263,14 +267,14 @@ impl Worker {
             selected: None,
             observation: None,
             last_scan: None,
+            process_every,
+            next_process: Instant::now() + process_every,
         }
     }
 
     fn run(mut self) {
         let refresh_every = Duration::from_millis(self.config.refresh_ms.max(1));
-        let process_every = Duration::from_millis(self.config.process_ms.max(1));
         let mut next_refresh = Instant::now() + refresh_every;
-        let mut next_process = Instant::now() + process_every;
         while !self.shutting_down {
             self.drain_requests();
             if self.shutting_down {
@@ -280,25 +284,28 @@ impl Worker {
             if self.shutting_down {
                 break;
             }
+            if self.has_due_load() {
+                // Loads queued while servicing (e.g. a selection that arrived
+                // during an adapter call) are answered now, not at the next tick.
+                continue;
+            }
             let now = Instant::now();
+            if self.config.process_enabled && now >= self.next_process {
+                self.sample_processes();
+                self.publish_after_sample();
+                continue;
+            }
             if !self.refresh_requested && now >= next_refresh {
                 self.refresh_requested = true;
             }
             if self.refresh_requested {
                 self.run_refresh();
                 next_refresh = Instant::now() + refresh_every;
-                next_process = Instant::now() + process_every;
-                continue;
-            }
-            if self.config.process_enabled && now >= next_process {
-                self.sample_processes();
-                self.publish_after_sample();
-                next_process = Instant::now() + process_every;
                 continue;
             }
             let mut deadline = next_refresh;
             if self.config.process_enabled {
-                deadline = deadline.min(next_process);
+                deadline = deadline.min(self.next_process);
             }
             if let Some(retry) = self.pending.iter().filter_map(|p| p.retry_at).min() {
                 deadline = deadline.min(retry);
@@ -310,6 +317,15 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => self.shutting_down = true,
             }
         }
+    }
+
+    /// A queued load that can run now. Servicing always removes it or pushes
+    /// its `retry_at` into the future, so this cannot spin.
+    fn has_due_load(&self) -> bool {
+        let now = Instant::now();
+        self.pending
+            .iter()
+            .any(|p| p.retry_at.is_none_or(|t| t <= now))
     }
 
     // ---- requests -------------------------------------------------------
@@ -343,7 +359,8 @@ impl Worker {
                     request_id,
                     key,
                     anchor: None,
-                    direction: PageDirection::Backward,
+                    // Transcripts open oldest-first; End/G requests Backward explicitly.
+                    direction: PageDirection::Forward,
                 });
             }
             WorkerRequest::LoadPage {
@@ -549,40 +566,43 @@ impl Worker {
                 }
                 self.last_scan = Some(scan);
                 self.publish(generation, scan);
+                // Checkpoint after every chunk, including a provider's last or
+                // failed one, so page/source/shutdown requests never wait for
+                // the remaining providers.
+                self.checkpoint();
                 if scan.done {
                     break;
                 }
-                // Between chunks: stay responsive.
-                self.drain_requests();
-                self.service_pending();
             }
         }
         self.emit(WorkerEvent::RefreshFinished { generation });
     }
 
+    /// Drain requests and answer every actionable load.
+    fn checkpoint(&mut self) {
+        self.drain_requests();
+        self.service_pending();
+        while !self.shutting_down && self.has_due_load() {
+            self.service_pending();
+        }
+    }
+
     fn apply_delta(&mut self, i: usize, delta: crate::providers::ProviderDelta) {
         let selected = self.selected.as_ref().map(|(_, k)| k.clone());
-        let mut invalidated = false;
         let state = &mut self.states[i];
         state.failure = None;
         for key in &delta.removed {
             state.sessions.remove(key);
         }
         for session in delta.sessions {
-            if selected.as_ref() == Some(&session.key)
-                && state
-                    .sessions
-                    .get(&session.key)
-                    .is_some_and(|old| changed_in_place(old, &session))
-            {
-                invalidated = true;
-            }
             state.sessions.insert(session.key.clone(), session);
         }
         for warning in delta.warnings {
             state.pending.insert(warning.key.clone(), warning);
         }
-        if invalidated && let Some(key) = selected {
+        if let Some(key) = selected
+            && delta.invalidated.contains(&key)
+        {
             self.emit(WorkerEvent::TranscriptInvalidated { key });
         }
     }
@@ -596,6 +616,7 @@ impl Worker {
             self.emit(WorkerEvent::Processes { snapshot });
         }
         self.observation = Some(observation);
+        self.next_process = Instant::now() + self.process_every;
     }
 
     fn publish_after_sample(&mut self) {
@@ -663,16 +684,4 @@ impl Worker {
             }
         }
     }
-}
-
-/// Whether the persisted state of a session moved in a way that can make an
-/// already-loaded page wrong. OpenCode rows are updated in place, so any
-/// `last_persisted_at` change counts; append-only JSONL providers only
-/// invalidate when the persisted time moved without the event count growing
-/// (rewrite/rotation), since pure appends are handled by new-event counting.
-fn changed_in_place(old: &SessionSummary, new: &SessionSummary) -> bool {
-    if old.last_persisted_at == new.last_persisted_at {
-        return false;
-    }
-    new.key.provider == Provider::OpenCode || new.displayed_event_count <= old.displayed_event_count
 }

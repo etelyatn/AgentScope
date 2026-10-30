@@ -812,3 +812,29 @@ fn record_cap_is_enforced_in_bytes_for_multibyte_and_nul_text() {
     let p = all(&mut s);
     assert_eq!(p.events[0].id, "m1#0");
 }
+
+#[test]
+fn in_place_row_update_is_reported_as_invalidated_in_the_delta() {
+    let (_d, db, conn) = fixture();
+    msg(
+        &conn,
+        "m1",
+        "assistant",
+        10,
+        10,
+        r#"{"content":[{"type":"text","text":"draft"}]}"#,
+    );
+    let mut s = scanner_for(&db);
+    let first = s.refresh(NOW, BIG).expect("refresh");
+    assert!(first.invalidated.is_empty(), "first sight is not a change");
+    let again = s.refresh(NOW, BIG).expect("refresh");
+    assert!(again.invalidated.is_empty());
+    conn.execute(
+        "UPDATE session_message SET data = ?1, time_updated = 9000 WHERE id = 'm1'",
+        [r#"{"content":[{"type":"text","text":"final"}]}"#],
+    )
+    .expect("update");
+    let after = s.refresh(NOW, BIG).expect("refresh");
+    assert_eq!(after.invalidated.len(), 1);
+    assert_eq!(after.invalidated[0], after.sessions[0].key);
+}

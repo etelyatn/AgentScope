@@ -14,6 +14,7 @@ impl ProviderReader for Stub {
         Ok(ProviderDelta {
             sessions: vec![],
             removed: vec![],
+            invalidated: vec![],
             warnings: vec![],
             scan: ScanProgress {
                 provider: Provider::Codex,

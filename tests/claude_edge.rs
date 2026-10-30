@@ -360,3 +360,38 @@ fn parent_user_after_sidechain_only_refresh_clears_side_usage() {
             .is_none()
     );
 }
+
+#[test]
+fn same_timestamp_block_revision_is_reported_as_invalidated() {
+    // No timestamps anywhere: persisted time and event count cannot move.
+    let (_dir, path, mut scanner) = setup(
+        &[record("a", "m", json!([{"type":"text","text":"old"}]))],
+        100,
+        1 << 20,
+    );
+    let first = scanner.scan_roster(NOW, BIG).unwrap();
+    assert!(first.invalidated.is_empty());
+    let count = first.sessions[0].displayed_event_count;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        record("a", "m", json!([{"type":"text","text":"new"}]))
+    )
+    .unwrap();
+    let second = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(second.sessions[0].displayed_event_count, count);
+    assert_eq!(second.invalidated, vec![second.sessions[0].key.clone()]);
+    // A plain append of a new block is not an invalidation.
+    writeln!(
+        file,
+        "{}",
+        record("b", "m2", json!([{"type":"text","text":"next"}]))
+    )
+    .unwrap();
+    let third = scanner.scan_roster(NOW, BIG).unwrap();
+    assert!(third.invalidated.is_empty());
+}
