@@ -123,7 +123,7 @@ pub fn render_roster(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     frame.render_widget(
         Paragraph::new(Line::styled(
             fit(
-                "j/k move  s sort  S reverse  r refresh  q quit",
+                "j/k move  Enter open  s sort  S reverse  r refresh  q quit",
                 area.width as usize,
             ),
             palette.dim(),

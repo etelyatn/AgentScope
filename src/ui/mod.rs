@@ -3,6 +3,7 @@
 //! The UI thread only polls terminal input and applies worker events; every
 //! file/database read happens in the worker thread.
 
+mod inspector;
 mod roster;
 pub mod widgets;
 
@@ -19,11 +20,20 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::App;
+use crate::app::{App, Screen};
 use crate::domain::Timestamp;
 use crate::worker::{WorkerEvent, WorkerHandle, WorkerRequest};
 
+pub use inspector::{REASONING_LABEL, render_inspector};
 pub use roster::{MIN_HEIGHT, MIN_WIDTH, render_roster};
+
+/// Draw whichever screen is active.
+pub fn render(frame: &mut ratatui::Frame, app: &App, ctx: &RosterContext) {
+    match app.screen {
+        Screen::Roster => render_roster(frame, app, ctx),
+        Screen::Inspector | Screen::Details => render_inspector(frame, app, ctx),
+    }
+}
 
 /// Presentation inputs that are not part of `App` state.
 #[derive(Clone, Debug, Default)]
@@ -108,19 +118,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     if key.kind != KeyEventKind::Press {
         return KeyAction::None;
     }
+    let inspector = matches!(app.screen, Screen::Inspector | Screen::Details);
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => KeyAction::Quit,
             KeyCode::Char('u') => {
-                app.move_selection(-10);
+                page_move(app, inspector, -10);
                 KeyAction::None
             }
             KeyCode::Char('d') => {
-                app.move_selection(10);
+                page_move(app, inspector, 10);
                 KeyAction::None
             }
             _ => KeyAction::None,
         };
+    }
+    if inspector {
+        return handle_inspector_key(app, key.code);
     }
     match key.code {
         // No text input exists on the roster yet, so `q` always quits here.
@@ -131,12 +145,48 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
         KeyCode::PageUp => app.move_selection(-10),
         KeyCode::Char('g') | KeyCode::Home => app.move_selection(isize::MIN),
         KeyCode::Char('G') | KeyCode::End => app.move_selection(isize::MAX),
+        KeyCode::Enter => {
+            app.open_inspector();
+        }
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('S') => app.sort(app.sort_mode()),
         KeyCode::Char('r') => return KeyAction::Refresh,
         _ => {}
     }
     KeyAction::None
+}
+
+fn page_move(app: &mut App, inspector: bool, delta: isize) {
+    if inspector {
+        app.inspector_move(delta);
+    } else {
+        app.move_selection(delta);
+    }
+}
+
+fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
+    match code {
+        KeyCode::Char('q') => return KeyAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => app.inspector_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.inspector_move(-1),
+        KeyCode::PageDown => app.inspector_move(10),
+        KeyCode::PageUp => app.inspector_move(-10),
+        KeyCode::Char('g') | KeyCode::Home => app.inspector_first(),
+        KeyCode::Char('G') | KeyCode::End => app.inspector_last(),
+        KeyCode::Enter => app.inspector_toggle(),
+        KeyCode::Esc | KeyCode::Backspace => app.close_inspector(),
+        KeyCode::Char('r') => return KeyAction::Refresh,
+        _ => {}
+    }
+    KeyAction::None
+}
+
+/// Send queued inspector requests to the worker. Never blocks: the request
+/// channel is unbounded, and a stopped worker simply drops them.
+fn flush_requests(app: &mut App, worker: &WorkerHandle) {
+    for request in app.take_requests() {
+        let _ = worker.tx.send(request);
+    }
 }
 
 /// Apply every queued worker event. Returns `false` when the worker is gone.
@@ -151,8 +201,17 @@ fn drain_worker(app: &mut App, ctx: &mut RosterContext, worker: &WorkerHandle) -
             }) => {
                 app.apply_roster_generation(generation, sessions, warnings, scan);
             }
-            Ok(WorkerEvent::Warning { warning }) => app.apply_warning(warning),
+            Ok(WorkerEvent::Warning { warning }) => {
+                if warning.key.source == "transcript" {
+                    app.transcript_load_failed();
+                }
+                app.apply_warning(warning);
+            }
             Ok(WorkerEvent::RefreshFinished { .. }) => ctx.last_refresh = Some(clock_label()),
+            Ok(WorkerEvent::Transcript { request_id, page }) => {
+                app.apply_transcript(request_id, page);
+            }
+            Ok(WorkerEvent::TranscriptInvalidated { key }) => app.invalidate_transcript(&key),
             Ok(_) => {}
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Disconnected) => return false,
@@ -189,14 +248,13 @@ pub fn run(
             ctx.error = Some("worker thread exited".into());
             app.live = false;
         }
+        flush_requests(app, &worker);
         let now = now_millis();
         if now - last_clock >= 1000 {
             last_clock = now;
             app.set_now(now);
         }
-        guard
-            .terminal()
-            .draw(|frame| render_roster(frame, app, ctx))?;
+        guard.terminal().draw(|frame| render(frame, app, ctx))?;
 
         if !event::poll(TICK)? {
             continue;
@@ -215,6 +273,7 @@ pub fn run(
                 }
                 KeyAction::None => {}
             }
+            flush_requests(app, &worker);
         }
     }
     drop(guard);
@@ -226,6 +285,7 @@ pub fn run(
 /// startup notes, its error, and its refresh time.
 pub fn reset_for_new_worker(app: &mut App, ctx: &mut RosterContext) {
     app.reset_generation();
+    app.restart_transcript();
     app.live = true;
     ctx.error = None;
     ctx.notes.clear();

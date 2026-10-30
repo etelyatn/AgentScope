@@ -7,9 +7,13 @@ use std::cmp::Ordering;
 
 use crate::domain::{
     Provider, ScanProgress, SessionKey, SessionLink, SessionSummary, Status, StatusLabel,
-    Thresholds, Timestamp, Warning,
+    Thresholds, Timestamp, TranscriptPage, Warning,
 };
 use crate::status::synthesize;
+use crate::worker::WorkerRequest;
+
+mod transcript;
+pub use transcript::{MAX_LOADED_EVENTS, PageKind, Transcript};
 
 const PROVIDERS: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::OpenCode];
 
@@ -110,6 +114,9 @@ pub struct App {
     pub screen: Screen,
     pub focus: Focus,
     pub live: bool,
+    transcript: Option<Transcript>,
+    request_seq: u64,
+    outbox: Vec<WorkerRequest>,
 }
 
 impl App {
@@ -130,6 +137,9 @@ impl App {
             screen: Screen::default(),
             focus: Focus::default(),
             live: true,
+            transcript: None,
+            request_seq: 0,
+            outbox: Vec::new(),
         }
     }
 
@@ -282,6 +292,166 @@ impl App {
     /// Every discovered session, ignoring filter and sort.
     pub fn all_rows(&self) -> Vec<RosterRow<'_>> {
         (0..self.sessions.len()).map(|i| self.row(i)).collect()
+    }
+
+    /// One session by key, with its synthesized status.
+    pub fn session(&self, key: &SessionKey) -> Option<RosterRow<'_>> {
+        let i = self.sessions.iter().position(|s| &s.key == key)?;
+        Some(self.row(i))
+    }
+
+    // ---- inspector and transcript (spec §10.3) ---------------------------
+
+    pub fn transcript(&self) -> Option<&Transcript> {
+        self.transcript.as_ref()
+    }
+
+    /// Requests for the worker queued by inspector actions. The UI loop sends
+    /// them; `App` itself never touches I/O.
+    pub fn take_requests(&mut self) -> Vec<WorkerRequest> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// Open the inspector for the selected roster row and request its oldest
+    /// page. Returns `false` when nothing is selected.
+    pub fn open_inspector(&mut self) -> bool {
+        let Some(key) = self.selected.clone() else {
+            return false;
+        };
+        self.start_transcript(key, None);
+        self.screen = Screen::Inspector;
+        true
+    }
+
+    pub fn close_inspector(&mut self) {
+        self.transcript = None;
+        self.screen = Screen::Roster;
+    }
+
+    /// Reload the open transcript from its oldest page, keeping expansion.
+    /// Used when the session changed in place and when the worker is replaced.
+    pub fn restart_transcript(&mut self) {
+        if let Some(old) = self.transcript.take() {
+            let key = old.key().clone();
+            self.start_transcript(key, Some(old));
+        }
+    }
+
+    /// The worker reported that `key` changed in place. This is not a new event.
+    pub fn invalidate_transcript(&mut self, key: &SessionKey) {
+        if self.transcript.as_ref().is_some_and(|t| t.key() == key) {
+            self.restart_transcript();
+        }
+    }
+
+    /// Merge a worker page response. Stale or unrequested responses are ignored.
+    pub fn apply_transcript(&mut self, request_id: u64, page: TranscriptPage) -> bool {
+        let Some(count) = self
+            .transcript
+            .as_ref()
+            .map(|t| self.displayed_count(t.key()))
+        else {
+            return false;
+        };
+        let applied = self
+            .transcript
+            .as_mut()
+            .is_some_and(|t| t.apply_page(request_id, page, count));
+        if applied {
+            self.pump_transcript();
+        }
+        applied
+    }
+
+    /// The page load failed for good; allow the user to trigger it again.
+    pub fn transcript_load_failed(&mut self) {
+        if let Some(t) = &mut self.transcript {
+            t.abort_pending();
+        }
+    }
+
+    pub fn inspector_move(&mut self, delta: isize) {
+        if let Some(t) = &mut self.transcript {
+            t.move_selection(delta);
+        }
+        self.pump_transcript();
+    }
+
+    /// `g`/`Home`: the oldest loaded event.
+    pub fn inspector_first(&mut self) {
+        if let Some(t) = &mut self.transcript {
+            t.select_first();
+        }
+        self.pump_transcript();
+    }
+
+    /// `G`/`End`: jump to the newest event, loading the tail page when the
+    /// window does not already end at it.
+    pub fn inspector_last(&mut self) {
+        let Some(t) = &self.transcript else {
+            return;
+        };
+        let current =
+            !t.has_newer() && t.loaded() && t.new_events(self.displayed_count(t.key())) == 0;
+        if current {
+            if let Some(t) = &mut self.transcript {
+                t.select_last();
+            }
+            self.pump_transcript();
+        } else {
+            let id = self.next_request_id();
+            if let Some(t) = &mut self.transcript {
+                let request = t.tail_request(id);
+                self.outbox.push(request);
+            }
+        }
+    }
+
+    pub fn inspector_toggle(&mut self) {
+        if let Some(t) = &mut self.transcript {
+            t.toggle_selected();
+        }
+    }
+
+    /// Events persisted since the newest page was loaded (`N new`).
+    pub fn new_event_count(&self) -> usize {
+        self.transcript
+            .as_ref()
+            .map_or(0, |t| t.new_events(self.displayed_count(t.key())))
+    }
+
+    fn displayed_count(&self, key: &SessionKey) -> usize {
+        self.sessions
+            .iter()
+            .find(|s| &s.key == key)
+            .map_or(0, |s| s.displayed_event_count)
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        self.request_seq += 1;
+        self.request_seq
+    }
+
+    fn start_transcript(&mut self, key: SessionKey, previous: Option<Transcript>) {
+        let id = self.next_request_id();
+        let mut transcript = Transcript::new(key.clone(), self.displayed_count(&key));
+        if let Some(previous) = &previous {
+            transcript.carry_over(previous);
+        }
+        let request = transcript.select_request(id);
+        self.transcript = Some(transcript);
+        self.outbox.push(request);
+    }
+
+    /// Queue the next edge page when the selection is near the window edge.
+    fn pump_transcript(&mut self) {
+        let id = self.request_seq + 1;
+        if let Some(t) = &mut self.transcript
+            && let Some(request) = t.next_load(id)
+        {
+            self.request_seq = id;
+            self.outbox.push(request);
+        }
     }
 
     pub fn selected_key(&self) -> Option<SessionKey> {
