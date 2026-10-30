@@ -907,3 +907,38 @@ fn token_usage_record_forms_are_all_read_and_latest_wins() {
         );
     }
 }
+
+#[test]
+fn rotation_charges_the_replacements_full_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let path = dated(&root, "rollout-rot.jsonl");
+    let small = session_meta("2026-10-29T10:00:00Z", "a", "/p");
+    write_lines(&path, std::slice::from_ref(&small));
+    let mut s = scanner(&root);
+    scan_until_done(&mut s, BIG);
+
+    // Replace with a single record much longer than the old end position.
+    let big = session_meta(
+        "2026-10-29T10:00:00Z",
+        "a",
+        &format!("/{}", "z".repeat(400)),
+    );
+    let old_len = small.len() as u64 + 1;
+    let new_len = big.len() as u64 + 1;
+    let max_bytes = (new_len - 20) as usize;
+    assert!(new_len > max_bytes as u64 && new_len - old_len < max_bytes as u64);
+    std::fs::remove_file(&path).unwrap();
+    write_lines(&path, &[big]);
+    // Offset difference alone (new_len - old_len) fits the budget; the full record does not.
+    let budget = RefreshBudget {
+        max_records: 1_000,
+        max_bytes,
+        max_millis: 60_000,
+    };
+    let first = s.scan_roster(NOW, budget).unwrap();
+    assert!(
+        !first.scan.done,
+        "replacement's full bytes must exhaust the budget"
+    );
+}

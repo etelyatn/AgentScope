@@ -520,18 +520,20 @@ impl CodexScanner {
                 return Advance::Done;
             };
             let before = cursor.position();
+            let rotations_before = cursor.rotation_count();
             let next = cursor.next_record();
             let after = cursor.position();
-            // A rotation restarts at 0, so everything read since is new.
-            let consumed = if after >= before {
-                after - before
-            } else {
+            let rotations = cursor.rotation_count();
+            // A rotation restarts at 0, so the whole post-reset position is new data;
+            // offsets alone cannot tell rotation from an append.
+            let consumed = if rotations > rotations_before {
                 after
+            } else {
+                after.saturating_sub(before)
             };
             meter.bytes = meter
                 .bytes
                 .saturating_add(usize::try_from(consumed).unwrap_or(usize::MAX));
-            let rotations = cursor.rotation_count();
             if rotations > state.rotations_seen {
                 // The file was replaced or truncated: restart its parse state.
                 state.parsed = Parsed::default();
