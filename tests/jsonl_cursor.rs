@@ -154,3 +154,38 @@ fn tail_records_returns_newest_complete_records_in_order() {
         Some(Record::Json { offset: 0, .. })
     ));
 }
+
+#[test]
+fn failed_reopen_is_retried_and_recovers() {
+    let (_dir, path) = temp();
+    append(&path, b"{\"a\":1}\n");
+    let mut cursor = JsonlCursor::open(path.clone(), 1024).unwrap();
+    assert!(cursor.next_record().unwrap().is_some());
+    assert!(cursor.next_record().unwrap().is_none());
+    fs::remove_file(&path).unwrap();
+    assert!(cursor.next_record().is_err());
+    assert!(cursor.next_record().is_err(), "error must not be swallowed");
+    fs::write(&path, b"{\"b\":2}\n{\"c\":3}\n").unwrap();
+    assert!(
+        matches!(cursor.next_record().unwrap(), Some(Record::Json { offset: 0, ref value }) if value["b"] == 2)
+    );
+    assert_eq!(cursor.rotation_count(), 1);
+}
+
+#[test]
+fn larger_replacement_is_detected_even_if_creation_time_is_preserved() {
+    let (dir, path) = temp();
+    append(&path, b"{\"o\":1}\n");
+    let mut cursor = JsonlCursor::open(path.clone(), 1024).unwrap();
+    assert!(cursor.next_record().unwrap().is_some());
+    assert!(cursor.next_record().unwrap().is_none());
+    // Written immediately, so Windows tunneling may reuse the creation time.
+    let other = dir.path().join("n.jsonl");
+    fs::write(&other, b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::rename(&other, &path).unwrap();
+    assert!(
+        matches!(cursor.next_record().unwrap(), Some(Record::Json { offset: 0, ref value }) if value["n"] == 1)
+    );
+    assert_eq!(cursor.rotation_count(), 1);
+}

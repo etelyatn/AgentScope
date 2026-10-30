@@ -151,11 +151,21 @@ static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 
+// Command-line style `--password value` / `--api-key value` (whitespace-separated).
+static CLI_ARG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)(--?[\w-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\s+)",
+        r#"("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s"'-][^\s]*)"#,
+    ))
+    .expect("valid regex")
+});
+
 /// Best-effort masking of common credential shapes. Not a guarantee.
 pub fn redact(input: &str) -> String {
     let s = PRIVATE_KEY.replace_all(input, MASK);
     let s = TOKEN_SHAPES.replace_all(&s, MASK);
     let s = BEARER.replace_all(&s, |c: &Captures<'_>| format!("{}{MASK}", &c[1]));
+    let s = CLI_ARG.replace_all(&s, |c: &Captures<'_>| format!("{}{MASK}", &c[1]));
     ASSIGNMENT
         .replace_all(&s, |c: &Captures<'_>| {
             let value = &c[2];

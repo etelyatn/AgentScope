@@ -143,13 +143,18 @@ impl JsonlCursor {
 
     fn check_rotation(&mut self) -> io::Result<()> {
         let current = Stamp::of(&fs::metadata(&self.path)?);
-        let rotated = current.key != self.stamp.key
+        // The held handle still describes the file we are reading; if the path no longer
+        // matches it (identity, length, or mtime), the path was replaced. This also catches
+        // Windows "tunneled" replacements that keep the old creation time.
+        let held = Stamp::of(&self.reader.get_ref().metadata()?);
+        let rotated = current != held
             || current.len < self.offset
             || (current.len == self.stamp.len && current.modified != self.stamp.modified);
-        self.stamp = current;
         if rotated {
+            // Open first; commit stamp and handle together so a failed reopen is retried.
             let file = File::open(&self.path)?;
-            self.stamp = Stamp::of(&file.metadata()?);
+            let stamp = Stamp::of(&file.metadata()?);
+            self.stamp = stamp;
             self.reader = BufReader::new(file);
             self.buffer.clear();
             self.offset = 0;
@@ -157,6 +162,8 @@ impl JsonlCursor {
             self.too_large = false;
             self.incomplete_reported = false;
             self.rotations += 1;
+        } else {
+            self.stamp = current;
         }
         Ok(())
     }
@@ -164,8 +171,8 @@ impl JsonlCursor {
     /// Returns one outcome. A partial line is retained and retried when more bytes arrive.
     pub fn next_record(&mut self) -> io::Result<Option<Record>> {
         if self.at_eof {
-            self.at_eof = false;
             self.check_rotation()?;
+            self.at_eof = false;
         }
         loop {
             let available = self.reader.fill_buf()?;
@@ -254,39 +261,72 @@ impl JsonlCursor {
         let mut data = Vec::new();
         file.take(len - read_from).read_to_end(&mut data)?;
 
-        let mut base = read_from;
-        if start > 0 {
-            // data[0] is the byte before the window; a line starts at the window only
-            // if that byte ends the previous line.
-            if data[0] == b'\n' {
+        Ok(tail_from_window(
+            data,
+            read_from,
+            start > 0,
+            max_records,
+            self.max_bytes,
+        ))
+    }
+}
+
+/// Parses complete lines from a window read at `read_from`. When `has_lead`, `data[0]` is
+/// the byte before the window proper. A short or empty buffer (the file was truncated
+/// while being read) yields no records rather than panicking.
+fn tail_from_window(
+    mut data: Vec<u8>,
+    read_from: u64,
+    has_lead: bool,
+    max_records: usize,
+    max_record_bytes: usize,
+) -> Vec<Record> {
+    let mut base = read_from;
+    if has_lead {
+        match data.first() {
+            None => return Vec::new(),
+            Some(b'\n') => {
                 data.remove(0);
                 base += 1;
-            } else if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+            }
+            Some(_) => {
+                let Some(pos) = data.iter().position(|&b| b == b'\n') else {
+                    return Vec::new();
+                };
                 data.drain(..=pos);
                 base += pos as u64 + 1;
-            } else {
-                return Ok(Vec::new());
             }
         }
-        let Some(end) = data.iter().rposition(|&b| b == b'\n') else {
-            return Ok(Vec::new());
-        };
-        let mut records = Vec::new();
-        let mut line_start = 0usize;
-        for (i, _) in data[..=end]
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| **b == b'\n')
-        {
-            records.push(classify(
-                &data[line_start..i],
-                base + line_start as u64,
-                self.max_bytes,
-            ));
-            line_start = i + 1;
-        }
-        let skip = records.len().saturating_sub(max_records);
-        records.drain(..skip);
-        Ok(records)
+    }
+    let Some(end) = data.iter().rposition(|&b| b == b'\n') else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    let mut line_start = 0usize;
+    for (i, _) in data[..=end]
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+    {
+        records.push(classify(
+            &data[line_start..i],
+            base + line_start as u64,
+            max_record_bytes,
+        ));
+        line_start = i + 1;
+    }
+    let skip = records.len().saturating_sub(max_records);
+    records.drain(..skip);
+    records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_from_window;
+
+    #[test]
+    fn truncated_tail_window_returns_nothing_instead_of_panicking() {
+        assert!(tail_from_window(Vec::new(), 99, true, 5, 1024).is_empty());
+        assert!(tail_from_window(b"x".to_vec(), 99, true, 5, 1024).is_empty());
     }
 }

@@ -213,3 +213,19 @@ fn preview_uses_sequence_aware_width() {
     let p = preview("ab\ncd", 100, 3);
     assert_eq!(p.preview, "ab\n");
 }
+
+#[test]
+fn masks_whitespace_separated_credential_arguments() {
+    for text in [
+        "run --password synthetic-private-value now",
+        "run --api-key synthetic-private-value now",
+        "run --api_key 'synthetic private value' now",
+        "run -token synthetic-private-value now",
+    ] {
+        let out = redact(text);
+        assert!(!out.contains("synthetic"), "{out}");
+        assert!(out.contains("now"), "{out}");
+    }
+    assert_eq!(redact("--password --verbose"), "--password --verbose");
+    assert_eq!(redact("the password policy"), "the password policy");
+}
