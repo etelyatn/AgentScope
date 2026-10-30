@@ -16,6 +16,9 @@ pub struct Counters {
     pub preview_bytes: u64,
     /// Largest single preview allocated.
     pub max_preview_bytes: u64,
+    /// Transient bytes allocated while building previews (sanitize and redact buffers
+    /// are sized by the whole input, before the cut).
+    pub preview_temp_bytes: u64,
 }
 
 #[cfg(feature = "perf-counters")]
@@ -25,6 +28,7 @@ thread_local! {
         records_parsed: 0,
         preview_bytes: 0,
         max_preview_bytes: 0,
+        preview_temp_bytes: 0,
     }) };
 }
 
@@ -78,3 +82,12 @@ pub(crate) fn preview_allocated(bytes: usize) {
 #[cfg(not(feature = "perf-counters"))]
 #[inline(always)]
 pub(crate) fn preview_allocated(_bytes: usize) {}
+
+#[cfg(feature = "perf-counters")]
+pub(crate) fn preview_temp(bytes: usize) {
+    update(|c| c.preview_temp_bytes += bytes as u64);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+pub(crate) fn preview_temp(_bytes: usize) {}

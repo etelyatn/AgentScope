@@ -1983,6 +1983,7 @@ fn prefix_hash(path: &Path, end: u64) -> Option<u64> {
     while left > 0 {
         let want = usize::try_from(left.min(buf.len() as u64)).ok()?;
         file.read_exact(&mut buf[..want]).ok()?;
+        crate::perf::bytes_read(want);
         hash.update(&buf[..want]);
         left -= want as u64;
     }
@@ -2004,6 +2005,7 @@ fn fingerprint(path: &Path, end: u64) -> Option<u64> {
         file.seek(SeekFrom::Start(start)).ok()?;
         let mut buf = vec![0u8; usize::try_from(len).ok()?];
         file.read_exact(&mut buf).ok()?;
+        crate::perf::bytes_read(buf.len());
         buf.hash(&mut hasher);
     }
     Some(hasher.finish())

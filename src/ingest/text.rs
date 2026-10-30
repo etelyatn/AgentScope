@@ -191,6 +191,8 @@ pub fn display_safe(input: &str) -> String {
 /// (newlines count as one column). The locator is left `None` for the caller.
 pub fn preview(input: &str, max_bytes: usize, max_cols: usize) -> BoundedText {
     let safe = display_safe(input);
+    // sanitize allocates an input-sized buffer; redact returns another of `safe` size.
+    crate::perf::preview_temp(input.len() + safe.len());
     let mut end = 0usize;
     let mut base = 0usize; // columns consumed before the current line segment
     let mut seg_start = 0usize;

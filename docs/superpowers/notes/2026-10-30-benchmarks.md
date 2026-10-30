@@ -38,18 +38,19 @@ Budgets per scan call match the worker chunk (256 records, 100 ms).
 | Measurement | Codex (2,000 files) | Claude (200 files) | Target |
 |---|---|---|---|
 | First roster delta | 11 ms (13 sessions) | n/a | usable < 3 s |
-| Complete initial roster | 268 ms in 157 calls; longest call 11 ms | 53 ms | < 3 s |
+| Complete initial roster | 250 ms in 157 calls; longest call 11 ms | 53 ms | < 3 s |
 | Bytes read / records parsed, initial | 12,688,900 / 40,000 (each source byte once) | 1,167,550 bytes | — |
-| First transcript page | 0.28 ms, 10 events, 12,700 bytes read | 0.73 ms, 20 events, 17,580 bytes read | < 500 ms |
+| First transcript page | 0.28 ms, 10 events, 12,700 bytes read | 1.1 ms, 20 events, 17,580 bytes read | < 500 ms |
 | Refresh, nothing changed | 3.6 ms, 0 bytes, 0 records | 4.3 ms, 0 bytes | no reparse |
-| Refresh, one appended record | 3.6 ms, 167 bytes, 1 record | n/a (counted in the test: new line + ≤1.5 KB integrity sample) | only changed |
+| Refresh, one appended record | 4.0 ms, 6,517 bytes (167 new + 6,350 prefix integrity re-read), 1 record | n/a (counted in the test: new line + ≤1.5 KB integrity sample) | only changed |
 
 All measured values are well inside the §13.1 targets on this machine. Timings vary run to run; the work counts are exact.
 
 ## Notes
 
-- Roster scans are **incremental, not metadata-only**: Codex and Claude stream every record of a file once during the initial pass (usage and last-activity need them), chunked by the refresh budget so no call exceeds `max_bytes`/`max_records` plus one record. Afterwards unchanged files cost no I/O, and appended files cost only the new bytes.
-- A Codex file outside the newest 32 releases its cursor; appending to it re-reads that one file from the start (bounded by that file's size). Newest files append in O(new bytes).
-- The Claude adapter keeps a cursor (open file handle) per scanned file. The test corpus for Claude is therefore kept below 256 files, the default macOS soft limit; a full 2,000-file Claude roster would need more handles than that platform grants by default.
-- Claude page requests re-hash the consumed prefix for files up to 4 MiB (and sample larger ones), so a page request may read up to about twice the file length; the budget test allows exactly that.
-- Adapters cut preview bodies at 2 KiB while building them and then fit each row to the page byte budget, so a small page budget can still allocate up to one 2 KiB body per row visited.
+- **Known v1 limitation: the roster scan is not metadata-only.** The spec's §13.2 calls for a header/tail metadata pass; that is deferred. Codex and Claude stream every record of each file once during the initial pass (usage and last activity need them). The enforced bounds are: each scan call stays within its records/bytes budget plus one record, and across the pass each source byte is read once. Afterwards unchanged files cost no I/O.
+- **Append cost includes integrity reads.** Growing a file makes the adapter re-read the consumed prefix to prove it is unchanged (exact hash up to 4 MiB; three 512-byte samples beyond). Both Codex (`prefix_hash`, `fingerprint`) and Claude count these bytes, so an append to a ~6 KB Codex file reads 6,517 bytes, not 167. For files up to 4 MiB this is O(file size) per append; the budget tests assert it exactly.
+- A Codex file outside the newest 32 releases its cursor; appending to it costs one integrity pass plus a full re-read of that file (asserted as `old_before + old_len`).
+- The Claude adapter keeps a cursor (open file handle) per scanned file, so its corpus is kept below 256 files (the default macOS soft limit); a full 2,000-file Claude roster would exceed that.
+- Claude page requests re-hash the consumed prefix (up to 4 MiB; sampled beyond), so a page may read about twice the file length; the budget test allows that.
+- **Preview allocation.** Retained previews are cut at 2 KiB per body before being kept, but sanitize and redact first allocate buffers sized by the whole source text (about two per visited row, bounded by the 1 MiB record cap). `preview_temp_bytes` counts these and the test asserts `visited * (2 * row_bytes)`. The page byte cap bounds what a page keeps, not the transient peak while building it; avoiding source-sized temporaries would need a pre-cut that preserves redaction correctness and is not done in v1.
