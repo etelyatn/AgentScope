@@ -296,3 +296,135 @@ fn revisions_and_shared_message_usage_are_consistent_across_pages() {
     assert_eq!(page.events.iter().filter(|e| e.usage.is_some()).count(), 1);
     assert_eq!(page.events[1].text.as_ref().unwrap().preview, "replacement");
 }
+
+#[test]
+fn index_preserves_partial_record_completed_beyond_scanned_boundary() {
+    let (_dir, path, mut scanner, key) = setup(&[assistant("first", json!("first"))]);
+    let line = assistant("second", json!("second")).to_string();
+    let split = line.len() / 2;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    write!(file, "{}", &line[..split]).unwrap();
+    file.flush().unwrap();
+    scanner.refresh(NOW, BUDGET).unwrap();
+    writeln!(file, "{}", &line[split..]).unwrap();
+    file.flush().unwrap();
+    let page = scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    scanner.refresh(NOW, BUDGET).unwrap();
+    let page = scanner
+        .transcript_page(&key, None, PageDirection::Backward, PAGE)
+        .unwrap();
+    assert_eq!(page.events[0].text.as_ref().unwrap().preview, "second");
+}
+
+#[test]
+fn large_sampled_source_rejects_replacement_with_identical_samples() {
+    let (_dir, path, mut scanner, key) = setup(&[assistant("a", json!("visible"))]);
+    let locator = scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .unwrap()
+        .events[0]
+        .provenance
+        .locator
+        .clone();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, "{}", "x".repeat(5 * 1024 * 1024)).unwrap();
+    drop(file);
+    scanner.refresh(NOW, BUDGET).unwrap();
+    assert!(scanner.source_record(&locator).is_ok());
+    let replacement = path.with_extension("replacement");
+    std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(scanner.source_record(&locator).is_err());
+}
+
+#[test]
+fn enormous_oversized_record_is_indexed_across_bounded_steps() {
+    let (_dir, path, mut scanner, key) = setup(&[assistant("a", json!("visible"))]);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{}", "x".repeat(10 * 1024 * 1024)).unwrap();
+    scanner.refresh(NOW, BUDGET).unwrap();
+    let mut retries = 0;
+    loop {
+        match scanner.transcript_page(&key, None, PageDirection::Forward, PAGE) {
+            Ok(page) => {
+                assert_eq!(page.events.len(), 1);
+                break;
+            }
+            Err(agentscope::providers::ProviderError::Unavailable(message))
+                if message.contains("index is building") =>
+            {
+                retries += 1
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    assert!(retries >= 2);
+}
+
+#[test]
+fn diagnostics_over_page_limit_are_explicitly_rejected() {
+    for visible in [false, true] {
+        let mut records = vec![json!({"type":"hidden"}); 201];
+        if visible {
+            records.push(assistant("a", json!("visible")));
+        }
+        let (_dir, _, mut scanner, key) = setup(&records);
+        assert!(matches!(
+            scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
+            Err(agentscope::providers::ProviderError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn finalization_is_resumable_after_small_append() {
+    let records: Vec<_> = (0..1100)
+        .map(|n| assistant(&format!("{n}"), json!("x")))
+        .collect();
+    let (_dir, path, mut scanner, key) = setup(&records);
+    while !scanner.refresh(NOW, BUDGET).unwrap().scan.done {}
+    while scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .is_err()
+    {}
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{}", assistant("new", json!("last"))).unwrap();
+    file.flush().unwrap();
+    scanner.refresh(NOW, BUDGET).unwrap();
+    assert!(matches!(
+        scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
+        Err(agentscope::providers::ProviderError::Unavailable(_))
+    ));
+    let mut retries = 1;
+    while scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .is_err()
+    {
+        retries += 1;
+        assert!(retries < 100);
+    }
+    assert!(retries >= 2);
+}
+
+#[test]
+fn large_uuid_many_blocks_hits_metadata_limit() {
+    let record = assistant(
+        &"u".repeat(500_000),
+        json!(vec![json!({"type":"text","text":"x"}); 160]),
+    );
+    let (_dir, _, mut scanner, key) = setup(&[record]);
+    assert!(matches!(
+        scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
+        Err(agentscope::providers::ProviderError::Unsupported(_))
+    ));
+}

@@ -181,6 +181,13 @@ impl JsonlCursor {
         self.rotations
     }
 
+    /// Whether the current path still names the file held by this cursor.
+    pub(crate) fn same_file(&self) -> io::Result<bool> {
+        let held = same_file::Handle::from_file(self.reader.get_ref().try_clone()?)?;
+        let current = same_file::Handle::from_path(&self.path)?;
+        Ok(held == current)
+    }
+
     fn check_rotation(&mut self) -> io::Result<()> {
         // Sample the path first, then the held handle: a writer appending between the two
         // samples can only make the handle look larger, never the path.

@@ -1,7 +1,7 @@
 //! Claude project discovery, roster scanning and persisted content mapping.
 //! Usage aggregation is independent from transcript paging.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1057,6 +1057,11 @@ fn checked_source<'a>(
         .cursor
         .as_ref()
         .ok_or_else(|| ProviderError::Unavailable("source unavailable".into()))?;
+    if !cursor.same_file().unwrap_or(false) {
+        return Err(ProviderError::Unavailable(
+            "source identity changed since refresh".into(),
+        ));
+    }
     let end = cursor.position();
     let intact = if end > PREFIX_VERIFY_MAX {
         state.fingerprint == fingerprint(path, end).map(|hash| (end, hash))
@@ -1159,6 +1164,7 @@ struct IndexedBlock {
     block: usize,
     kind: BlockKind,
     live: bool,
+    usage: bool,
     result: Option<u64>,
 }
 
@@ -1169,18 +1175,138 @@ struct IndexedDiagnostic {
     hidden: bool,
 }
 
+struct IndexCursor {
+    reader: BufReader<File>,
+    position: u64,
+    line_start: u64,
+    buffer: Vec<u8>,
+    oversized: bool,
+}
+
+impl IndexCursor {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(File::open(path)?),
+            position: 0,
+            line_start: 0,
+            buffer: Vec::new(),
+            oversized: false,
+        })
+    }
+
+    // Consume no more than the scanned boundary and the caller's byte allowance.
+    fn next(&mut self, end: u64, max: usize, allowance: u64) -> std::io::Result<Option<Record>> {
+        let stop = end.min(self.position.saturating_add(allowance));
+        while self.position < stop {
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            let len = available.len().min((stop - self.position) as usize);
+            let bytes = &available[..len];
+            let newline = bytes.iter().position(|&b| b == b'\n');
+            let data_len = newline.unwrap_or(len);
+            let consumed = data_len + usize::from(newline.is_some());
+            if !self.oversized {
+                if data_len > max.saturating_add(1).saturating_sub(self.buffer.len()) {
+                    self.buffer.clear();
+                    self.oversized = true;
+                } else {
+                    self.buffer.extend_from_slice(&bytes[..data_len]);
+                }
+            }
+            self.reader.consume(consumed);
+            self.position += consumed as u64;
+            if newline.is_some() {
+                let offset = self.line_start;
+                self.line_start = self.position;
+                let record = if self.oversized {
+                    Record::TooLarge { offset }
+                } else {
+                    let line = self.buffer.strip_suffix(b"\r").unwrap_or(&self.buffer);
+                    if line.len() > max {
+                        Record::TooLarge { offset }
+                    } else if let Ok(value) = serde_json::from_slice(line) {
+                        Record::Json { offset, value }
+                    } else {
+                        Record::Invalid { offset }
+                    }
+                };
+                self.buffer.clear();
+                self.oversized = false;
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+}
+#[derive(Default)]
+struct Finalization {
+    stage: u8,
+    at: usize,
+    revisions: BTreeMap<(String, usize), usize>,
+    calls: BTreeMap<String, usize>,
+    seen_ids: BTreeSet<String>,
+    last_record: Option<u64>,
+    rows: BTreeMap<PageAnchor, usize>,
+    diagnostics: BTreeMap<(Option<Timestamp>, u64, usize), usize>,
+}
+
 struct TranscriptIndex {
     path: PathBuf,
     generation: u64,
-    cursor: JsonlCursor,
+    cursor: IndexCursor,
     end: u64,
     blocks: Vec<IndexedBlock>,
+    diag_order: Vec<usize>,
+    base_diags: usize,
+    finalization: Option<Finalization>,
+    ready: bool,
     diagnostics: Vec<IndexedDiagnostic>,
     rows: Vec<usize>,
     usage_ids: HashMap<u64, Option<String>>,
-    usage_rows: HashSet<usize>,
     metadata_bytes: usize,
     over: bool,
+}
+
+fn record_fits(index: &TranscriptIndex, value: &Value) -> bool {
+    let uuid_len = value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    let message_id = value
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    let mut bytes = index
+        .metadata_bytes
+        .saturating_add(message_id)
+        .saturating_add(128);
+    let mut entries = index.blocks.len().saturating_add(index.diagnostics.len());
+    let content = value.pointer("/message/content");
+    let count = match content {
+        Some(Value::Array(parts)) => parts.len(),
+        Some(Value::String(_)) => 1,
+        _ => usize::from(value.get("type").and_then(Value::as_str) == Some("system")),
+    };
+    for n in 0..count {
+        let part = content
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.get(n));
+        let id_len = part
+            .and_then(|part| part.get("id").or_else(|| part.get("tool_use_id")))
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        bytes = bytes
+            .saturating_add(uuid_len.saturating_mul(2))
+            .saturating_add(id_len)
+            .saturating_add(256);
+        entries = entries.saturating_add(2);
+        if bytes > INDEX_METADATA_CAP || entries > INDEX_CAP {
+            return false;
+        }
+    }
+    bytes <= INDEX_METADATA_CAP && entries < INDEX_CAP
 }
 
 impl TranscriptIndex {
@@ -1295,82 +1421,110 @@ impl TranscriptIndex {
             block,
             kind,
             live: true,
+            usage: false,
             result: None,
         });
     }
 
-    fn finish(&mut self) {
-        let mut revisions = HashMap::new();
-        for (i, block) in self.blocks.iter().enumerate() {
-            if let Some(uuid) = &block.uuid {
-                revisions.insert((uuid.clone(), block.block), i);
-            }
-        }
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            block.live = block
-                .uuid
-                .as_ref()
-                .is_none_or(|uuid| revisions.get(&(uuid.clone(), block.block)) == Some(&i));
-            block.result = None;
-        }
-        let mut calls = HashMap::new();
-        let mut pairs = Vec::new();
-        for (i, block) in self.blocks.iter().enumerate() {
-            if !block.live {
-                continue;
-            }
-            match &block.kind {
-                BlockKind::Call(id) if !id.is_empty() => {
-                    calls.insert(id.clone(), i);
-                }
-                BlockKind::Result(id) if !id.is_empty() => {
-                    if let Some(call) = calls.remove(id) {
-                        pairs.push((call, i));
+    fn finish_step(&mut self) -> bool {
+        let mut work = self.finalization.take().unwrap_or_default();
+        let mut remaining = INDEX_STEP;
+        while remaining > 0 {
+            match work.stage {
+                0 if work.at < self.blocks.len() => {
+                    let block = &self.blocks[work.at];
+                    if let Some(uuid) = &block.uuid {
+                        work.revisions.insert((uuid.clone(), block.block), work.at);
                     }
                 }
-                _ => {}
+                1 if work.at < self.blocks.len() => {
+                    let block = &mut self.blocks[work.at];
+                    block.live = block.uuid.as_ref().is_none_or(|uuid| {
+                        work.revisions.get(&(uuid.clone(), block.block)) == Some(&work.at)
+                    });
+                    block.result = None;
+                    block.usage = false;
+                }
+                2 if work.at < self.blocks.len() => {
+                    let block = &self.blocks[work.at];
+                    if block.live {
+                        match &block.kind {
+                            BlockKind::Call(id) if !id.is_empty() => {
+                                work.calls.insert(id.clone(), work.at);
+                            }
+                            BlockKind::Result(id) if !id.is_empty() => {
+                                if let Some(call) = work.calls.remove(id) {
+                                    let offset = block.anchor.source_order;
+                                    let timestamp = block.anchor.timestamp;
+                                    self.blocks[call].result = Some(offset);
+                                    self.blocks[work.at].live = false;
+                                    self.diagnostics.push(IndexedDiagnostic {
+                                        timestamp,
+                                        offset,
+                                        label: "source-only tool result",
+                                        hidden: false,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                3 if work.at < self.blocks.len() => {
+                    let block = &mut self.blocks[work.at];
+                    if block.live && !matches!(block.kind, BlockKind::Hidden) {
+                        work.rows.insert(block.anchor.clone(), work.at);
+                        if work.last_record != Some(block.anchor.source_order) {
+                            work.last_record = Some(block.anchor.source_order);
+                            if let Some(id) = self.usage_ids.get(&block.anchor.source_order)
+                                && id
+                                    .as_ref()
+                                    .is_none_or(|id| work.seen_ids.insert(id.clone()))
+                            {
+                                block.usage = true;
+                            }
+                        }
+                    }
+                }
+                4 if work.at < self.diagnostics.len() => {
+                    let diag = &self.diagnostics[work.at];
+                    work.diagnostics
+                        .insert((diag.timestamp, diag.offset, work.at), work.at);
+                }
+                5 => {
+                    if let Some((_, row)) = work.rows.pop_first() {
+                        self.rows.push(row);
+                    } else if let Some((_, diag)) = work.diagnostics.pop_first() {
+                        self.diag_order.push(diag);
+                    } else {
+                        work.stage = 6;
+                        continue;
+                    }
+                    remaining -= 1;
+                    continue;
+                }
+                6 => {
+                    if work.revisions.pop_first().is_none()
+                        && work.calls.pop_first().is_none()
+                        && work.seen_ids.pop_first().is_none()
+                    {
+                        self.ready = true;
+                        return true;
+                    }
+                    remaining -= 1;
+                    continue;
+                }
+                _ => {
+                    work.stage += 1;
+                    work.at = 0;
+                    continue;
+                }
             }
+            work.at += 1;
+            remaining -= 1;
         }
-        self.diagnostics
-            .retain(|d| d.label != "source-only tool result");
-        for (call, result) in pairs {
-            let offset = self.blocks[result].anchor.source_order;
-            self.blocks[call].result = Some(offset);
-            self.blocks[result].live = false;
-            self.diagnostics.push(IndexedDiagnostic {
-                timestamp: self.blocks[result].anchor.timestamp,
-                offset,
-                label: "source-only tool result",
-                hidden: false,
-            });
-        }
-        self.usage_rows.clear();
-        let mut seen_ids = HashSet::new();
-        let mut seen_records = HashSet::new();
-        for (i, block) in self.blocks.iter().enumerate() {
-            if !block.live
-                || matches!(block.kind, BlockKind::Hidden)
-                || !seen_records.insert(block.anchor.source_order)
-            {
-                continue;
-            }
-            if let Some(id) = self.usage_ids.get(&block.anchor.source_order)
-                && id.as_ref().is_none_or(|id| seen_ids.insert(id))
-            {
-                self.usage_rows.insert(i);
-            }
-        }
-        self.rows = self
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.live && !matches!(b.kind, BlockKind::Hidden))
-            .map(|(i, _)| i)
-            .collect();
-        self.rows
-            .sort_unstable_by(|a, b| self.blocks[*a].anchor.cmp(&self.blocks[*b].anchor));
-        self.diagnostics
-            .sort_unstable_by_key(|d| (d.timestamp, d.offset));
+        self.finalization = Some(work);
+        false
     }
 }
 
@@ -1388,14 +1542,17 @@ fn ensure_index<'a>(
         *slot = Some(TranscriptIndex {
             path: path.to_owned(),
             generation,
-            cursor: JsonlCursor::open(path.to_owned(), max)
+            cursor: IndexCursor::open(path)
                 .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?,
             end: 0,
             blocks: Vec::new(),
+            diag_order: Vec::new(),
+            base_diags: 0,
+            finalization: None,
+            ready: false,
             diagnostics: Vec::new(),
             rows: Vec::new(),
             usage_ids: HashMap::new(),
-            usage_rows: HashSet::new(),
             metadata_bytes: 0,
             over: false,
         });
@@ -1407,29 +1564,38 @@ fn ensure_index<'a>(
     if index.over {
         return Err(over());
     }
+    if index.end < end && index.finalization.is_some() && !index.finish_step() {
+        return Err(ProviderError::Unavailable(
+            "transcript index is building (finalizing); retry".into(),
+        ));
+    }
     if index.end < end {
-        let start = index.cursor.position();
+        if index.ready || index.finalization.is_some() {
+            index.diagnostics.truncate(index.base_diags);
+            index.rows.clear();
+            index.diag_order.clear();
+            index.finalization = None;
+            index.ready = false;
+        }
+        let start = index.cursor.position;
         let mut count = 0;
-        while index.cursor.position() < end
+        while index.cursor.position < end
             && count < INDEX_STEP
-            && index.cursor.position().saturating_sub(start) < INDEX_BYTES_PER_STEP
+            && index.cursor.position.saturating_sub(start) < INDEX_BYTES_PER_STEP
         {
+            let allowance = INDEX_BYTES_PER_STEP - index.cursor.position.saturating_sub(start);
             let record = index
                 .cursor
-                .next_record()
+                .next(end, max, allowance)
                 .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-            if index.cursor.rotation_count() != 0 {
-                return Err(ProviderError::Unavailable(
-                    "source changed while indexing".into(),
-                ));
-            }
-            if index.cursor.position() > end {
-                return Err(ProviderError::Unavailable(
-                    "source changed while indexing".into(),
-                ));
-            }
             match record {
-                Some(Record::Json { offset, value }) => index.add_record(offset, &value),
+                Some(Record::Json { offset, value }) => {
+                    if !record_fits(index, &value) {
+                        index.over = true;
+                        return Err(over());
+                    }
+                    index.add_record(offset, &value);
+                }
                 Some(Record::Invalid { offset }) | Some(Record::TooLarge { offset }) => {
                     index.diagnostics.push(IndexedDiagnostic {
                         timestamp: None,
@@ -1440,27 +1606,27 @@ fn ensure_index<'a>(
                 }
                 Some(Record::Incomplete { .. }) | None => break,
             }
+            index.base_diags = index.diagnostics.len();
             count += 1;
             if index.blocks.len().saturating_add(index.diagnostics.len()) > INDEX_CAP
                 || index.metadata_bytes > INDEX_METADATA_CAP
             {
-                index.blocks.clear();
-                index.diagnostics.clear();
-                index.rows.clear();
-                index.usage_ids.clear();
-                index.usage_rows.clear();
                 index.over = true;
                 return Err(over());
             }
         }
-        index.end = index.cursor.position();
+        index.end = index.cursor.position;
         if index.end < end {
             return Err(ProviderError::Unavailable(format!(
                 "transcript index is building ({} of {end} bytes); retry",
                 index.end
             )));
         }
-        index.finish();
+    }
+    if !index.ready && !index.finish_step() {
+        return Err(ProviderError::Unavailable(
+            "transcript index is building (finalizing); retry".into(),
+        ));
     }
     Ok(index)
 }
@@ -1508,7 +1674,7 @@ fn indexed_event(
         .find(|event| event.id == block.anchor.stable_id)
         .ok_or_else(|| ProviderError::Unavailable("indexed event changed".into()))?;
     event.provenance.locator.generation = Some(index.generation);
-    event.usage = if index.usage_rows.contains(&index.rows[row]) {
+    event.usage = if block.usage {
         usage(&records[0].1["message"], &event.provenance)
     } else {
         None
@@ -1609,19 +1775,27 @@ impl ProviderReader for ClaudeScanner {
                 0
             } else {
                 let previous = &index.blocks[index.rows[first - 1]].anchor;
-                index.diagnostics.partition_point(|d| {
+                index.diag_order.partition_point(|d| {
+                    let d = &index.diagnostics[*d];
                     (d.timestamp, d.offset) <= (previous.timestamp, previous.source_order)
                 })
             };
             let stop = if index.rows.is_empty() || last + 1 == index.rows.len() {
-                index.diagnostics.len()
+                index.diag_order.len()
             } else {
                 let last_anchor = &index.blocks[index.rows[last]].anchor;
-                index.diagnostics.partition_point(|d| {
+                index.diag_order.partition_point(|d| {
+                    let d = &index.diagnostics[*d];
                     (d.timestamp, d.offset) <= (last_anchor.timestamp, last_anchor.source_order)
                 })
             };
-            for d in &index.diagnostics[start..stop.min(start.saturating_add(200))] {
+            if stop.saturating_sub(start) > 200 {
+                return Err(ProviderError::Unsupported(
+                    "too many diagnostics in one transcript page".into(),
+                ));
+            }
+            for entry in &index.diag_order[start..stop] {
+                let d = &index.diagnostics[*entry];
                 let mut loc = locator(key, d.offset);
                 loc.generation = Some(generation);
                 page_diags.push(DiagnosticEntry {
@@ -1630,7 +1804,7 @@ impl ProviderReader for ClaudeScanner {
                     hidden: d.hidden,
                 });
             }
-            truncated |= stop.saturating_sub(start) > 200;
+            // An oversized diagnostic interval is rejected instead of silently losing entries.
         }
         Ok(TranscriptPage {
             events: page,
