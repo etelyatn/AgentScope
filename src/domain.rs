@@ -94,8 +94,15 @@ pub struct SourceLocator {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocatorKind {
-    FileOffset { path: PathBuf, offset: u64 },
-    DbRow { table: String, row_id: String, part_index: Option<usize> },
+    FileOffset {
+        path: PathBuf,
+        offset: u64,
+    },
+    DbRow {
+        table: String,
+        row_id: String,
+        part_index: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,8 +259,13 @@ pub enum Lifecycle {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessAssociation {
-    Matched { pid: u32, started_at: Option<Timestamp> },
-    Candidates { count: usize },
+    Matched {
+        pid: u32,
+        started_at: Option<Timestamp>,
+    },
+    Candidates {
+        count: usize,
+    },
     Unmatched,
     NotChecked,
     Unavailable,
@@ -365,7 +377,12 @@ mod tests {
 
     #[test]
     fn bounded_text_debug_hides_preview() {
-        let t = BoundedText { preview: "TOPSECRET".into(), byte_len: 9, truncated: false, locator: None };
+        let t = BoundedText {
+            preview: "TOPSECRET".into(),
+            byte_len: 9,
+            truncated: false,
+            locator: None,
+        };
         let dbg = format!("{t:?}");
         assert!(!dbg.contains("TOPSECRET"));
         assert!(dbg.contains("byte_len"));
@@ -373,7 +390,11 @@ mod tests {
 
     #[test]
     fn anchor_orders_missing_timestamp_first_then_order_then_id() {
-        let a = |t, o, id: &str| PageAnchor { timestamp: t, source_order: o, stable_id: id.into() };
+        let a = |t, o, id: &str| PageAnchor {
+            timestamp: t,
+            source_order: o,
+            stable_id: id.into(),
+        };
         assert!(a(None, 9, "z") < a(Some(0), 0, "a"));
         assert!(a(Some(1), 1, "z") < a(Some(1), 2, "a"));
         assert!(a(Some(1), 1, "a") < a(Some(1), 1, "b"));

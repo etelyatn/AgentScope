@@ -5,7 +5,10 @@ use crate::domain::{
 };
 
 fn status(label: StatusLabel, evidence: impl Into<String>) -> Status {
-    Status { label, evidence: evidence.into() }
+    Status {
+        label,
+        evidence: evidence.into(),
+    }
 }
 
 fn process_note(p: &ProcessAssociation) -> &'static str {
@@ -21,22 +24,31 @@ fn process_note(p: &ProcessAssociation) -> &'static str {
 pub fn synthesize(session: &SessionSummary, now: Timestamp, thresholds: &Thresholds) -> Status {
     // 1. Source unavailable wins over everything.
     if !session.source_available {
-        return status(StatusLabel::Unavailable, "source unavailable; state not inferred");
+        return status(
+            StatusLabel::Unavailable,
+            "source unavailable; state not inferred",
+        );
     }
     // 2. Explicit terminal failure/cancel.
     match session.lifecycle {
         Lifecycle::Failed => return status(StatusLabel::Failed, "failure persisted by provider"),
-        Lifecycle::Cancelled => return status(StatusLabel::Cancelled, "cancellation persisted by provider"),
+        Lifecycle::Cancelled => {
+            return status(StatusLabel::Cancelled, "cancellation persisted by provider");
+        }
         _ => {}
     }
 
     let matched = matches!(session.process, ProcessAssociation::Matched { .. });
     let pnote = process_note(&session.process);
     let completed = session.last_completion.is_some() && !session.unfinished_work;
-    let activity = [session.last_persisted_at, session.last_event_at, session.last_completion]
-        .into_iter()
-        .flatten()
-        .max();
+    let activity = [
+        session.last_persisted_at,
+        session.last_event_at,
+        session.last_completion,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
     let age_ms = activity.map(|t| now.saturating_sub(t).max(0) as u128);
     let quiet_ms = thresholds.quiet.as_millis();
     let stall_ms = thresholds.stall.as_millis();
@@ -44,12 +56,18 @@ pub fn synthesize(session: &SessionSummary, now: Timestamp, thresholds: &Thresho
 
     // 4. Matched process, latest turn completed: idle, never stalled.
     if matched && completed {
-        return status(StatusLabel::Complete, "last turn completed; process observed");
+        return status(
+            StatusLabel::Complete,
+            "last turn completed; process observed",
+        );
     }
 
     if matched {
         let Some(age) = age_ms else {
-            return status(StatusLabel::Unknown, "process observed; no activity evidence");
+            return status(
+                StatusLabel::Unknown,
+                "process observed; no activity evidence",
+            );
         };
         // 3. Matched process, unfinished work.
         if session.unfinished_work && age > stall_ms {
@@ -67,15 +85,24 @@ pub fn synthesize(session: &SessionSummary, now: Timestamp, thresholds: &Thresho
     // 5. Explicit completion without a matched process: Complete only once quiet.
     if completed {
         return if is_quiet {
-            status(StatusLabel::Complete, format!("last turn completed; {pnote}"))
+            status(
+                StatusLabel::Complete,
+                format!("last turn completed; {pnote}"),
+            )
         } else {
-            status(StatusLabel::Recent, format!("last turn completed recently; {pnote}"))
+            status(
+                StatusLabel::Recent,
+                format!("last turn completed recently; {pnote}"),
+            )
         };
     }
 
     // 6/7/8. No process match.
     match age_ms {
-        None => status(StatusLabel::Unknown, format!("no activity evidence; {pnote}")),
+        None => status(
+            StatusLabel::Unknown,
+            format!("no activity evidence; {pnote}"),
+        ),
         Some(_) if is_quiet => status(StatusLabel::Quiet, format!("no recent writes; {pnote}")),
         Some(_) => status(StatusLabel::Recent, format!("recent writes; {pnote}")),
     }

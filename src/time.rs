@@ -18,9 +18,13 @@ pub fn relative_label(then: Timestamp, now: Timestamp) -> String {
 /// Format `ts` at an explicit UTC offset, e.g. `2026-03-08 08:00:00 -04:00`.
 /// Out-of-range offsets or timestamps fall back to UTC / the literal `invalid time`.
 pub fn format_absolute(ts: Timestamp, offset_secs: i32) -> String {
-    let offset = FixedOffset::east_opt(offset_secs).unwrap_or_else(|| FixedOffset::east_opt(0).expect("zero offset"));
+    let offset = FixedOffset::east_opt(offset_secs)
+        .unwrap_or_else(|| FixedOffset::east_opt(0).expect("zero offset"));
     match Utc.timestamp_millis_opt(ts).single() {
-        Some(utc) => utc.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+        Some(utc) => utc
+            .with_timezone(&offset)
+            .format("%Y-%m-%d %H:%M:%S %:z")
+            .to_string(),
         None => "invalid time".to_string(),
     }
 }
