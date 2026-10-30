@@ -1,0 +1,691 @@
+mod support;
+
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use agentscope::config::Config;
+use agentscope::domain::{
+    DiagnosticEntry, Event, EventKind, Lifecycle, LocatorKind, PageAnchor, PageDirection,
+    PageRequest, RefreshBudget, SessionKey, SessionSummary, SourceKey, SourceLocator, ToolStatus,
+    TranscriptPage,
+};
+use agentscope::providers::ProviderReader;
+use agentscope::providers::codex::CodexScanner;
+use serde_json::json;
+use support::codex::*;
+use support::{NOW, config_for, dated, write_lines};
+
+const BIG: RefreshBudget = RefreshBudget {
+    max_records: 100_000,
+    max_bytes: 100_000_000,
+    max_millis: 60_000,
+};
+const ALL: PageRequest = PageRequest {
+    max_events: 1000,
+    max_bytes: 10_000_000,
+};
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    path: PathBuf,
+    scanner: CodexScanner,
+}
+
+fn scan(scanner: &mut CodexScanner) -> Vec<SessionSummary> {
+    let mut out = Vec::new();
+    loop {
+        let delta = scanner.refresh(NOW, BIG).expect("refresh");
+        out.extend(delta.sessions);
+        if delta.scan.done {
+            return out;
+        }
+    }
+}
+
+fn open_with(lines: &[String], tweak: impl FnOnce(&mut Config)) -> (Fixture, SessionSummary) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sessions");
+    let path = dated(&root, "rollout-t.jsonl");
+    write_lines(&path, lines);
+    let mut config = config_for(&root);
+    tweak(&mut config);
+    let mut scanner = CodexScanner::new(&config).unwrap();
+    let summary = scan(&mut scanner).pop().expect("one session");
+    (
+        Fixture {
+            _dir: dir,
+            root,
+            path,
+            scanner,
+        },
+        summary,
+    )
+}
+
+fn open(lines: &[String]) -> (Fixture, SessionSummary) {
+    open_with(lines, |_| {})
+}
+
+fn first(f: &mut Fixture, key: &SessionKey) -> TranscriptPage {
+    f.scanner
+        .transcript_page(key, None, PageDirection::Forward, ALL)
+        .expect("page")
+}
+
+fn anchor_of(e: &Event) -> PageAnchor {
+    PageAnchor {
+        timestamp: e.timestamp,
+        source_order: e.source_order,
+        stable_id: e.id.clone(),
+    }
+}
+
+fn kinds(page: &TranscriptPage) -> Vec<EventKind> {
+    page.events.iter().map(|e| e.kind).collect()
+}
+
+fn ids(events: &[Event]) -> Vec<String> {
+    events.iter().map(|e| e.id.clone()).collect()
+}
+
+fn append(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
+fn diag<'a>(page: &'a TranscriptPage, label: &str) -> Vec<&'a DiagnosticEntry> {
+    page.diagnostics
+        .iter()
+        .filter(|d| d.label.contains(label))
+        .collect()
+}
+
+fn offset_of(locator: &SourceLocator) -> u64 {
+    match &locator.kind {
+        LocatorKind::FileOffset { offset, .. } => *offset,
+        other => panic!("unexpected locator {other:?}"),
+    }
+}
+
+#[test]
+fn renders_user_assistant_reasoning_and_one_row_per_tool() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "s1", "/p"),
+        turn_context("2026-10-29T10:00:00Z", "gpt-x", "/p"),
+        user("2026-10-29T10:00:01Z", "run the tests"),
+        reasoning(
+            "2026-10-29T10:00:02Z",
+            "Thinking about tests",
+            "SECRET-RAW-CHAIN",
+        ),
+        assistant("2026-10-29T10:00:03Z", "Running them now"),
+        custom_call("2026-10-29T10:00:04Z", "call-1", "shell", "cargo test"),
+        custom_output("2026-10-29T10:00:05Z", "call-1", "ok"),
+        item_completed_timed(
+            "2026-10-29T10:00:05Z",
+            command_item("item-9", "cargo test", "3 passed", 0),
+            1_793_000_000_000,
+            1_793_000_002_500,
+        ),
+        item_completed(
+            "2026-10-29T10:00:06Z",
+            json!({"type": "AgentMessage", "id": "m", "content": [{"text": "Running them now"}]}),
+        ),
+        token_count("2026-10-29T10:00:06Z", usage(10, 0, 5, 0, 15), Some(1000)),
+    ]);
+    let page = first(&mut f, &s.key);
+    assert_eq!(
+        kinds(&page),
+        vec![
+            EventKind::UserPrompt,
+            EventKind::Reasoning,
+            EventKind::AssistantMessage,
+            EventKind::Tool
+        ]
+    );
+    assert_eq!(
+        page.events[0].text.as_ref().unwrap().preview,
+        "run the tests"
+    );
+    let reasoning_text = page.events[1].text.as_ref().unwrap();
+    assert_eq!(reasoning_text.preview, "Thinking about tests");
+    assert!(!format!("{:?}", page.events).contains("SECRET-RAW-CHAIN"));
+    for e in &page.events {
+        assert!(
+            !e.text
+                .iter()
+                .any(|t| t.preview.contains("SECRET-RAW-CHAIN"))
+        );
+    }
+    let tool = page.events[3].tool.as_ref().expect("tool interaction");
+    assert_eq!(tool.status, ToolStatus::Completed);
+    assert_eq!(tool.exit_code, Some(0));
+    assert_eq!(tool.input.as_ref().unwrap().preview, "bash -lc cargo test");
+    assert_eq!(tool.output.as_ref().unwrap().preview, "3 passed");
+    assert_eq!(tool.started_at, Some(1_793_000_000_000));
+    assert_eq!(tool.completed_at, Some(1_793_000_002_500));
+    assert!(!tool.orphan);
+    // Raw custom call/output are source-only diagnostics, never a second row.
+    assert_eq!(
+        page.events
+            .iter()
+            .filter(|e| e.kind == EventKind::Tool)
+            .count(),
+        1
+    );
+    assert_eq!(diag(&page, "custom_tool_call").len(), 2);
+    // The duplicate AgentMessage item and token_count are hidden, not rows.
+    assert_eq!(s.displayed_event_count, page.events.len());
+    assert_eq!(s.hidden_records, 6);
+}
+
+#[test]
+fn tool_exit_code_is_tool_status_not_session_failure() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "s2", "/p"),
+        task_started("2026-10-29T10:00:01Z", None),
+        item_completed(
+            "2026-10-29T10:00:02Z",
+            command_item("i1", "false", "boom", 1),
+        ),
+        task_complete("2026-10-29T10:00:03Z"),
+    ]);
+    let page = first(&mut f, &s.key);
+    let tool = page
+        .events
+        .iter()
+        .find_map(|e| e.tool.as_ref())
+        .expect("tool");
+    assert_eq!(tool.status, ToolStatus::Error);
+    assert_eq!(tool.exit_code, Some(1));
+    assert_eq!(s.lifecycle, Lifecycle::Completed);
+    assert_eq!(
+        kinds(&page),
+        vec![EventKind::Lifecycle, EventKind::Tool, EventKind::Lifecycle]
+    );
+}
+
+#[test]
+fn pending_and_orphan_tools_are_labeled() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "s3", "/p"),
+        function_call("2026-10-29T10:00:01Z", "c-paired", "shell", "{}"),
+        function_output("2026-10-29T10:00:02Z", "c-paired", "done"),
+        function_call(
+            "2026-10-29T10:00:03Z",
+            "c-open",
+            "shell",
+            "{\"cmd\":\"sleep\"}",
+        ),
+        function_output("2026-10-29T10:00:04Z", "c-ghost", "late result"),
+        item_completed(
+            "2026-10-29T10:00:05Z",
+            json!({"type": "McpToolCall", "id": "m", "server": "srv", "tool": "t",
+                   "arguments": {"a": 1}, "status": "in_progress"}),
+        ),
+    ]);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 3);
+    let pending = page.events[0].tool.as_ref().unwrap();
+    assert_eq!(pending.status, ToolStatus::Pending);
+    assert_eq!(pending.call_id.as_deref(), Some("c-open"));
+    assert_eq!(pending.name, "shell");
+    assert!(pending.output.is_none() && !pending.orphan);
+    let orphan = page.events[1].tool.as_ref().unwrap();
+    assert!(orphan.orphan);
+    assert!(orphan.input.is_none());
+    assert_eq!(orphan.output.as_ref().unwrap().preview, "late result");
+    assert_eq!(orphan.status, ToolStatus::Unknown);
+    let running = page.events[2].tool.as_ref().unwrap();
+    assert_eq!(running.status, ToolStatus::Pending);
+    assert_eq!(running.name, "srv/t");
+    // The paired call/output stay source-only.
+    assert_eq!(diag(&page, "function_call").len(), 2);
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.key.source.ends_with("#orphan-tool") && w.count == 1)
+    );
+    assert_eq!(s.displayed_event_count, 3);
+
+    // Completing the open call later removes its row (the item is source-only again).
+    append(
+        &f.path,
+        format!(
+            "{}\n",
+            function_output("2026-10-29T10:00:06Z", "c-open", "woke")
+        )
+        .as_bytes(),
+    );
+    scan(&mut f.scanner);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 2);
+    assert!(page.events.iter().all(|e| {
+        e.tool
+            .as_ref()
+            .is_none_or(|t| t.call_id.as_deref() != Some("c-open"))
+    }));
+}
+
+#[test]
+fn suppressed_custom_calls_are_source_only_and_addressable() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "s4", "/p"),
+        user("2026-10-29T10:00:01Z", "go"),
+        custom_call(
+            "2026-10-29T10:00:02Z",
+            "k",
+            "apply_patch",
+            "*** Begin Patch",
+        ),
+        custom_output("2026-10-29T10:00:03Z", "k", "Done!"),
+        record("2026-10-29T10:00:04Z", "future_thing", json!({"x": 1})),
+        record("2026-10-29T10:00:05Z", "world_state", json!({})),
+    ]);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 1);
+    let source_only = diag(&page, "custom_tool_call");
+    assert_eq!(source_only.len(), 2);
+    assert!(source_only.iter().all(|d| !d.hidden));
+    let unknown = diag(&page, "future_thing");
+    assert_eq!(unknown.len(), 1);
+    assert!(unknown[0].hidden);
+    assert_eq!(diag(&page, "world_state").len(), 1);
+
+    let call = f.scanner.source_record(&source_only[0].locator).unwrap();
+    assert!(call.raw.contains("apply_patch"));
+    assert!(call.unavailable.is_none());
+    let output = f.scanner.source_record(&source_only[1].locator).unwrap();
+    assert!(output.raw.contains("Done!"));
+    let future = f.scanner.source_record(&unknown[0].locator).unwrap();
+    assert!(future.raw.contains("future_thing"));
+    assert!(future.display.contains("future_thing"));
+
+    // Locators are validated against this session's own source.
+    let good = &source_only[0].locator;
+    let LocatorKind::FileOffset { path, offset } = &good.kind else {
+        panic!("file locator")
+    };
+    let mut other_path = path.clone();
+    other_path.set_file_name("rollout-other.jsonl");
+    let bad = [
+        SourceLocator {
+            session: good.session.clone(),
+            kind: LocatorKind::FileOffset {
+                path: other_path,
+                offset: *offset,
+            },
+        },
+        SourceLocator {
+            session: SessionKey {
+                provider_session_id: "nope".into(),
+                ..good.session.clone()
+            },
+            kind: good.kind.clone(),
+        },
+        SourceLocator {
+            session: SessionKey {
+                source: SourceKey::File(f.root.join("elsewhere.jsonl")),
+                ..good.session.clone()
+            },
+            kind: good.kind.clone(),
+        },
+        SourceLocator {
+            session: good.session.clone(),
+            kind: LocatorKind::FileOffset {
+                path: path.clone(),
+                offset: offset + 3, // mid-record
+            },
+        },
+        SourceLocator {
+            session: good.session.clone(),
+            kind: LocatorKind::FileOffset {
+                path: path.clone(),
+                offset: 10_000_000,
+            },
+        },
+        SourceLocator {
+            session: good.session.clone(),
+            kind: LocatorKind::DbRow {
+                table: "t".into(),
+                row_id: "1".into(),
+                part_index: None,
+            },
+        },
+    ];
+    for locator in &bad {
+        assert!(
+            f.scanner.source_record(locator).is_err(),
+            "accepted {locator:?}"
+        );
+    }
+    let missing = f.scanner.transcript_page(
+        &SessionKey {
+            provider_session_id: "nope".into(),
+            ..s.key.clone()
+        },
+        None,
+        PageDirection::Forward,
+        ALL,
+    );
+    assert!(missing.is_err());
+}
+
+fn mixed_session(n: usize) -> Vec<String> {
+    let mut lines = vec![session_meta("2026-10-29T10:00:00Z", "mix", "/p")];
+    for i in 0..n {
+        let ts = format!("2026-10-29T10:{:02}:{:02}Z", i / 60, i % 60);
+        match i % 6 {
+            0 => lines.push(user(&ts, &format!("prompt {i}"))),
+            1 => lines.push(reasoning(&ts, &format!("think {i}"), "raw")),
+            2 => {
+                lines.push(custom_call(&ts, &format!("c{i}"), "shell", "x"));
+                lines.push(custom_output(&ts, &format!("c{i}"), "y"));
+                lines.push(item_completed(
+                    &ts,
+                    command_item(&format!("it{i}"), "ls", &format!("out {i}"), 0),
+                ));
+            }
+            3 => {
+                lines.push(token_count(&ts, usage(1, 0, 1, 0, 2), None));
+                lines.push(assistant(&ts, &format!("answer {i}")));
+            }
+            4 => lines.push(record(&ts, "mystery", json!({}))),
+            _ => lines.push(compacted(&ts)),
+        }
+    }
+    lines
+}
+
+fn chain(
+    f: &mut Fixture,
+    key: &SessionKey,
+    direction: PageDirection,
+    request: PageRequest,
+) -> Vec<TranscriptPage> {
+    let mut pages = Vec::new();
+    let mut anchor = None;
+    loop {
+        let page = f
+            .scanner
+            .transcript_page(key, anchor.clone(), direction, request)
+            .unwrap();
+        assert!(page.events.len() <= request.max_events);
+        let more = page.has_more;
+        anchor = page.next.clone();
+        pages.push(page);
+        if !more {
+            return pages;
+        }
+        assert!(anchor.is_some(), "has_more without a continuation anchor");
+        assert!(pages.len() < 1000, "paging never finished");
+    }
+}
+
+#[test]
+fn forward_and_backward_pages_do_not_duplicate_or_split_tool_pairs() {
+    let (mut f, s) = open(&mixed_session(60));
+    let whole = first(&mut f, &s.key);
+    assert!(!whole.has_more);
+    let all_ids = ids(&whole.events);
+    assert_eq!(all_ids.iter().collect::<HashSet<_>>().len(), all_ids.len());
+    assert_eq!(
+        whole.events.iter().filter(|e| e.tool.is_some()).count(),
+        10,
+        "one row per completed tool"
+    );
+    assert_eq!(s.displayed_event_count, whole.events.len());
+
+    for size in [1usize, 2, 3, 7, 1000] {
+        let request = PageRequest {
+            max_events: size,
+            max_bytes: 10_000_000,
+        };
+        let forward = chain(&mut f, &s.key, PageDirection::Forward, request);
+        let backward = chain(&mut f, &s.key, PageDirection::Backward, request);
+        let fwd: Vec<_> = forward.iter().flat_map(|p| ids(&p.events)).collect();
+        let mut bwd_pages: Vec<_> = backward.iter().map(|p| ids(&p.events)).collect();
+        bwd_pages.reverse();
+        let bwd: Vec<_> = bwd_pages.into_iter().flatten().collect();
+        assert_eq!(fwd, all_ids, "forward size {size}");
+        assert_eq!(bwd, all_ids, "backward size {size}");
+        // Diagnostics partition the same way in both directions.
+        let diag_ids = |pages: &[TranscriptPage]| {
+            let mut v: Vec<u64> = pages
+                .iter()
+                .flat_map(|p| p.diagnostics.iter().map(|d| offset_of(&d.locator)))
+                .collect();
+            let n = v.len();
+            v.sort_unstable();
+            v.dedup();
+            assert_eq!(v.len(), n, "duplicate diagnostics, size {size}");
+            v
+        };
+        assert_eq!(diag_ids(&forward), diag_ids(&backward), "size {size}");
+        assert_eq!(diag_ids(&forward).len(), whole.diagnostics.len());
+    }
+
+    // Backward from an interior anchor returns exactly the events before it.
+    let mid = &whole.events[10];
+    let before = f
+        .scanner
+        .transcript_page(
+            &s.key,
+            Some(anchor_of(mid)),
+            PageDirection::Backward,
+            PageRequest {
+                max_events: 4,
+                max_bytes: 10_000_000,
+            },
+        )
+        .unwrap();
+    assert_eq!(ids(&before.events), all_ids[6..10].to_vec());
+    assert!(before.has_more);
+    assert_eq!(before.next.as_ref().unwrap().stable_id, all_ids[6]);
+
+    // The byte budget limits a page but always makes progress.
+    let tiny = PageRequest {
+        max_events: 1000,
+        max_bytes: 40,
+    };
+    let pages = chain(&mut f, &s.key, PageDirection::Forward, tiny);
+    assert!(pages.len() > 5);
+    assert!(pages.iter().all(|p| !p.events.is_empty()));
+    let combined: Vec<_> = pages.iter().flat_map(|p| ids(&p.events)).collect();
+    assert_eq!(combined, all_ids);
+}
+
+#[test]
+fn count_events_after_counts_displayed_work_only() {
+    let (mut f, s) = open(&mixed_session(30));
+    let whole = first(&mut f, &s.key);
+    let anchor = anchor_of(&whole.events[whole.events.len() - 4]);
+    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 3);
+    append(
+        &f.path,
+        format!(
+            "{}\n{}\n{}\n",
+            token_count("2026-10-29T11:00:00Z", usage(1, 0, 1, 0, 2), None),
+            assistant("2026-10-29T11:00:01Z", "new one"),
+            user("2026-10-29T11:00:02Z", "new two"),
+        )
+        .as_bytes(),
+    );
+    // Not visible until the roster scan has consumed it.
+    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 3);
+    scan(&mut f.scanner);
+    assert_eq!(f.scanner.count_events_after(&s.key, &anchor).unwrap(), 5);
+}
+
+#[test]
+fn partial_append_rotation_and_oversized_records_are_safe() {
+    let (mut f, s) = open_with(
+        &[
+            session_meta("2026-10-29T10:00:00Z", "rot", "/p"),
+            user("2026-10-29T10:00:01Z", "first"),
+            user("2026-10-29T10:00:02Z", &"y".repeat(5000)),
+            assistant("2026-10-29T10:00:03Z", "after the big one"),
+        ],
+        |c| c.max_record_bytes = 2048,
+    );
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 2);
+    let big = diag(&page, "oversized");
+    assert_eq!(big.len(), 1);
+    assert!(big[0].hidden);
+    let raw = f.scanner.source_record(&big[0].locator).unwrap();
+    assert!(raw.raw.is_empty() && raw.unavailable.is_some());
+    // Backward reads classify the same oversized record.
+    let back = f
+        .scanner
+        .transcript_page(&s.key, None, PageDirection::Backward, ALL)
+        .unwrap();
+    assert_eq!(ids(&back.events), ids(&page.events));
+    assert_eq!(diag(&back, "oversized").len(), 1);
+
+    // A partial trailing line is held until its newline arrives.
+    let tail = assistant("2026-10-29T10:00:04Z", "late reply");
+    let (head, rest) = tail.split_at(20);
+    append(&f.path, head.as_bytes());
+    scan(&mut f.scanner);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(
+        f.scanner
+            .transcript_page(&s.key, None, PageDirection::Backward, ALL)
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+    append(&f.path, format!("{rest}\n").as_bytes());
+    scan(&mut f.scanner);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 3);
+    let old_anchor = anchor_of(&page.events[2]);
+
+    // Rotation: a shorter replacement restarts the transcript; stale anchors yield nothing.
+    write_lines(
+        &f.path,
+        &[
+            session_meta("2026-10-29T12:00:00Z", "rot", "/p"),
+            user("2026-10-29T12:00:01Z", "fresh"),
+        ],
+    );
+    let summaries = scan(&mut f.scanner);
+    assert!(summaries.iter().any(|x| x.key == s.key));
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].text.as_ref().unwrap().preview, "fresh");
+    let stale = f
+        .scanner
+        .transcript_page(&s.key, Some(old_anchor), PageDirection::Forward, ALL)
+        .unwrap();
+    assert!(stale.events.is_empty() && !stale.has_more);
+}
+
+#[test]
+fn previews_are_bounded_redacted_and_marked_truncated() {
+    let secret = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789";
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "red", "/p"),
+        item_completed(
+            "2026-10-29T10:00:01Z",
+            command_item("i", "curl", &format!("{secret}\n{}", "z".repeat(50_000)), 0),
+        ),
+    ]);
+    let page = f
+        .scanner
+        .transcript_page(
+            &s.key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                max_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let out = page.events[0]
+        .tool
+        .as_ref()
+        .unwrap()
+        .output
+        .as_ref()
+        .unwrap();
+    assert!(!out.preview.contains("abcdefghijklmnop"));
+    assert!(out.truncated);
+    assert!(out.preview.len() <= 4096);
+    assert!(out.byte_len > 50_000);
+    assert!(page.truncated);
+    assert!(out.locator.is_some());
+}
+
+#[test]
+fn backward_reads_cross_block_boundaries_and_oversized_records() {
+    // Records of 100 B to 200 KB straddle the 64 KiB read blocks in every alignment.
+    let mut lines = vec![session_meta("2026-10-29T10:00:00Z", "big", "/p")];
+    for (i, size) in [
+        100usize, 70_000, 30_000, 200_000, 65_536, 65_000, 1, 140_000, 5,
+    ]
+    .iter()
+    .cycle()
+    .take(27)
+    .enumerate()
+    {
+        let ts = format!("2026-10-29T10:{:02}:{:02}Z", i / 60, i % 60);
+        lines.push(user(&ts, &format!("{i}:{}", "q".repeat(*size))));
+        if i % 4 == 0 {
+            lines.push(record(&ts, "mystery", json!({"i": i})));
+        }
+    }
+    let (mut f, s) = open_with(&lines, |c| c.max_record_bytes = 150_000);
+    let whole = first(&mut f, &s.key);
+    let oversized = diag(&whole, "oversized").len();
+    assert_eq!(oversized, 3);
+    assert_eq!(whole.events.len(), 24);
+    let request = PageRequest {
+        max_events: 5,
+        max_bytes: 10_000_000,
+    };
+    let forward = chain(&mut f, &s.key, PageDirection::Forward, request);
+    let backward = chain(&mut f, &s.key, PageDirection::Backward, request);
+    let mut bwd: Vec<_> = backward.iter().map(|p| ids(&p.events)).collect();
+    bwd.reverse();
+    assert_eq!(
+        forward
+            .iter()
+            .flat_map(|p| ids(&p.events))
+            .collect::<Vec<_>>(),
+        bwd.into_iter().flatten().collect::<Vec<_>>()
+    );
+    let offsets = |pages: &[TranscriptPage]| {
+        let mut v: Vec<u64> = pages
+            .iter()
+            .flat_map(|p| p.diagnostics.iter().map(|d| offset_of(&d.locator)))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(offsets(&forward), offsets(&backward));
+    assert_eq!(offsets(&forward).len(), whole.diagnostics.len());
+    // Every diagnostic locator resolves to the record it names.
+    for d in &whole.diagnostics {
+        let rec = f.scanner.source_record(&d.locator).unwrap();
+        if d.label.contains("oversized") {
+            assert!(rec.unavailable.is_some());
+        } else {
+            assert!(
+                rec.raw.starts_with('{') && rec.raw.ends_with('}'),
+                "{}",
+                d.label
+            );
+        }
+    }
+}

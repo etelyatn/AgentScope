@@ -99,3 +99,79 @@ pub fn usage_record_event(ts: &str, thread: Value) -> String {
         json!({"type": "token_usage_record", "thread_token_usage": thread}),
     )
 }
+
+pub fn reasoning(ts: &str, summary: &str, raw: &str) -> String {
+    record(
+        ts,
+        "response_item",
+        json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": summary}],
+            "content": [{"type": "reasoning_text", "text": raw}],
+        }),
+    )
+}
+
+pub fn compacted(ts: &str) -> String {
+    record(ts, "compacted", json!({"message": "history compacted"}))
+}
+
+/// `event_msg.item_completed` wrapping one thread item.
+pub fn item_completed(ts: &str, item: Value) -> String {
+    record(
+        ts,
+        "event_msg",
+        json!({"type": "item_completed", "thread_id": "t", "turn_id": "u", "item": item}),
+    )
+}
+
+pub fn item_completed_timed(ts: &str, item: Value, started_ms: i64, completed_ms: i64) -> String {
+    record(
+        ts,
+        "event_msg",
+        json!({
+            "type": "item_completed", "thread_id": "t", "turn_id": "u", "item": item,
+            "started_at_ms": started_ms, "completed_at_ms": completed_ms,
+        }),
+    )
+}
+
+pub fn command_item(id: &str, command: &str, output: &str, exit_code: i64) -> Value {
+    json!({
+        "type": "CommandExecution", "id": id, "command": ["bash", "-lc", command],
+        "cwd": "/p", "status": "completed", "aggregated_output": output,
+        "exit_code": exit_code, "duration": {"secs": 2, "nanos": 500_000_000},
+    })
+}
+
+pub fn custom_call(ts: &str, call_id: &str, name: &str, input: &str) -> String {
+    record(
+        ts,
+        "response_item",
+        json!({"type": "custom_tool_call", "call_id": call_id, "name": name, "input": input}),
+    )
+}
+
+pub fn custom_output(ts: &str, call_id: &str, output: &str) -> String {
+    record(
+        ts,
+        "response_item",
+        json!({"type": "custom_tool_call_output", "call_id": call_id, "output": output}),
+    )
+}
+
+pub fn function_call(ts: &str, call_id: &str, name: &str, arguments: &str) -> String {
+    record(
+        ts,
+        "response_item",
+        json!({"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments}),
+    )
+}
+
+pub fn function_output(ts: &str, call_id: &str, output: &str) -> String {
+    record(
+        ts,
+        "response_item",
+        json!({"type": "function_call_output", "call_id": call_id, "output": output}),
+    )
+}
