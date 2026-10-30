@@ -1273,6 +1273,9 @@ struct Job {
     derivation: Option<OpenCodeDerivation>,
     derive_rows: usize,
     derive_cursor: Option<(i64, String)>,
+    /// The cursor is a consumed row (skip it on resume), not a synthetic prefix
+    /// bound (a row equal to it has not been seen).
+    derive_cursor_is_row: bool,
     omitted: bool,
 }
 
@@ -1291,6 +1294,7 @@ impl Job {
             derivation: derive.then(OpenCodeDerivation::new),
             derive_rows: 0,
             derive_cursor: None,
+            derive_cursor_is_row: false,
             omitted: false,
         }
     }
@@ -1363,6 +1367,8 @@ fn advance(
 
     if let Some(mut derivation) = job.derivation.take() {
         let resume = job.derive_cursor.clone();
+        let skip_resume = job.derive_cursor_is_row;
+        let mut cursor_is_row = skip_resume;
         let (mut rows, mut cursor, mut omitted) =
             (job.derive_rows, job.derive_cursor.clone(), job.omitted);
         let mut more = false;
@@ -1381,6 +1387,7 @@ fn advance(
             },
             |r| {
                 if !r.oversized
+                    && skip_resume
                     && resume
                         .as_ref()
                         .is_some_and(|(c, i)| r.created == *c && r.id == *i)
@@ -1399,11 +1406,15 @@ fn advance(
                     // Continue past the whole group of ids sharing this prefix (all
                     // oversized) with a true upper bound; the full id is not kept.
                     match prefix_successor(&r.id) {
-                        Some(next) => cursor = Some((r.created, next)),
+                        Some(next) => {
+                            cursor = Some((r.created, next));
+                            cursor_is_row = false;
+                        }
                         None => return Ok(false),
                     }
                 } else {
                     cursor = Some((r.created, r.id.clone()));
+                    cursor_is_row = true;
                     if kind == Some("assistant") {
                         let tokens = value.as_ref().map(message_tokens);
                         let cost = value
@@ -1423,6 +1434,7 @@ fn advance(
         )?;
         job.derive_rows = rows;
         job.derive_cursor = cursor;
+        job.derive_cursor_is_row = cursor_is_row;
         job.omitted = omitted;
         if capped {
             derivation.mark_truncated();

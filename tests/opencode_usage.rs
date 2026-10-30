@@ -769,3 +769,24 @@ fn ids_sorting_after_a_naive_prefix_cursor_are_still_skipped_once() {
     assert_eq!(usage.class, AggregationClass::Partial);
     assert_eq!(usage.categories.input, Some(101));
 }
+
+#[test]
+fn a_valid_id_equal_to_a_synthetic_prefix_bound_is_counted_once() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    let one = |input: u64| assistant(Some("stop"), tokens(input, 0, 0, 0, 0), None);
+    // Its prefix bound is exactly "n".
+    let oversized = format!("m{}", "\u{10FFFF}".repeat(4096));
+    msg(&conn, "s", &oversized, "assistant", 6, one(1000));
+    msg(&conn, "s", "n", "assistant", 6, one(10));
+    msg(&conn, "s", "a2", "assistant", 20, one(100));
+    let (steps, out) = scan_with(&mut scanner_for(&db), budget(1, 100_000_000, 60_000));
+    assert!(steps <= 15, "got {steps} steps");
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Partial);
+    assert_eq!(
+        usage.categories.input,
+        Some(110),
+        "\"n\" counted exactly once"
+    );
+}
