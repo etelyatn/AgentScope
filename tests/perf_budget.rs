@@ -748,3 +748,46 @@ fn benchmark_report() {
         perf::snapshot().bytes_read
     );
 }
+
+/// Tabs expand to up to four spaces in `sanitize`, so a tab-heavy row builds buffers
+/// larger than its source: the expanded output, then redaction's copy of it.
+#[test]
+fn preview_temporaries_include_tab_expansion_and_redaction_output() {
+    const TABS: u64 = 25_000;
+    const EXPANDED: u64 = 4 * TABS;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("codex");
+    let mut lines = vec![session_meta(TS, "tabs", "/work/demo")];
+    lines.extend((0..10).map(|_| assistant(TS, &"\t".repeat(TABS as usize))));
+    write_lines(&dated(&root, "rollout-tabs.jsonl"), &lines);
+    let mut scanner = CodexScanner::new(&config_for(&root)).unwrap();
+    let (sessions, _) = scan_codex(&mut scanner, BIG);
+    perf::reset();
+    let page = scanner
+        .transcript_page(
+            &sessions[0].key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 500,
+                max_bytes: 1000,
+            },
+        )
+        .unwrap();
+    let used = perf::snapshot();
+    let visited = page.events.len() as u64 + 1;
+    // Retained previews stay at the cap...
+    assert!(used.max_preview_bytes <= PREVIEW_CAP);
+    // ...but each visited row built at least the expanded buffer plus redaction's
+    // owned copy (2 x 4N), and at most a grown sanitize buffer (< 2 x 4N) plus the copy.
+    assert!(
+        used.preview_temp_bytes >= visited * 2 * EXPANDED,
+        "only {} temporary bytes counted for {visited} rows",
+        used.preview_temp_bytes
+    );
+    assert!(
+        used.preview_temp_bytes <= visited * 3 * EXPANDED + visited * 1024,
+        "{} temporary bytes for {visited} rows",
+        used.preview_temp_bytes
+    );
+}

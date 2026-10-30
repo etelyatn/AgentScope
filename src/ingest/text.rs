@@ -71,6 +71,7 @@ pub fn sanitize(input: &str) -> String {
             }
         }
     }
+    crate::perf::preview_temp(out.capacity());
     out
 }
 
@@ -163,20 +164,36 @@ static CLI_ARG: LazyLock<Regex> = LazyLock::new(|| {
 /// Best-effort masking of common credential shapes. Not a guarantee.
 pub fn redact(input: &str) -> String {
     let s = PRIVATE_KEY.replace_all(input, MASK);
+    note_owned(&s);
     let s = TOKEN_SHAPES.replace_all(&s, MASK);
+    note_owned(&s);
     let s = BEARER.replace_all(&s, |c: &Captures<'_>| format!("{}{MASK}", &c[1]));
+    note_owned(&s);
     let s = CLI_ARG.replace_all(&s, |c: &Captures<'_>| format!("{}{MASK}", &c[1]));
-    ASSIGNMENT
-        .replace_all(&s, |c: &Captures<'_>| {
-            let value = &c[2];
-            let quoted = value.starts_with(['"', '\'']);
-            // Unquoted values that look like expressions (calls) are code, not secrets.
-            if !quoted && (value.contains('(') || value.contains(')')) {
-                return c[0].to_string();
-            }
-            format!("{}{MASK}", &c[1])
-        })
-        .into_owned()
+    note_owned(&s);
+    let s = ASSIGNMENT.replace_all(&s, |c: &Captures<'_>| {
+        let value = &c[2];
+        let quoted = value.starts_with(['"', '\'']);
+        // Unquoted values that look like expressions (calls) are code, not secrets.
+        if !quoted && (value.contains('(') || value.contains(')')) {
+            return c[0].to_string();
+        }
+        format!("{}{MASK}", &c[1])
+    });
+    note_owned(&s);
+    // `into_owned` copies when no pattern matched.
+    if matches!(s, std::borrow::Cow::Borrowed(_)) {
+        crate::perf::preview_temp(s.len());
+    }
+    s.into_owned()
+}
+
+/// Counts a replacement pass's output buffer when it allocated one.
+#[allow(clippy::ptr_arg)] // the Owned/Borrowed distinction is the point
+fn note_owned(s: &std::borrow::Cow<'_, str>) {
+    if matches!(s, std::borrow::Cow::Owned(_)) {
+        crate::perf::preview_temp(s.len());
+    }
 }
 
 /// Sanitize, then redact. Sanitizing first stops escape/zero-width characters
@@ -191,8 +208,6 @@ pub fn display_safe(input: &str) -> String {
 /// (newlines count as one column). The locator is left `None` for the caller.
 pub fn preview(input: &str, max_bytes: usize, max_cols: usize) -> BoundedText {
     let safe = display_safe(input);
-    // sanitize allocates an input-sized buffer; redact returns another of `safe` size.
-    crate::perf::preview_temp(input.len() + safe.len());
     let mut end = 0usize;
     let mut base = 0usize; // columns consumed before the current line segment
     let mut seg_start = 0usize;
