@@ -689,3 +689,328 @@ fn backward_reads_cross_block_boundaries_and_oversized_records() {
         }
     }
 }
+
+fn last_summary(scanner: &mut CodexScanner) -> SessionSummary {
+    scan(scanner).pop().expect("changed session")
+}
+
+#[test]
+fn long_credential_values_are_redacted_before_the_preview_is_cut() {
+    let value = format!("correct horse battery staple {}", "Z".repeat(20_000));
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "cred", "/p"),
+        item_completed(
+            "2026-10-29T10:00:01Z",
+            command_item("i", "env", &format!("password: \"{value}\" trailing"), 0),
+        ),
+        user("2026-10-29T10:00:02Z", &format!("api_key = \"{value}\"")),
+    ]);
+    let page = f
+        .scanner
+        .transcript_page(
+            &s.key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                max_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let out = page.events[0]
+        .tool
+        .as_ref()
+        .unwrap()
+        .output
+        .as_ref()
+        .unwrap();
+    let prompt = page.events[1].text.as_ref().unwrap();
+    for text in [out, prompt] {
+        assert!(!text.preview.contains("correct horse"), "{}", text.preview);
+        assert!(!text.preview.contains("ZZZZ"), "{}", text.preview);
+        assert!(text.byte_len > 20_000);
+    }
+}
+
+#[test]
+fn page_byte_budget_applies_to_the_whole_first_tool_row() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "fit", "/p"),
+        item_completed(
+            "2026-10-29T10:00:01Z",
+            command_item("i", &"a".repeat(3000), &"b".repeat(3000), 0),
+        ),
+        user("2026-10-29T10:00:02Z", "next"),
+    ]);
+    for budget in [1000usize, 300, 20] {
+        let page = f
+            .scanner
+            .transcript_page(
+                &s.key,
+                None,
+                PageDirection::Forward,
+                PageRequest {
+                    max_events: 10,
+                    max_bytes: budget,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.events.len(), 1, "budget {budget}: oversized row alone");
+        assert!(page.has_more && page.truncated);
+        let tool = page.events[0].tool.as_ref().unwrap();
+        let used = tool.name.len()
+            + tool.input.as_ref().map_or(0, |t| t.preview.len())
+            + tool.output.as_ref().map_or(0, |t| t.preview.len());
+        assert!(
+            used <= budget.max(tool.name.len()),
+            "budget {budget}: {used} bytes"
+        );
+        assert!(tool.input.as_ref().unwrap().truncated);
+        assert!(tool.output.as_ref().unwrap().truncated);
+        // Progress is still made: the next page starts at the following row.
+        let next = f
+            .scanner
+            .transcript_page(
+                &s.key,
+                page.next.clone(),
+                PageDirection::Forward,
+                PageRequest {
+                    max_events: 10,
+                    max_bytes: budget,
+                },
+            )
+            .unwrap();
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].kind, EventKind::UserPrompt);
+    }
+}
+
+#[test]
+fn completion_without_raw_output_replaces_the_pending_call() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "pend", "/p"),
+        custom_call("2026-10-29T10:00:01Z", "k1", "shell", "cargo test"),
+        item_completed(
+            "2026-10-29T10:00:02Z",
+            command_item("item-1", "cargo test", "ok", 0),
+        ),
+    ]);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 1, "no pending row beside the completion");
+    let tool = page.events[0].tool.as_ref().unwrap();
+    assert_eq!(tool.status, ToolStatus::Completed);
+    assert_eq!(s.displayed_event_count, 1);
+    assert_eq!(diag(&page, "custom_tool_call").len(), 1);
+
+    // The raw output arriving later is neither an orphan nor a second row.
+    append(
+        &f.path,
+        format!("{}\n", custom_output("2026-10-29T10:00:03Z", "k1", "ok")).as_bytes(),
+    );
+    let s = last_summary(&mut f.scanner);
+    assert!(
+        !s.warnings
+            .iter()
+            .any(|w| w.key.source.ends_with("#orphan-tool"))
+    );
+    assert_eq!(s.displayed_event_count, 1);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(diag(&page, "custom_tool_call").len(), 2);
+
+    // An in-progress item does not retire a genuinely pending call.
+    append(
+        &f.path,
+        format!(
+            "{}\n{}\n",
+            custom_call("2026-10-29T10:00:04Z", "k2", "shell", "sleep"),
+            item_completed(
+                "2026-10-29T10:00:05Z",
+                json!({"type": "McpToolCall", "id": "m", "server": "s", "tool": "t",
+                       "status": "in_progress"}),
+            ),
+        )
+        .as_bytes(),
+    );
+    let s = last_summary(&mut f.scanner);
+    assert_eq!(first(&mut f, &s.key).events.len(), 3);
+}
+
+#[test]
+fn replaced_source_is_not_served_through_old_offsets() {
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "swap", "/p"),
+        user("2026-10-29T10:00:01Z", "aaaa original"),
+        custom_call("2026-10-29T10:00:02Z", "c", "shell", "x"),
+        custom_output("2026-10-29T10:00:03Z", "c", "y"),
+    ]);
+    let page = first(&mut f, &s.key);
+    let locator = diag(&page, "custom_tool_call")[0].locator.clone();
+    let anchor = anchor_of(&page.events[0]);
+    let original = std::fs::read_to_string(&f.path).unwrap();
+
+    // Same length, different content, no refresh in between.
+    std::fs::write(&f.path, original.replace("aaaa", "bbbb")).unwrap();
+    // Longer replacement.
+    let check = |f: &mut Fixture| {
+        assert!(
+            f.scanner
+                .transcript_page(&s.key, None, PageDirection::Forward, ALL)
+                .is_err()
+        );
+        assert!(
+            f.scanner
+                .transcript_page(&s.key, None, PageDirection::Backward, ALL)
+                .is_err()
+        );
+        assert!(f.scanner.count_events_after(&s.key, &anchor).is_err());
+        assert!(f.scanner.source_record(&locator).is_err());
+    };
+    check(&mut f);
+    std::fs::write(
+        &f.path,
+        format!(
+            "{}\n{}",
+            original.replace("aaaa", "cccc"),
+            user("2026-10-29T10:00:09Z", "appended elsewhere")
+        ),
+    )
+    .unwrap();
+    check(&mut f);
+
+    // After a refresh the new content is what is served. (A shrink is what the
+    // cursor can detect; an in-place longer rewrite is its documented blind spot.)
+    write_lines(
+        &f.path,
+        &[
+            session_meta("2026-10-29T11:00:00Z", "swap", "/p"),
+            user("2026-10-29T11:00:01Z", "new"),
+        ],
+    );
+    scan(&mut f.scanner);
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].text.as_ref().unwrap().preview, "new");
+}
+
+#[test]
+fn record_cap_is_applied_after_the_line_terminator_for_pages_and_source() {
+    let cap = 2048usize;
+    let pad = |total: usize| {
+        let base = user("2026-10-29T10:00:01Z", "").len();
+        user("2026-10-29T10:00:01Z", &"x".repeat(total - base))
+    };
+    let just_over = pad(cap + 1);
+    let exact = pad(cap);
+    assert_eq!((just_over.len(), exact.len()), (cap + 1, cap));
+    let (mut f, s) = open_with(
+        &[
+            session_meta("2026-10-29T10:00:00Z", "cap", "/p"),
+            just_over,
+            exact,
+        ],
+        |c| c.max_record_bytes = cap,
+    );
+    let page = first(&mut f, &s.key);
+    assert_eq!(page.events.len(), 1, "only the in-cap record is a row");
+    let over = diag(&page, "oversized");
+    assert_eq!(over.len(), 1);
+    let rec = f.scanner.source_record(&over[0].locator).unwrap();
+    assert!(rec.raw.is_empty() && rec.unavailable.is_some());
+    let ok = f
+        .scanner
+        .source_record(&page.events[0].provenance.locator)
+        .unwrap();
+    assert!(ok.unavailable.is_none() && ok.raw.len() == cap);
+}
+
+#[test]
+fn pages_follow_the_anchor_total_order_with_missing_and_decreasing_timestamps() {
+    let no_clock = json!({"type": "response_item", "payload": {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "no clock"}]}})
+    .to_string();
+    let (mut f, s) = open(&[
+        session_meta("2026-10-29T10:00:00Z", "ord", "/p"),
+        user("2026-10-29T10:00:05Z", "t5"),
+        assistant("2026-10-29T10:00:01Z", "t1"),
+        user("2026-10-29T10:00:03Z", "t3"),
+        no_clock,
+        assistant("2026-10-29T10:00:03Z", "t3b"),
+        record("2026-10-29T10:00:02Z", "mystery", json!({})),
+        item_completed("2026-10-29T10:00:04Z", command_item("i", "ls", "out", 0)),
+        record("2026-10-29T10:00:06Z", "mystery", json!({})),
+    ]);
+    let whole = first(&mut f, &s.key);
+    let label = |e: &Event| match (&e.text, &e.tool) {
+        (Some(t), _) => t.preview.clone(),
+        (_, Some(_)) => "tool".to_owned(),
+        _ => unreachable!(),
+    };
+    let order: Vec<String> = whole.events.iter().map(label).collect();
+    assert_eq!(order, ["no clock", "t1", "t3", "t3b", "tool", "t5"]);
+    let keys: Vec<_> = whole
+        .events
+        .iter()
+        .map(|e| (e.timestamp, e.source_order))
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] < w[1]),
+        "anchor order: {keys:?}"
+    );
+    assert_eq!(whole.events[0].timestamp, None);
+    let all_ids = ids(&whole.events);
+
+    for size in [1usize, 2, 3, 5] {
+        let request = PageRequest {
+            max_events: size,
+            max_bytes: 10_000_000,
+        };
+        let forward = chain(&mut f, &s.key, PageDirection::Forward, request);
+        let backward = chain(&mut f, &s.key, PageDirection::Backward, request);
+        let fwd: Vec<_> = forward.iter().flat_map(|p| ids(&p.events)).collect();
+        let mut bwd_pages: Vec<_> = backward.iter().map(|p| ids(&p.events)).collect();
+        bwd_pages.reverse();
+        let bwd: Vec<_> = bwd_pages.into_iter().flatten().collect();
+        assert_eq!(fwd, all_ids, "forward size {size}");
+        assert_eq!(bwd, all_ids, "backward size {size}");
+        let offsets = |pages: &[TranscriptPage]| {
+            let mut v: Vec<u64> = pages
+                .iter()
+                .flat_map(|p| p.diagnostics.iter().map(|d| offset_of(&d.locator)))
+                .collect();
+            let n = v.len();
+            v.sort_unstable();
+            v.dedup();
+            assert_eq!(v.len(), n, "duplicate diagnostics, size {size}");
+            v
+        };
+        assert_eq!(offsets(&forward), offsets(&backward), "size {size}");
+        assert_eq!(offsets(&forward).len(), whole.diagnostics.len());
+    }
+
+    // Interior anchors split the order exactly, including across a decreasing step.
+    let t3 = &whole.events[2];
+    let after = f
+        .scanner
+        .transcript_page(&s.key, Some(anchor_of(t3)), PageDirection::Forward, ALL)
+        .unwrap();
+    assert_eq!(ids(&after.events), all_ids[3..].to_vec());
+    let before = f
+        .scanner
+        .transcript_page(&s.key, Some(anchor_of(t3)), PageDirection::Backward, ALL)
+        .unwrap();
+    assert_eq!(ids(&before.events), all_ids[..2].to_vec());
+    assert_eq!(
+        f.scanner
+            .count_events_after(&s.key, &anchor_of(t3))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        f.scanner
+            .count_events_after(&s.key, &anchor_of(&whole.events[0]))
+            .unwrap(),
+        5
+    );
+}

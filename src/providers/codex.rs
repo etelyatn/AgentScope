@@ -8,10 +8,12 @@
 //! offset is the Codex source order and the basis of every [`PageAnchor`].
 //! Duplicate session IDs are never merged: every rollout file is its own row.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, UNIX_EPOCH};
 
 use chrono::DateTime;
@@ -33,13 +35,14 @@ use crate::usage::{codex_total, estimate_cost};
 
 /// Unpaired calls and orphan outputs tracked per session (each).
 const MAX_TRACKED: usize = 256;
+/// Superseded call IDs remembered so their late outputs are not orphans.
+const MAX_CLOSED: usize = 1024;
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Largest preview kept for one text field of a page event. `preview` is quadratic
 /// in the kept length, and full content is one source-record load away.
 const PREVIEW_CAP: usize = 2048;
 /// Diagnostics returned (and buffered) per page.
 const DIAG_CAP: usize = 200;
-/// Backward reads walk the file in blocks of this size.
-const BLOCK: usize = 64 * 1024;
 const LABEL_CHARS: usize = 64;
 
 /// Open file handles are bounded: only the most recently modified rollouts keep a
@@ -199,19 +202,6 @@ fn classify(value: &Value) -> Class<'_> {
     }
 }
 
-/// Whether a record is a timeline row. Calls/outputs only render when unpaired.
-fn is_displayed(class: &Class<'_>, offset: u64, shown: &BTreeSet<u64>) -> bool {
-    match class {
-        Class::Message(_)
-        | Class::Reasoning(_)
-        | Class::Compaction(_)
-        | Class::Turn { .. }
-        | Class::Tool(_) => true,
-        Class::Call(_) | Class::Output(_) => shown.contains(&offset),
-        Class::Duplicate(_) | Class::Hidden(_) | Class::Unknown(_) => false,
-    }
-}
-
 /// Everything learned from one rollout file so far. Usage snapshots are
 /// replaced, never accumulated: both Codex sources are cumulative.
 #[derive(Default)]
@@ -249,7 +239,14 @@ struct Parsed {
     /// Outputs with no call seen.
     orphans: u32,
     /// More calls were open than tracked, so later unmatched outputs are not orphans.
+    /// More calls were open than tracked, so later unmatched outputs are not orphans.
     pairing_overflow: bool,
+    /// Calls superseded by an `item_completed`; their late output is not an orphan.
+    closed: HashSet<String>,
+    /// Unique per parse restart; keys the transcript index cache.
+    generation: u64,
+    /// `(end, hash)` of the bytes the scan consumed, to detect replaced files.
+    fingerprint: Option<(u64, u64)>,
 }
 
 impl Parsed {
@@ -261,6 +258,13 @@ impl Parsed {
     fn window(&mut self, v: &Value) {
         if let Some(w) = field(v, "model_context_window").as_u64() {
             self.context_window = Some(w);
+        }
+    }
+
+    fn tool_completed(&mut self, item: &Value, ts: Option<Timestamp>) {
+        self.display(ts);
+        if !item_pending(item) {
+            self.complete_oldest_call();
         }
     }
 
@@ -278,7 +282,8 @@ impl Parsed {
                 }
                 self.display(ts);
             }
-            Class::Reasoning(_) | Class::Compaction(_) | Class::Tool(_) => self.display(ts),
+            Class::Reasoning(_) | Class::Compaction(_) => self.display(ts),
+            Class::Tool(item) => self.tool_completed(item, ts),
             Class::Turn { started } => {
                 self.display(ts);
                 if started {
@@ -377,11 +382,41 @@ impl Parsed {
         };
         if let Some(call) = self.open_calls.remove(&id) {
             self.shown.remove(&call);
+        } else if self.closed.remove(&id) {
+            // The authoritative completion already replaced this call; stay source-only.
         } else if !self.pairing_overflow && (self.orphans as usize) < MAX_TRACKED {
             self.orphans += 1;
             self.shown.insert(offset);
             self.last_event = self.last_event.max(ts);
         }
+    }
+
+    /// An authoritative `item_completed` tool row supersedes the oldest still-open raw
+    /// call: IDs never join (spec §6.3), so completion order is the only evidence.
+    /// Without this a pending row would sit next to its own completed row.
+    fn complete_oldest_call(&mut self) {
+        let Some((id, offset)) = self
+            .open_calls
+            .iter()
+            .min_by_key(|(_, offset)| **offset)
+            .map(|(id, offset)| (id.clone(), *offset))
+        else {
+            return;
+        };
+        self.open_calls.remove(&id);
+        self.shown.remove(&offset);
+        if self.closed.len() >= MAX_CLOSED {
+            self.pairing_overflow = true;
+        } else {
+            self.closed.insert(id);
+        }
+    }
+
+    fn set_end(&mut self, end: u64) {
+        if self.generation == 0 {
+            self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+        self.end = end;
     }
 
     fn usage_record(&mut self, body: &Value) {
@@ -433,6 +468,15 @@ impl FileState {
         self.rotations_seen = 0;
         self.reached_eof = false;
         self.dirty = true;
+    }
+
+    /// Records a fingerprint of the consumed bytes so later transcript reads can
+    /// tell the scanned file from a replacement.
+    fn stamp(&mut self) {
+        let end = self.parsed.end;
+        if self.parsed.fingerprint.map(|f| f.0) != Some(end) {
+            self.parsed.fingerprint = fingerprint(&self.source.path, end).map(|hash| (end, hash));
+        }
     }
 
     fn stem(&self) -> String {
@@ -507,6 +551,8 @@ pub struct CodexScanner {
     /// Sources that stayed unreadable for a full refresh; probed silently until readable.
     expired: HashSet<PathBuf>,
     pass: Option<Pass>,
+    /// Page index of the one session being inspected.
+    index: Option<Index>,
 }
 
 impl CodexScanner {
@@ -516,6 +562,7 @@ impl CodexScanner {
             states: HashMap::new(),
             expired: HashSet::new(),
             pass: None,
+            index: None,
         })
     }
 
@@ -681,6 +728,7 @@ impl CodexScanner {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     state.reached_eof = true;
+                    state.stamp();
                     state.dirty |= !state.available;
                     state.available = true;
                     state.retained = false;
@@ -711,10 +759,11 @@ impl CodexScanner {
                 Record::Invalid { .. } => state.parsed.malformed += 1,
                 Record::TooLarge { .. } => state.parsed.oversized += 1,
             }
-            state.parsed.end = after;
+            state.parsed.set_end(after);
             state.dirty = true;
             meter.records += 1;
             if meter.spent() {
+                state.stamp();
                 return Advance::Exhausted;
             }
         }
@@ -962,21 +1011,28 @@ fn io_error(error: &io::Error) -> ProviderError {
 
 /// Reads complete lines forward from `start` up to (never past) `end`. A line longer
 /// than the record cap is consumed without being buffered.
-struct ForwardLines {
-    reader: BufReader<io::Take<File>>,
+struct ForwardLines<R: Read> {
+    reader: BufReader<io::Take<R>>,
     offset: u64,
     max: usize,
 }
 
-impl ForwardLines {
+impl ForwardLines<File> {
     fn open(path: &Path, start: u64, end: u64, max: usize) -> io::Result<Self> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start))?;
-        Ok(Self {
-            reader: BufReader::new(file.take(end.saturating_sub(start))),
+        Ok(Self::new(file, start, end, max))
+    }
+}
+
+impl<R: Read> ForwardLines<R> {
+    /// `source` must already be positioned at `start`.
+    fn new(source: R, start: u64, end: u64, max: usize) -> Self {
+        Self {
+            reader: BufReader::new(source.take(end.saturating_sub(start))),
             offset: start,
             max,
-        })
+        }
     }
 
     /// One line's start offset and bytes (`None` when oversized); `None` at the end.
@@ -1018,126 +1074,6 @@ impl ForwardLines {
             offset,
             body: bytes.map_or(Body::TooLarge, |b| parse_line(&b, max)),
         }))
-    }
-}
-
-/// Reads complete lines backward (newest first) from `end`, in blocks. `end` is
-/// normally a record boundary; a dangling partial line before it is discarded.
-struct BackLines {
-    file: File,
-    pos: u64,
-    max: usize,
-    /// Tail of a line whose start is further left.
-    carry: Vec<u8>,
-    carry_len: u64,
-    carry_over: bool,
-    has_carry: bool,
-    skip_next: bool,
-    ready: VecDeque<Line>,
-}
-
-impl BackLines {
-    fn open(path: &Path, end: u64, max: usize) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let mut dangling = false;
-        if end > 0 {
-            file.seek(SeekFrom::Start(end - 1))?;
-            let mut last = [0u8; 1];
-            file.read_exact(&mut last)?;
-            dangling = last[0] != b'\n';
-        }
-        Ok(Self {
-            file,
-            pos: end,
-            max,
-            carry: Vec::new(),
-            carry_len: 0,
-            carry_over: false,
-            has_carry: dangling,
-            skip_next: dangling,
-            ready: VecDeque::new(),
-        })
-    }
-
-    fn finish(&mut self, offset: u64, bytes: Option<Vec<u8>>) {
-        if std::mem::take(&mut self.skip_next) {
-            return;
-        }
-        let body = bytes.map_or(Body::TooLarge, |b| parse_line(&b, self.max));
-        self.ready.push_back(Line { offset, body });
-    }
-
-    fn next_line(&mut self) -> io::Result<Option<Line>> {
-        loop {
-            if let Some(line) = self.ready.pop_front() {
-                return Ok(Some(line));
-            }
-            if self.pos == 0 {
-                if !self.has_carry {
-                    return Ok(None);
-                }
-                self.has_carry = false;
-                let bytes = (!self.carry_over).then(|| std::mem::take(&mut self.carry));
-                self.carry_over = false;
-                self.carry_len = 0;
-                self.finish(0, bytes);
-                continue;
-            }
-            self.read_block()?;
-        }
-    }
-
-    fn read_block(&mut self) -> io::Result<()> {
-        let n = BLOCK.min(usize::try_from(self.pos).unwrap_or(BLOCK));
-        let start = self.pos - n as u64;
-        let mut chunk = vec![0u8; n];
-        self.file.seek(SeekFrom::Start(start))?;
-        self.file.read_exact(&mut chunk)?;
-        self.pos = start;
-        let limit = self.max.saturating_add(1) as u64;
-        let newlines: Vec<usize> = chunk
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &b)| (b == b'\n').then_some(i))
-            .collect();
-        let (Some(&first), Some(&last)) = (newlines.first(), newlines.last()) else {
-            // No line start in this block: it only extends the carried line leftwards.
-            self.carry_len += n as u64;
-            if self.carry_over || self.carry_len > limit {
-                self.carry_over = true;
-                self.carry = Vec::new();
-            } else {
-                chunk.extend_from_slice(&self.carry);
-                self.carry = chunk;
-            }
-            self.has_carry = true;
-            return Ok(());
-        };
-        if self.has_carry {
-            let tail = &chunk[last + 1..];
-            let total = tail.len() as u64 + self.carry_len;
-            let bytes = (!self.carry_over && total <= limit).then(|| {
-                let mut joined = tail.to_vec();
-                joined.extend_from_slice(&self.carry);
-                joined
-            });
-            self.finish(start + last as u64 + 1, bytes);
-        }
-        for pair in newlines.windows(2).rev() {
-            let line = &chunk[pair[0] + 1..pair[1]];
-            let bytes = (line.len() as u64 <= limit).then(|| line.to_vec());
-            self.finish(start + pair[0] as u64 + 1, bytes);
-        }
-        let head = &chunk[..first];
-        self.carry_len = head.len() as u64;
-        self.carry_over = self.carry_len > limit;
-        self.carry = if self.carry_over {
-            Vec::new()
-        } else {
-            head.to_vec()
-        };
-        self.has_carry = true;
-        Ok(())
     }
 }
 
@@ -1219,6 +1155,16 @@ fn duration_ms(item: &Value) -> Option<i64> {
     let secs = d.get("secs")?.as_i64()?;
     let nanos = d.get("nanos").and_then(Value::as_i64).unwrap_or(0);
     secs.checked_mul(1000)?.checked_add(nanos / 1_000_000)
+}
+
+fn item_pending(item: &Value) -> bool {
+    let status = field(item, "status")
+        .as_str()
+        .map(|s| s.to_ascii_lowercase().replace(['_', '-'], ""));
+    matches!(
+        status.as_deref(),
+        Some("inprogress" | "running" | "pending" | "started")
+    )
 }
 
 fn tool_status(item: &Value, exit_code: Option<i32>, result_error: bool) -> ToolStatus {
@@ -1351,16 +1297,11 @@ impl Mapper<'_> {
         }
     }
 
-    /// Sanitized, redacted, size-capped preview that never buffers more than a
-    /// small multiple of the cap before the regexes run.
+    /// Sanitized, redacted, then cut. Redaction sees the whole value (already bounded
+    /// by the record cap), so a secret longer than the preview cap is never left
+    /// half-masked by a cut that removed its closing quote.
     fn bounded(&self, text: &str, locator: &SourceLocator) -> BoundedText {
-        let mut cut = text.len().min(self.cap.saturating_mul(4).max(1024));
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let mut bounded = preview(&text[..cut], self.cap, self.cap);
-        bounded.byte_len = text.len();
-        bounded.truncated |= cut < text.len();
+        let mut bounded = preview(text, self.cap, self.cap);
         bounded.locator = Some(locator.clone());
         bounded
     }
@@ -1570,13 +1511,41 @@ fn push_diag(into: &mut Vec<DiagnosticEntry>, entry: DiagnosticEntry, truncated:
 struct Limits {
     max_events: usize,
     max_bytes: usize,
-    max_record: usize,
 }
 
 impl Limits {
     fn full(&self, events: &[Event], bytes: usize, next: &Event) -> bool {
         !events.is_empty()
             && (events.len() >= self.max_events || bytes + event_cost(next) > self.max_bytes)
+    }
+}
+
+/// Shrinks the previews of one row so the whole interaction (name, input, output)
+/// fits `budget`. Previews are already redacted, so cutting them is safe.
+fn fit(event: &mut Event, budget: usize) {
+    let name = event.tool.as_ref().map_or(0, |t| t.name.len());
+    let mut left = budget.saturating_sub(name);
+    let mut fields: Vec<&mut BoundedText> = Vec::new();
+    if let Some(text) = event.text.as_mut() {
+        fields.push(text);
+    }
+    if let Some(tool) = event.tool.as_mut() {
+        fields.extend(tool.input.as_mut());
+        fields.extend(tool.output.as_mut());
+    }
+    let mut remaining = fields.len();
+    for field in fields {
+        let share = left / remaining;
+        remaining -= 1;
+        if field.preview.len() > share {
+            let mut cut = share;
+            while !field.preview.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            field.preview.truncate(cut);
+            field.truncated = true;
+        }
+        left -= field.preview.len();
     }
 }
 
@@ -1590,136 +1559,288 @@ fn empty_page() -> TranscriptPage {
     }
 }
 
-/// Events strictly after `anchor` (or from the start), oldest first. A diagnostic
-/// record belongs to the page of the next event after it, or to the last page.
-fn forward_page(
-    mapper: &Mapper<'_>,
-    anchor: Option<&PageAnchor>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IxKind {
+    /// Always a timeline row.
+    Row,
+    /// Raw call/output: a row only while unpaired (see `Parsed::shown`).
+    Pairable,
+    /// Hidden, unknown, malformed, or oversized: diagnostics only.
+    Diag,
+}
+
+#[derive(Clone, Copy)]
+struct Ix {
+    ts: Option<Timestamp>,
+    offset: u64,
+    kind: IxKind,
+}
+
+impl Ix {
+    /// The `PageAnchor` total order; the stable ID (`codex:<offset>`) is a function
+    /// of the offset, so it never breaks a tie the offset has not.
+    fn key(&self) -> (Option<Timestamp>, u64) {
+        (self.ts, self.offset)
+    }
+
+    fn displayed(&self, shown: &BTreeSet<u64>) -> bool {
+        match self.kind {
+            IxKind::Row => true,
+            IxKind::Pairable => shown.contains(&self.offset),
+            IxKind::Diag => false,
+        }
+    }
+}
+
+/// Every complete record of one session in `PageAnchor` order. Built lazily for the
+/// session being inspected (one slot), extended on append, rebuilt on replacement.
+struct Index {
+    path: PathBuf,
+    generation: u64,
     end: u64,
+    entries: Vec<Ix>,
+}
+
+fn ensure_index<'a>(
+    slot: &'a mut Option<Index>,
+    state: &FileState,
+    max: usize,
+) -> io::Result<&'a Index> {
+    let parsed = &state.parsed;
+    let stale = slot.as_ref().is_none_or(|i| {
+        i.path != state.source.path || i.generation != parsed.generation || i.end > parsed.end
+    });
+    if stale {
+        *slot = Some(Index {
+            path: state.source.path.clone(),
+            generation: parsed.generation,
+            end: 0,
+            entries: Vec::new(),
+        });
+    }
+    let index = slot.as_mut().expect("index slot was just filled");
+    if index.end < parsed.end {
+        let mut lines = ForwardLines::open(&index.path, index.end, parsed.end, max)?;
+        let mut fresh: Vec<Ix> = Vec::new();
+        while let Some(line) = lines.next_line()? {
+            let (ts, kind) = match &line.body {
+                Body::Json(value) => (
+                    parse_ts(field(value, "timestamp")),
+                    match classify(value) {
+                        Class::Message(_)
+                        | Class::Reasoning(_)
+                        | Class::Compaction(_)
+                        | Class::Turn { .. }
+                        | Class::Tool(_) => IxKind::Row,
+                        Class::Call(_) | Class::Output(_) => IxKind::Pairable,
+                        Class::Duplicate(_) | Class::Hidden(_) | Class::Unknown(_) => IxKind::Diag,
+                    },
+                ),
+                Body::Invalid | Body::TooLarge => (None, IxKind::Diag),
+            };
+            fresh.push(Ix {
+                ts,
+                offset: line.offset,
+                kind,
+            });
+        }
+        index.end = parsed.end;
+        let ordered = fresh.windows(2).all(|w| w[0].key() <= w[1].key())
+            && index
+                .entries
+                .last()
+                .zip(fresh.first())
+                .is_none_or(|(a, b)| a.key() <= b.key());
+        index.entries.extend(fresh);
+        if !ordered {
+            index.entries.sort_unstable_by_key(Ix::key);
+        }
+    }
+    Ok(index)
+}
+
+impl Index {
+    /// Position of the entry an anchor names; `None` for an anchor from another
+    /// generation of the file (or a record that no longer exists).
+    fn position(&self, anchor: &PageAnchor) -> Option<usize> {
+        let key = (anchor.timestamp, anchor.source_order);
+        let i = self.entries.partition_point(|e| e.key() < key);
+        let entry = self.entries.get(i)?;
+        (entry.key() == key && anchor.stable_id == format!("codex:{}", entry.offset)).then_some(i)
+    }
+}
+
+/// Random access to records by offset, never past the scanned end.
+struct Reader {
+    file: File,
+    end: u64,
+    max: usize,
+}
+
+impl Reader {
+    fn line(&mut self, offset: u64) -> io::Result<Line> {
+        (&self.file).seek(SeekFrom::Start(offset))?;
+        ForwardLines::new(&self.file, offset, self.end, self.max)
+            .next_line()?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+    }
+}
+
+/// Pages in `PageAnchor` order (timestamp, offset, stable ID). Forward returns the
+/// rows after the anchor; backward the rows before it, oldest first. A diagnostic
+/// record belongs to the page of the next row after it in that order, or to the
+/// last page, so both directions partition diagnostics identically.
+fn page(
+    mapper: &Mapper<'_>,
+    index: &Index,
+    reader: &mut Reader,
+    anchor: Option<&PageAnchor>,
+    direction: PageDirection,
     limits: Limits,
 ) -> io::Result<TranscriptPage> {
-    let start = anchor.map_or(0, |a| a.source_order);
-    if start >= end {
-        return Ok(empty_page());
-    }
-    let mut lines = ForwardLines::open(mapper.path, start, end, limits.max_record)?;
-    if anchor.is_some() {
-        lines.read()?;
-    }
+    let at = match anchor {
+        Some(a) => match index.position(a) {
+            Some(i) => Some(i),
+            None => return Ok(empty_page()),
+        },
+        None => None,
+    };
+    let len = index.entries.len();
+    let forward = direction == PageDirection::Forward;
+    let order: Box<dyn Iterator<Item = usize>> = if forward {
+        Box::new(at.map_or(0, |i| i + 1)..len)
+    } else {
+        Box::new((0..at.unwrap_or(len)).rev())
+    };
     let mut events: Vec<Event> = Vec::new();
     let mut diags = Vec::new();
-    let mut trailing = Vec::new();
+    // Forward: diagnostics waiting for the next row. Backward: the page's own.
+    let mut pending = Vec::new();
     let mut truncated = false;
     let mut bytes = 0usize;
     let mut has_more = false;
-    while let Some(line) = lines.next_line()? {
+    for i in order {
+        let entry = index.entries[i];
+        let keep_diag = forward || anchor.is_none() || !events.is_empty();
+        if entry.kind == IxKind::Diag {
+            let sink = if forward { &pending } else { &diags };
+            if !keep_diag {
+                continue;
+            }
+            if sink.len() >= DIAG_CAP {
+                truncated = true;
+                continue;
+            }
+        }
+        let line = reader.line(entry.offset)?;
         match mapper.map(&line) {
-            Mapped::Diag(entry) => push_diag(&mut trailing, entry, &mut truncated),
+            Mapped::Diag(d) => {
+                if !keep_diag {
+                    continue;
+                }
+                push_diag(
+                    if forward { &mut pending } else { &mut diags },
+                    d,
+                    &mut truncated,
+                );
+            }
             Mapped::Event(event) => {
+                let mut event = *event;
+                fit(&mut event, limits.max_bytes);
                 if limits.full(&events, bytes, &event) {
                     has_more = true;
                     break;
                 }
-                for entry in trailing.drain(..) {
-                    push_diag(&mut diags, entry, &mut truncated);
+                if forward {
+                    for d in pending.drain(..) {
+                        push_diag(&mut diags, d, &mut truncated);
+                    }
                 }
                 bytes += event_cost(&event);
-                events.push(*event);
+                events.push(event);
             }
         }
     }
-    if !has_more {
-        for entry in trailing {
-            push_diag(&mut diags, entry, &mut truncated);
+    if forward && !has_more {
+        for d in pending {
+            push_diag(&mut diags, d, &mut truncated);
         }
     }
+    if !forward {
+        events.reverse();
+        diags.reverse();
+    }
     truncated |= events.iter().any(event_truncated);
+    let next = if forward {
+        events.last()
+    } else {
+        events.first()
+    }
+    .map(anchor_of);
     Ok(TranscriptPage {
-        next: events.last().map(anchor_of),
         events,
         diagnostics: diags,
+        next,
         has_more,
         truncated,
     })
 }
 
-/// The newest events strictly before `anchor` (or the end), returned oldest first.
-fn backward_page(
-    mapper: &Mapper<'_>,
-    anchor: Option<&PageAnchor>,
-    end: u64,
-    limits: Limits,
-) -> io::Result<TranscriptPage> {
-    let before = anchor.map_or(end, |a| a.source_order.min(end));
-    let mut lines = BackLines::open(mapper.path, before, limits.max_record)?;
-    let mut events: Vec<Event> = Vec::new();
-    let mut diags = Vec::new();
-    let mut truncated = false;
-    let mut bytes = 0usize;
-    let mut has_more = false;
-    while let Some(line) = lines.next_line()? {
-        match mapper.map(&line) {
-            // Records between the anchor and the page's newest event belong to the
-            // anchor's page; with no anchor there is no later event to claim them.
-            Mapped::Diag(entry) => {
-                if anchor.is_none() || !events.is_empty() {
-                    push_diag(&mut diags, entry, &mut truncated);
-                }
-            }
-            Mapped::Event(event) => {
-                if limits.full(&events, bytes, &event) {
-                    has_more = true;
-                    break;
-                }
-                bytes += event_cost(&event);
-                events.push(*event);
-            }
-        }
+/// Hash of three samples of the consumed bytes plus their length. A file replaced
+/// by different content no longer matches; a replacement that only differs between
+/// the samples is a documented false negative.
+fn fingerprint(path: &Path, end: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() < end {
+        return None;
     }
-    events.reverse();
-    diags.reverse();
-    truncated |= events.iter().any(event_truncated);
-    Ok(TranscriptPage {
-        next: events.first().map(anchor_of),
-        events,
-        diagnostics: diags,
-        has_more,
-        truncated,
-    })
+    let mut hasher = DefaultHasher::new();
+    end.hash(&mut hasher);
+    let len = end.min(512);
+    for start in [0, (end / 2).min(end - len), end - len] {
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = vec![0u8; usize::try_from(len).ok()?];
+        file.read_exact(&mut buf).ok()?;
+        buf.hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
-impl CodexScanner {
-    fn session(&self, key: &SessionKey) -> Result<&FileState, ProviderError> {
-        let SourceKey::File(path) = &key.source else {
-            return Err(ProviderError::Unsupported(
-                "not a Codex file session".into(),
-            ));
-        };
-        if key.provider != Provider::Codex {
-            return Err(ProviderError::Unsupported("not a Codex session".into()));
-        }
-        let state = self
-            .states
-            .get(path)
-            .filter(|s| s.key() == *key)
-            .ok_or_else(|| ProviderError::Unavailable("unknown Codex session".into()))?;
-        if !state.available {
-            return Err(ProviderError::Unavailable("source unavailable".into()));
-        }
-        Ok(state)
+fn find<'a>(
+    states: &'a HashMap<PathBuf, FileState>,
+    key: &SessionKey,
+) -> Result<&'a FileState, ProviderError> {
+    let SourceKey::File(path) = &key.source else {
+        return Err(ProviderError::Unsupported(
+            "not a Codex file session".into(),
+        ));
+    };
+    if key.provider != Provider::Codex {
+        return Err(ProviderError::Unsupported("not a Codex session".into()));
     }
+    let state = states
+        .get(path)
+        .filter(|s| s.key() == *key)
+        .ok_or_else(|| ProviderError::Unavailable("unknown Codex session".into()))?;
+    if !state.available {
+        return Err(ProviderError::Unavailable("source unavailable".into()));
+    }
+    Ok(state)
+}
 
-    /// End of the data the roster has consumed, provided the file still holds it.
-    fn readable_end(state: &FileState) -> Result<u64, ProviderError> {
-        let len = fs::metadata(&state.source.path)
-            .map_err(|e| io_error(&e))?
-            .len();
-        if len < state.parsed.end {
-            return Err(ProviderError::Unavailable(
-                "source changed since the last refresh".into(),
-            ));
+/// End of the data the roster consumed, provided the file on disk is still the one
+/// that was scanned. A replaced file must not be read through the old offsets.
+fn verified_end(state: &FileState) -> Result<u64, ProviderError> {
+    let end = state.parsed.end;
+    match state.parsed.fingerprint {
+        Some((scanned, hash))
+            if scanned == end && fingerprint(&state.source.path, end) == Some(hash) =>
+        {
+            Ok(end)
         }
-        Ok(state.parsed.end)
+        _ => Err(ProviderError::Unavailable(
+            "source changed since the last refresh".into(),
+        )),
     }
 }
 
@@ -1743,8 +1864,10 @@ impl ProviderReader for CodexScanner {
         direction: PageDirection,
         request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
-        let state = self.session(key)?;
-        let end = Self::readable_end(state)?;
+        let state = find(&self.states, key)?;
+        let end = verified_end(state)?;
+        let max = self.config.max_record_bytes;
+        let index = ensure_index(&mut self.index, state, max).map_err(|e| io_error(&e))?;
         let mapper = Mapper {
             key,
             path: &state.source.path,
@@ -1755,12 +1878,20 @@ impl ProviderReader for CodexScanner {
         let limits = Limits {
             max_events: request.max_events.max(1),
             max_bytes: request.max_bytes,
-            max_record: self.config.max_record_bytes,
         };
-        match direction {
-            PageDirection::Forward => forward_page(&mapper, anchor.as_ref(), end, limits),
-            PageDirection::Backward => backward_page(&mapper, anchor.as_ref(), end, limits),
-        }
+        let mut reader = Reader {
+            file: File::open(&state.source.path).map_err(|e| io_error(&e))?,
+            end,
+            max,
+        };
+        page(
+            &mapper,
+            index,
+            &mut reader,
+            anchor.as_ref(),
+            direction,
+            limits,
+        )
         .map_err(|e| io_error(&e))
     }
 
@@ -1769,26 +1900,16 @@ impl ProviderReader for CodexScanner {
         key: &SessionKey,
         anchor: &PageAnchor,
     ) -> Result<usize, ProviderError> {
-        let state = self.session(key)?;
-        let end = Self::readable_end(state)?;
-        if anchor.source_order >= end {
-            return Ok(0);
-        }
+        let state = find(&self.states, key)?;
+        verified_end(state)?;
         let max = self.config.max_record_bytes;
-        let count = || -> io::Result<usize> {
-            let mut lines = ForwardLines::open(&state.source.path, anchor.source_order, end, max)?;
-            lines.read()?;
-            let mut count = 0;
-            while let Some(line) = lines.next_line()? {
-                if let Body::Json(value) = &line.body
-                    && is_displayed(&classify(value), line.offset, &state.parsed.shown)
-                {
-                    count += 1;
-                }
-            }
-            Ok(count)
-        };
-        count().map_err(|e| io_error(&e))
+        let index = ensure_index(&mut self.index, state, max).map_err(|e| io_error(&e))?;
+        let key = (anchor.timestamp, anchor.source_order);
+        let from = index.entries.partition_point(|e| e.key() <= key);
+        Ok(index.entries[from..]
+            .iter()
+            .filter(|e| e.displayed(&state.parsed.shown))
+            .count())
     }
 
     fn source_record(&mut self, locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
@@ -1797,13 +1918,13 @@ impl ProviderReader for CodexScanner {
                 "not a Codex file locator".into(),
             ));
         };
-        let state = self.session(&locator.session)?;
+        let state = find(&self.states, &locator.session)?;
         if *path != state.source.path {
             return Err(ProviderError::Unsupported(
                 "locator does not belong to this session source".into(),
             ));
         }
-        let end = Self::readable_end(state)?;
+        let end = verified_end(state)?;
         if *offset >= end {
             return Err(ProviderError::Unavailable(
                 "record is beyond the scanned data".into(),
@@ -1824,24 +1945,25 @@ impl ProviderReader for CodexScanner {
                 .read()?
                 .map(|(_, bytes)| bytes))
         };
-        let bytes = match read().map_err(|e| io_error(&e))? {
-            None => {
-                return Err(ProviderError::Parse(
-                    "locator is not a record boundary".into(),
-                ));
-            }
-            Some(bytes) => bytes,
+        let Some(bytes) = read().map_err(|e| io_error(&e))? else {
+            return Err(ProviderError::Parse(
+                "locator is not a record boundary".into(),
+            ));
         };
-        let Some(mut bytes) = bytes else {
+        // Same rule as `parse_line`: the cap applies after the CRLF terminator is gone.
+        let bytes = bytes.map(|mut b| {
+            if b.last() == Some(&b'\r') {
+                b.pop();
+            }
+            b
+        });
+        let Some(bytes) = bytes.filter(|b| b.len() <= max) else {
             return Ok(SourceRecord {
                 raw: String::new(),
                 display: String::new(),
                 unavailable: Some(format!("record exceeds the {max}-byte limit")),
             });
         };
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
         let raw = String::from_utf8_lossy(&bytes).into_owned();
         let display = display_safe(&raw);
         Ok(SourceRecord {
