@@ -321,3 +321,57 @@ fn unsupported_schema_lists_nothing_and_refuses_transcripts() {
         .expect_err("unsupported");
     assert!(matches!(err, ProviderError::Unsupported(_)));
 }
+
+#[test]
+fn legacy_message_rows_of_every_kind_spend_the_evidence_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = create_legacy(&db);
+        insert_legacy_session(&conn, &Session::new("s", 1, 100));
+        for i in 0..9 {
+            message(
+                &conn,
+                "s",
+                &format!("u{i}"),
+                10 + i,
+                json!({"role": "user"}),
+            );
+        }
+        message(
+            &conn,
+            "s",
+            "a",
+            5,
+            json!({"role": "assistant", "finish": "stop",
+                   "tokens": {"input": 1, "output": 1, "reasoning": 0,
+                              "cache": {"read": 0, "write": 0}}}),
+        );
+    }
+    let mut scanner = scanner_for(&db);
+    let small = RefreshBudget {
+        max_records: 3,
+        ..BIG
+    };
+    let first = scanner.scan_roster(NOW, small).expect("scan");
+    assert!(!first.scan.done && first.sessions.is_empty());
+    let mut steps = 1;
+    let mut out = HashMap::new();
+    loop {
+        let d = scanner.scan_roster(NOW, small).expect("scan");
+        steps += 1;
+        for s in d.sessions {
+            out.insert(s.key.provider_session_id.clone(), s);
+        }
+        if d.scan.done {
+            break;
+        }
+    }
+    assert!(steps >= 3, "10 message rows at 3 per step, got {steps}");
+    assert_eq!(out["s"].usage.as_ref().and_then(|u| u.total), Some(2));
+    assert_eq!(
+        out["s"].lifecycle,
+        Lifecycle::Ongoing,
+        "newer user rows reopen"
+    );
+}

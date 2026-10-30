@@ -415,7 +415,7 @@ fn finish_and_idle_map_to_turn_evidence_not_session_failure() {
         Case {
             id: "col-idle",
             lifecycle: Lifecycle::Completed,
-            completion: None,
+            completion: Some(2000),
             unfinished: false,
         },
     ];
@@ -457,4 +457,228 @@ fn in_place_message_update_refreshes_lifecycle_and_usage() {
     assert_eq!(second["s"].lifecycle, Lifecycle::Completed);
     assert_eq!(second["s"].last_completion, Some(60));
     assert_eq!(second["s"].usage.as_ref().and_then(|u| u.total), Some(8));
+}
+
+fn raw_msg(conn: &Connection, session: &str, id: &str, ty: &str, at: i64, data: Option<&str>) {
+    conn.execute(
+        "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5)",
+        params![id, session, ty, at, data],
+    )
+    .expect("insert raw message");
+}
+
+fn budget(records: usize, bytes: usize, millis: u64) -> RefreshBudget {
+    RefreshBudget {
+        max_records: records,
+        max_bytes: bytes,
+        max_millis: millis,
+    }
+}
+
+/// Runs steps until the pass is done; returns the number of steps and the roster.
+fn scan_with(
+    scanner: &mut OpenCodeScanner,
+    budget: RefreshBudget,
+) -> (usize, HashMap<String, SessionSummary>) {
+    let mut out = HashMap::new();
+    for step in 1..=10_000 {
+        let delta = scanner.scan_roster(NOW, budget).expect("scan");
+        for s in delta.sessions {
+            out.insert(s.key.provider_session_id.clone(), s);
+        }
+        if delta.scan.done {
+            return (step, out);
+        }
+    }
+    panic!("scan never finished");
+}
+
+#[test]
+fn evidence_collection_is_resumable_under_the_refresh_budget() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    // Non-assistant rows spend budget too: 12 system rows newest-first.
+    for i in 0..12 {
+        msg(
+            &conn,
+            "s",
+            &format!("x{i:02}"),
+            "system",
+            10 + i,
+            json!({"text": "n"}),
+        );
+    }
+    msg(
+        &conn,
+        "s",
+        "a1",
+        "assistant",
+        5,
+        assistant(Some("length"), tokens(3, 2, 0, 0, 0), None),
+    );
+    let mut scanner = scanner_for(&db);
+
+    // The roster row is read but no evidence is published until it completes.
+    let first = scanner
+        .scan_roster(NOW, budget(4, 100_000_000, 60_000))
+        .expect("scan");
+    assert!(!first.scan.done, "evidence outstanding keeps the pass open");
+    assert!(first.sessions.is_empty());
+
+    let (steps, out) = scan_with(&mut scanner, budget(4, 100_000_000, 60_000));
+    assert!(steps >= 3, "13 rows at 4 per step, got {steps} steps");
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Derived);
+    assert_eq!(usage.total, Some(5));
+
+    // Byte budget: at least one row per step still makes progress.
+    let mut scanner = scanner_for(&db);
+    let (steps, out) = scan_with(&mut scanner, budget(100_000, 1, 60_000));
+    assert!(
+        steps > 3,
+        "1-byte budget reads one row per step, got {steps}"
+    );
+    assert_eq!(out["s"].usage.as_ref().and_then(|u| u.total), Some(5));
+}
+
+#[test]
+fn exhausted_budget_reads_nothing_and_keeps_state() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    msg(
+        &conn,
+        "s",
+        "a1",
+        "assistant",
+        5,
+        assistant(Some("stop"), tokens(1, 1, 0, 0, 0), None),
+    );
+    let mut scanner = scanner_for(&db);
+    for zero in [
+        budget(0, 1000, 1000),
+        budget(10, 0, 1000),
+        budget(10, 1000, 0),
+    ] {
+        let d = scanner.scan_roster(NOW, zero).expect("scan");
+        assert!(d.sessions.is_empty() && !d.scan.done);
+    }
+    let (_, out) = scan_with(&mut scanner, budget(10, 100_000, 60_000));
+    assert_eq!(out["s"].lifecycle, Lifecycle::Completed);
+    assert_eq!(out["s"].usage.as_ref().and_then(|u| u.total), Some(2));
+}
+
+#[test]
+fn optional_session_columns_are_kept_independently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("partial.db");
+    {
+        let conn = create(
+            &db,
+            "CREATE TABLE session_v2(
+                id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, fork_session_id TEXT,
+                title TEXT, directory TEXT, model TEXT, version TEXT,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                time_archived INTEGER, tokens_input INTEGER, cost REAL);
+             CREATE TABLE session_message(
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT);
+             INSERT INTO session_v2(id, time_created, time_updated, tokens_input, cost)
+                VALUES ('s', 1, 2, 7, 0.0);",
+        );
+        drop(conn);
+    }
+    let out = scan(&mut scanner_for(&db));
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.categories.input, Some(7));
+    assert_eq!(usage.categories.output, None);
+    assert_eq!(usage.class, AggregationClass::Partial);
+    assert_eq!(usage.total, None);
+    assert_eq!(usage.cost.usd, Some(0.0), "reported zero cost survives");
+    assert_eq!(usage.cost.class, AggregationClass::Reported);
+}
+
+#[test]
+fn unreadable_idle_rows_are_neutral_and_never_close_a_turn() {
+    let (_d, db, conn) = fixture();
+    let huge = format!(
+        r#"{{"outcome":"succeeded","pad":"{}"}}"#,
+        "x".repeat(1_100_000)
+    );
+    let cases: [(&str, Option<&str>); 5] = [
+        ("null", None),
+        ("malformed", Some("{not json")),
+        ("array", Some("[]")),
+        ("oversized", Some(huge.as_str())),
+        ("bad-outcome", Some(r#"{"outcome":7}"#)),
+    ];
+    for (i, (name, data)) in cases.iter().enumerate() {
+        insert_session(&conn, &Session::new(name, 1, 100 + i as i64));
+        raw_msg(
+            &conn,
+            name,
+            &format!("{name}-u"),
+            "user",
+            10,
+            Some(r#"{"text":"go"}"#),
+        );
+        raw_msg(&conn, name, &format!("{name}-i"), "idle", 20, *data);
+    }
+    let out = scan(&mut scanner_for(&db));
+    for (name, _) in cases {
+        assert_eq!(out[name].lifecycle, Lifecycle::Ongoing, "{name}");
+        assert!(out[name].unfinished_work, "{name}");
+        assert_eq!(out[name].last_completion, None, "{name}");
+    }
+}
+
+#[test]
+fn session_level_idle_succeeded_reaches_status_synthesis() {
+    use agentscope::domain::{StatusLabel, Thresholds};
+    use agentscope::status::synthesize;
+    use std::time::Duration;
+    let (_d, db, conn) = fixture();
+    let mut s = Session::new("done", 1, 5_000);
+    s.idle_outcome = Some("succeeded");
+    insert_session(&conn, &s);
+    let out = scan(&mut scanner_for(&db));
+    let summary = &out["done"];
+    assert_eq!(summary.lifecycle, Lifecycle::Completed);
+    assert_eq!(summary.last_completion, Some(5_000));
+    let t = Thresholds {
+        quiet: Duration::from_secs(300),
+        stall: Duration::from_secs(900),
+    };
+    let quiet = synthesize(summary, 5_000 + 301_000, &t);
+    assert_eq!(quiet.label, StatusLabel::Complete);
+    let recent = synthesize(summary, 5_000 + 1_000, &t);
+    assert_eq!(recent.label, StatusLabel::Recent);
+}
+
+#[test]
+fn skipped_oversized_message_ids_make_derived_usage_partial() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    msg(
+        &conn,
+        "s",
+        "a1",
+        "assistant",
+        5,
+        assistant(Some("stop"), tokens(1, 1, 0, 0, 0), Some(0.1)),
+    );
+    let long_id = "m".repeat(5000);
+    msg(
+        &conn,
+        "s",
+        &long_id,
+        "assistant",
+        6,
+        assistant(Some("stop"), tokens(1, 1, 0, 0, 0), Some(0.1)),
+    );
+    let out = scan(&mut scanner_for(&db));
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Partial);
+    assert_eq!(usage.total, None, "an incomplete sum is not a total");
+    assert_eq!(usage.cost.usd, None);
 }

@@ -7,7 +7,7 @@
 //! uses `immutable=1`. Account, credential, share, and key-value tables are denied
 //! at the connection boundary, and `share_url` is never selectable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -244,11 +244,20 @@ pub fn detect_schema(conn: &Connection) -> Result<Schema, ProviderError> {
 #[derive(Clone, Copy, Default)]
 struct Shape {
     project: bool,
-    /// `session_v2` token and cost columns.
-    usage: bool,
+    /// Presence of each `USAGE_COLUMNS` entry in `session_v2`, probed independently.
+    usage: [bool; 6],
     /// `session_v2.idle_outcome`.
     idle: bool,
 }
+
+const USAGE_COLUMNS: [&str; 6] = [
+    "tokens_input",
+    "tokens_output",
+    "tokens_reasoning",
+    "tokens_cache_read",
+    "tokens_cache_write",
+    "cost",
+];
 
 #[derive(Clone, Copy)]
 struct Tables {
@@ -286,6 +295,7 @@ impl Tables {
     }
 }
 
+#[derive(Clone)]
 struct Row {
     id: String,
     title: Option<String>,
@@ -307,6 +317,7 @@ struct Row {
 }
 
 struct Pass {
+    exhausted: bool,
     cursor: Option<(i64, String)>,
     seen: HashSet<String>,
     processed: usize,
@@ -324,7 +335,10 @@ pub struct OpenCodeScanner {
     pass: Option<Pass>,
     known: HashMap<String, SessionSummary>,
     /// Per-session lifecycle/usage evidence keyed by the change stamp it was read at.
-    evidence: HashMap<String, ((i64, Option<i64>), Evidence)>,
+    evidence: HashMap<String, (Stamp, Evidence)>,
+    /// Evidence collections interrupted by the refresh budget, oldest first.
+    jobs: HashMap<String, Job>,
+    pending: VecDeque<String>,
 }
 
 impl OpenCodeScanner {
@@ -341,6 +355,8 @@ impl OpenCodeScanner {
             pass: None,
             known: HashMap::new(),
             evidence: HashMap::new(),
+            jobs: HashMap::new(),
+            pending: VecDeque::new(),
         };
         scanner.ensure_open()?;
         Ok(scanner)
@@ -355,14 +371,14 @@ impl OpenCodeScanner {
             .map_err(map_error)?;
         self.schema = detect_schema(&conn)?;
         let v2 = self.schema == Schema::V2;
+        let mut usage = [false; 6];
+        for (present, column) in usage.iter_mut().zip(USAGE_COLUMNS) {
+            *present =
+                v2 && shape_present(&conn, &format!("SELECT {column} FROM session_v2 LIMIT 0"))?;
+        }
         self.shape = Shape {
             project: shape_present(&conn, "SELECT id, name FROM project LIMIT 0")?,
-            usage: v2
-                && shape_present(
-                    &conn,
-                    "SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
-                     tokens_cache_write, cost FROM session_v2 LIMIT 0",
-                )?,
+            usage,
             idle: v2 && shape_present(&conn, "SELECT idle_outcome FROM session_v2 LIMIT 0")?,
         };
         self.connection = Some(conn);
@@ -398,11 +414,40 @@ impl OpenCodeScanner {
         if result.is_err() {
             self.connection = None;
             self.pass = None;
+            self.jobs.clear();
+            self.pending.clear();
         }
         result
     }
 
     fn step(&mut self, budget: RefreshBudget) -> Result<ProviderDelta, ProviderError> {
+        let conn = self.connection.take().expect("opened");
+        let result = self.step_with(&conn, budget);
+        self.connection = Some(conn);
+        result
+    }
+
+    fn publish(
+        &mut self,
+        row: &Row,
+        stamp: Stamp,
+        evidence: Evidence,
+        tables: &Tables,
+        out: &mut Vec<SessionSummary>,
+    ) {
+        let summary = self.summarize(row, tables, &evidence);
+        self.evidence.insert(row.id.clone(), (stamp, evidence));
+        if self.known.get(&row.id) != Some(&summary) {
+            self.known.insert(row.id.clone(), summary.clone());
+            out.push(summary);
+        }
+    }
+
+    fn step_with(
+        &mut self,
+        conn: &Connection,
+        budget: RefreshBudget,
+    ) -> Result<ProviderDelta, ProviderError> {
         let started = Instant::now();
         let mut warnings = Vec::new();
         let Some(tables) = Tables::for_schema(self.schema) else {
@@ -423,7 +468,6 @@ impl OpenCodeScanner {
                 },
             });
         };
-        let conn = self.connection.as_ref().expect("opened");
         if self.schema == Schema::Legacy
             && shape_present(conn, "SELECT id FROM session_v2 LIMIT 0")?
         {
@@ -448,6 +492,7 @@ impl OpenCodeScanner {
                     eligible_ids(&tables)
                 ))?;
                 Pass {
+                    exhausted: false,
                     cursor: None,
                     seen: HashSet::new(),
                     processed: 0,
@@ -458,10 +503,55 @@ impl OpenCodeScanner {
             }
         };
 
+        let record_cap = self.config.max_record_bytes;
+        let runnable = budget.max_records > 0 && budget.max_bytes > 0 && budget.max_millis > 0;
+        let mut allow = Allowance {
+            records: budget.max_records,
+            bytes: budget.max_bytes,
+            deadline: started + Duration::from_millis(budget.max_millis),
+        };
+        let mut sessions = Vec::new();
+
+        // Evidence left over from earlier steps goes first; the roster does not
+        // advance while any is outstanding, so one step's work stays bounded.
+        let mut first = true;
+        while runnable && let Some(id) = self.pending.front().cloned() {
+            if !first && allow.exhausted() {
+                break;
+            }
+            first = false;
+            let mut job = self.jobs.remove(&id).expect("pending job");
+            match advance(conn, &tables, &mut job, &mut allow, record_cap)? {
+                Some(evidence) => {
+                    self.pending.pop_front();
+                    self.publish(&job.row, job.stamp, evidence, &tables, &mut sessions);
+                }
+                None => {
+                    self.jobs.insert(id, job);
+                    break;
+                }
+            }
+        }
+        if !self.pending.is_empty() {
+            let scan = ScanProgress {
+                provider: Provider::OpenCode,
+                scanned: pass.processed,
+                total: Some(pass.cap),
+                done: false,
+            };
+            self.pass = Some(pass);
+            return Ok(ProviderDelta {
+                sessions,
+                removed: vec![],
+                warnings,
+                scan,
+            });
+        }
+
         let remaining = pass.cap.saturating_sub(pass.processed);
         let limit = budget.max_records.min(remaining);
-        let (rows, ended) = if limit == 0 {
-            (Vec::new(), false)
+        let (rows, ended) = if limit == 0 || pass.exhausted {
+            (Vec::new(), pass.exhausted)
         } else {
             read_page(
                 conn,
@@ -473,32 +563,40 @@ impl OpenCodeScanner {
                 started,
             )?
         };
-
-        let mut sessions = Vec::new();
-        for row in &rows {
+        pass.exhausted |= ended;
+        let read = rows.len();
+        for row in rows {
             pass.cursor = Some((row.updated, row.id.clone()));
             pass.seen.insert(row.id.clone());
             let stamp = (row.updated, row.message_updated);
-            let evidence = match self.evidence.get(&row.id) {
-                Some((at, cached)) if *at == stamp => cached.clone(),
-                _ => {
-                    let conn = self.connection.as_ref().expect("opened");
-                    let fresh = compute_evidence(conn, &tables, row, self.config.max_record_bytes)?;
-                    self.evidence.insert(row.id.clone(), (stamp, fresh.clone()));
-                    fresh
-                }
+            if let Some((at, cached)) = self.evidence.get(&row.id)
+                && *at == stamp
+            {
+                let cached = cached.clone();
+                self.publish(&row, stamp, cached, &tables, &mut sessions);
+                continue;
+            }
+            let mut job = Job::new(row);
+            let finished = if runnable && !allow.exhausted() {
+                advance(conn, &tables, &mut job, &mut allow, record_cap)?
+            } else {
+                None
             };
-            let summary = self.summarize(row, &tables, &evidence);
-            if self.known.get(&row.id) != Some(&summary) {
-                self.known.insert(row.id.clone(), summary.clone());
-                sessions.push(summary);
+            match finished {
+                Some(evidence) => {
+                    self.publish(&job.row, job.stamp, evidence, &tables, &mut sessions);
+                }
+                None => {
+                    let id = job.row.id.clone();
+                    self.pending.push_back(id.clone());
+                    self.jobs.insert(id, job);
+                }
             }
         }
-        pass.processed += rows.len();
-        let done = ended || pass.processed >= pass.cap;
+        pass.processed += read;
+        let done = (pass.exhausted || pass.processed >= pass.cap) && self.pending.is_empty();
         let mut removed = Vec::new();
         if done {
-            let conn = self.connection.as_ref().expect("opened");
             let capped = pass.total > pass.cap;
             let missing: Vec<String> = self
                 .known
@@ -742,12 +840,18 @@ fn read_page(
         ("NULL".to_owned(), "")
     };
     let v2 = !tables.legacy;
-    let usage_cols = if shape.usage && v2 {
-        "s.tokens_input, s.tokens_output, s.tokens_reasoning, s.tokens_cache_read, \
-         s.tokens_cache_write, s.cost"
-    } else {
-        "NULL, NULL, NULL, NULL, NULL, NULL"
-    };
+    let usage_cols = USAGE_COLUMNS
+        .iter()
+        .zip(shape.usage)
+        .map(|(column, present)| {
+            if present && v2 {
+                format!("s.{column}")
+            } else {
+                "NULL".to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let idle_col = if shape.idle && v2 {
         "substr(s.idle_outcome, 1, 64)"
     } else {
@@ -855,6 +959,8 @@ struct RawRow {
     data_len: Option<i64>,
     /// Legacy part rows only: the owning message's `role` (empty when unknown).
     role: Option<String>,
+    /// The id exceeds `ID_MAX`; `id` is empty and the row cannot be keyed.
+    oversized: bool,
 }
 
 /// The row's change marker. `time_updated` moves whenever the provider rewrites a
@@ -884,6 +990,9 @@ struct Scan<'a> {
     parts: bool,
     /// v2 only: restrict to `assistant` rows.
     assistant_only: bool,
+    /// Message rows whose id is too long to key are returned (empty id,
+    /// `oversized`) instead of filtered out, so callers can see they were omitted.
+    flag_oversized: bool,
 }
 
 /// Streams rows of one session in `(time_created, id)` order, starting at (and
@@ -913,7 +1022,7 @@ fn stream_rows(
              CASE WHEN length(CAST(p.data AS BLOB)) <= ?2 THEN p.data END, \
              length(CAST(p.data AS BLOB)), \
              CASE WHEN length(p.message_id) <= {ID_MAX} THEN p.message_id END, \
-             CASE WHEN length(CAST(m.data AS BLOB)) <= ?2 THEN m.data END \
+             CASE WHEN length(CAST(m.data AS BLOB)) <= ?2 THEN m.data END, 0 \
              FROM part p LEFT JOIN message m ON m.id = p.message_id \
              WHERE p.session_id = ?1 AND length(p.id) <= ?3{bound} \
              ORDER BY p.time_created {order}, p.id {order}"
@@ -929,12 +1038,21 @@ fn stream_rows(
         } else {
             ""
         };
+        let (id_col, id_filter, oversized) = if scan.flag_oversized {
+            (
+                "CASE WHEN length(id) <= ?3 THEN id ELSE '' END",
+                "",
+                "length(id) > ?3",
+            )
+        } else {
+            ("id", " AND length(id) <= ?3", "0")
+        };
         format!(
-            "SELECT id, time_created, time_updated, {ty}, \
+            "SELECT {id_col}, time_created, time_updated, {ty}, \
              CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, \
-             length(CAST(data AS BLOB)), NULL, NULL \
+             length(CAST(data AS BLOB)), NULL, NULL, {oversized} \
              FROM {table} \
-             WHERE session_id = ?1 AND length(id) <= ?3{only}{bound} \
+             WHERE session_id = ?1{id_filter}{only}{bound} \
              ORDER BY time_created {order}, id {order}",
             table = scan.tables.message
         )
@@ -987,6 +1105,7 @@ fn stream_rows(
             data: row.get_ref(4).map_err(map_error).map(lossy)?,
             data_len: row.get(5).map_err(map_error)?,
             role,
+            oversized: row.get(8).map_err(map_error)?,
         };
         if !each(raw)? {
             break;
@@ -1017,13 +1136,15 @@ fn float(value: rusqlite::types::ValueRef<'_>) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle and derived usage evidence.
+// Lifecycle and derived usage evidence: resumable, budgeted jobs.
 // ---------------------------------------------------------------------------
 
 /// Rows examined (newest first) while looking for the latest completed turn.
 const LIFECYCLE_ROWS: usize = 256;
-/// Assistant rows read when deriving usage from messages.
+/// Rows read (of any kind) when deriving usage from messages.
 const DERIVE_ROWS: usize = 100_000;
+
+type Stamp = (i64, Option<i64>);
 
 #[derive(Clone, Debug, PartialEq)]
 struct Evidence {
@@ -1055,9 +1176,9 @@ fn row_kind<'a>(row: &'a RawRow, value: Option<&'a Value>) -> Option<&'a str> {
 }
 
 /// Turn evidence of one message. A user prompt or `finish: tool-calls` opens
-/// work; `finish: stop` or an `idle` row (outcome absent or `succeeded`) completes
-/// a turn. `unknown`/`length`/null finishes, other idle outcomes, and tool errors
-/// are neutral: never a session failure.
+/// work; `finish: stop` or a readable `idle` row (outcome absent or `succeeded`)
+/// completes a turn. `unknown`/`length`/null finishes, other or unreadable idle
+/// rows, and tool errors are neutral: never a session failure.
 fn classify(row: &RawRow) -> Turn {
     let value = row_value(row);
     let text = |name: &str| {
@@ -1068,9 +1189,13 @@ fn classify(row: &RawRow) -> Turn {
     };
     match row_kind(row, value.as_ref()) {
         Some("user") => Turn::Open,
-        Some("idle") => match text("outcome") {
-            None | Some("succeeded") => Turn::Complete(row.created),
-            Some(_) => Turn::Other,
+        Some("idle") => match &value {
+            Some(Value::Object(map)) => match map.get("outcome") {
+                None | Some(Value::Null) => Turn::Complete(row.created),
+                Some(Value::String(s)) if s == "succeeded" => Turn::Complete(row.created),
+                _ => Turn::Other,
+            },
+            _ => Turn::Other,
         },
         Some("assistant") => match text("finish") {
             Some("stop") => Turn::Complete(
@@ -1109,79 +1234,219 @@ fn has_session_totals(row: &Row) -> bool {
         .any(Option::is_some)
 }
 
-fn compute_evidence(
+/// What one refresh step may still spend on evidence.
+struct Allowance {
+    records: usize,
+    bytes: usize,
+    deadline: Instant,
+}
+
+impl Allowance {
+    fn exhausted(&self) -> bool {
+        self.records == 0 || self.bytes == 0 || Instant::now() >= self.deadline
+    }
+
+    /// Every row read counts, whatever its type or validity.
+    fn spend(&mut self, row: &RawRow) {
+        let cost = 64 + row.id.len() + row.ty.len() + row.data.as_ref().map_or(0, String::len);
+        self.records = self.records.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(cost);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Lifecycle,
+    Derive,
+}
+
+/// Resumable evidence collection for one session at one change stamp.
+struct Job {
+    row: Row,
+    stamp: Stamp,
+    stage: Stage,
+    open: bool,
+    completion: Option<Timestamp>,
+    life_seen: usize,
+    life_cursor: Option<(i64, String)>,
+    derivation: Option<OpenCodeDerivation>,
+    derive_rows: usize,
+    derive_cursor: Option<(i64, String)>,
+    omitted: bool,
+}
+
+impl Job {
+    fn new(row: Row) -> Self {
+        let stamp = (row.updated, row.message_updated);
+        let derive = !(has_session_totals(&row) && row.cost.is_some());
+        Self {
+            row,
+            stamp,
+            stage: Stage::Lifecycle,
+            open: false,
+            completion: None,
+            life_seen: 0,
+            life_cursor: None,
+            derivation: derive.then(OpenCodeDerivation::new),
+            derive_rows: 0,
+            derive_cursor: None,
+            omitted: false,
+        }
+    }
+}
+
+/// Advances `job` until it finishes (`Some`) or the allowance runs out (`None`,
+/// state kept for the next call). At least one row is read per call when rows remain.
+fn advance(
     conn: &Connection,
     tables: &Tables,
-    row: &Row,
+    job: &mut Job,
+    allow: &mut Allowance,
     record_cap: usize,
-) -> Result<Evidence, ProviderError> {
-    let scan = |direction, assistant_only| Scan {
-        tables,
-        session: &row.id,
-        record_cap,
-        direction,
-        from: None,
-        parts: false,
-        assistant_only,
-    };
-    let mut open = false;
-    let mut completion = None;
-    let mut seen = 0usize;
-    stream_rows(conn, scan(PageDirection::Backward, false), |r| {
-        seen += 1;
-        match classify(&r) {
-            Turn::Complete(at) => {
-                completion = Some(at);
-                return Ok(false);
-            }
-            Turn::Open => open = true,
-            Turn::Other => {}
+) -> Result<Option<Evidence>, ProviderError> {
+    let session = job.row.id.clone();
+    if job.stage == Stage::Lifecycle {
+        let resume = job.life_cursor.clone();
+        let (mut open, mut completion) = (job.open, job.completion);
+        let (mut seen, mut cursor) = (job.life_seen, job.life_cursor.clone());
+        let mut more = false;
+        stream_rows(
+            conn,
+            Scan {
+                tables,
+                session: &session,
+                record_cap,
+                direction: PageDirection::Backward,
+                from: resume.as_ref().map(|(c, i)| (*c, i.as_str())),
+                parts: false,
+                assistant_only: false,
+                flag_oversized: false,
+            },
+            |r| {
+                if resume
+                    .as_ref()
+                    .is_some_and(|(c, i)| r.created == *c && r.id == *i)
+                {
+                    return Ok(true);
+                }
+                seen += 1;
+                allow.spend(&r);
+                cursor = Some((r.created, r.id.clone()));
+                match classify(&r) {
+                    Turn::Complete(at) => {
+                        completion = Some(at);
+                        return Ok(false);
+                    }
+                    Turn::Open => open = true,
+                    Turn::Other => {}
+                }
+                if seen >= LIFECYCLE_ROWS {
+                    return Ok(false);
+                }
+                more = allow.exhausted();
+                Ok(!more)
+            },
+        )?;
+        job.open = open;
+        job.completion = completion;
+        job.life_seen = seen;
+        job.life_cursor = cursor;
+        if more && completion.is_none() && seen < LIFECYCLE_ROWS {
+            return Ok(None);
         }
-        Ok(seen < LIFECYCLE_ROWS)
-    })?;
-    let mut lifecycle = if open {
+        job.stage = Stage::Derive;
+    }
+
+    if let Some(mut derivation) = job.derivation.take() {
+        let resume = job.derive_cursor.clone();
+        let (mut rows, mut cursor, mut omitted) =
+            (job.derive_rows, job.derive_cursor.clone(), job.omitted);
+        let mut more = false;
+        let mut capped = false;
+        stream_rows(
+            conn,
+            Scan {
+                tables,
+                session: &session,
+                record_cap,
+                direction: PageDirection::Forward,
+                from: resume.as_ref().map(|(c, i)| (*c, i.as_str())),
+                parts: false,
+                assistant_only: true,
+                flag_oversized: true,
+            },
+            |r| {
+                if !r.oversized
+                    && resume
+                        .as_ref()
+                        .is_some_and(|(c, i)| r.created == *c && r.id == *i)
+                {
+                    return Ok(true);
+                }
+                rows += 1;
+                allow.spend(&r);
+                let value = row_value(&r);
+                let kind = row_kind(&r, value.as_ref());
+                if r.oversized {
+                    // An id too long to key exactly cannot be counted once.
+                    omitted |= kind.is_none_or(|k| k == "assistant");
+                } else {
+                    cursor = Some((r.created, r.id.clone()));
+                    if kind == Some("assistant") {
+                        let tokens = value.as_ref().map(message_tokens);
+                        let cost = value
+                            .as_ref()
+                            .and_then(|v| v.get("cost")?.as_f64())
+                            .filter(|c| c.is_finite() && *c >= 0.0);
+                        derivation.add(&r.id, tokens.as_ref(), cost);
+                    }
+                }
+                if rows >= DERIVE_ROWS {
+                    capped = true;
+                    return Ok(false);
+                }
+                more = allow.exhausted();
+                Ok(!more)
+            },
+        )?;
+        job.derive_rows = rows;
+        job.derive_cursor = cursor;
+        job.omitted = omitted;
+        if capped {
+            derivation.mark_truncated();
+        } else if more {
+            job.derivation = Some(derivation);
+            return Ok(None);
+        }
+        if omitted {
+            derivation.mark_truncated();
+        }
+        return Ok(Some(finish_evidence(job, Some(derivation.finish()))));
+    }
+    Ok(Some(finish_evidence(job, None)))
+}
+
+fn finish_evidence(job: &Job, derived: Option<DerivedUsage>) -> Evidence {
+    let mut completion = job.completion;
+    let mut lifecycle = if job.open {
         Lifecycle::Ongoing
     } else if completion.is_some() {
         Lifecycle::Completed
     } else {
         Lifecycle::Unknown
     };
-    // The session-level outcome has no timestamp; it only fills in when no message
-    // row says anything about the latest turn.
-    if lifecycle == Lifecycle::Unknown && row.idle_outcome.as_deref() == Some("succeeded") {
+    // The session-level outcome only fills in when no message row says anything
+    // about the latest turn. Its time is the session row's reported `time_updated`.
+    if lifecycle == Lifecycle::Unknown && job.row.idle_outcome.as_deref() == Some("succeeded") {
         lifecycle = Lifecycle::Completed;
+        completion = Some(job.row.updated);
     }
-
-    let derived = if has_session_totals(row) && row.cost.is_some() {
-        None
-    } else {
-        let mut derivation = OpenCodeDerivation::new();
-        let mut rows = 0usize;
-        stream_rows(conn, scan(PageDirection::Forward, true), |r| {
-            let value = row_value(&r);
-            if row_kind(&r, value.as_ref()) == Some("assistant") {
-                rows += 1;
-                let tokens = value.as_ref().map(message_tokens);
-                let cost = value
-                    .as_ref()
-                    .and_then(|v| v.get("cost")?.as_f64())
-                    .filter(|c| c.is_finite() && *c >= 0.0);
-                derivation.add(&r.id, tokens.as_ref(), cost);
-            }
-            if rows >= DERIVE_ROWS {
-                derivation.mark_truncated();
-                return Ok(false);
-            }
-            Ok(true)
-        })?;
-        Some(derivation.finish())
-    };
-    Ok(Evidence {
+    Evidence {
         lifecycle,
         last_completion: completion,
-        unfinished: open,
+        unfinished: job.open,
         derived,
-    })
+    }
 }
 
 enum Mapped {
@@ -1741,6 +2006,7 @@ impl OpenCodeScanner {
                 from: at.as_ref().map(|(created, id, _)| (*created, id.as_str())),
                 parts: tables.legacy,
                 assistant_only: false,
+                flag_oversized: false,
             },
             |row| {
                 let mut items = mapper.map_row(&row, record_cap);
@@ -1841,6 +2107,7 @@ impl OpenCodeScanner {
                 from: Some((created, at_id.as_str())),
                 parts: tables.legacy,
                 assistant_only: false,
+                flag_oversized: false,
             },
             |row| {
                 let same = row.created == created && row.id == at_id;
@@ -1908,6 +2175,7 @@ impl OpenCodeScanner {
                             ty,
                             data,
                             data_len: r.get(5)?,
+                            oversized: false,
                             // Only the part's own data is shown; the role is not needed.
                             role: tables.legacy.then(String::new),
                         },
