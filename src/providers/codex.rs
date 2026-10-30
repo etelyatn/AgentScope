@@ -1109,6 +1109,7 @@ fn parse_line(bytes: &[u8], max: usize) -> Body {
     if bytes.len() > max {
         return Body::TooLarge;
     }
+    crate::perf::record_parsed();
     serde_json::from_slice(bytes).map_or(Body::Invalid, Body::Json)
 }
 
@@ -1168,6 +1169,7 @@ impl<R: Read> ForwardLines<R> {
             let consumed = data + usize::from(newline.is_some());
             self.reader.consume(consumed);
             self.offset += consumed as u64;
+            crate::perf::bytes_read(consumed);
             if newline.is_some() {
                 break;
             }

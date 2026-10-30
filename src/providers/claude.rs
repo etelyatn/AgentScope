@@ -1041,6 +1041,7 @@ fn fingerprint(path: &Path, end: u64) -> Option<u64> {
     for start in [0, (end / 2).min(end - len as u64), end - len as u64] {
         file.seek(SeekFrom::Start(start)).ok()?;
         file.read_exact(&mut bytes[..len]).ok()?;
+        crate::perf::bytes_read(len);
         hash.update(&bytes[..len]);
     }
     Some(hash.finish())
@@ -1088,6 +1089,7 @@ fn checked_source<'a>(
             let size = left.min(buf.len() as u64) as usize;
             file.read_exact(&mut buf[..size])
                 .map_err(|_| ProviderError::Unavailable("source changed since refresh".into()))?;
+            crate::perf::bytes_read(size);
             hash.update(&buf[..size]);
             left -= size as u64;
         }
@@ -1229,6 +1231,7 @@ impl IndexCursor {
             }
             self.reader.consume(consumed);
             self.position += consumed as u64;
+            crate::perf::bytes_read(consumed);
             if newline.is_some() {
                 let offset = self.line_start;
                 self.line_start = self.position;
@@ -1238,10 +1241,12 @@ impl IndexCursor {
                     let line = self.buffer.strip_suffix(b"\r").unwrap_or(&self.buffer);
                     if line.len() > max {
                         Record::TooLarge { offset }
-                    } else if let Ok(value) = serde_json::from_slice(line) {
-                        Record::Json { offset, value }
                     } else {
-                        Record::Invalid { offset }
+                        crate::perf::record_parsed();
+                        match serde_json::from_slice(line) {
+                            Ok(value) => Record::Json { offset, value },
+                            Err(_) => Record::Invalid { offset },
+                        }
                     }
                 };
                 self.buffer.clear();
@@ -1658,6 +1663,8 @@ fn read_indexed_value(
         .take((end - offset).min(max as u64 + 2))
         .read_until(b'\n', &mut bytes)
         .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+    crate::perf::bytes_read(bytes.len());
+    crate::perf::record_parsed();
     serde_json::from_slice(&bytes)
         .map_err(|_| ProviderError::Unavailable("indexed source changed".into()))
 }

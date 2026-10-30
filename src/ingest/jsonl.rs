@@ -139,6 +139,7 @@ fn classify(line: &[u8], offset: u64, max_bytes: usize) -> Record {
     if line.len() > max_bytes {
         return Record::TooLarge { offset };
     }
+    crate::perf::record_parsed();
     match serde_json::from_slice(line) {
         Ok(value) => Record::Json { offset, value },
         Err(_) => Record::Invalid { offset },
@@ -249,6 +250,7 @@ impl JsonlCursor {
                     self.buffer.extend_from_slice(&available[..data_len]);
                 }
             }
+            crate::perf::bytes_read(consumed);
             self.hash.update(&available[..consumed]);
             self.reader.consume(consumed);
             self.offset = self
@@ -283,6 +285,7 @@ impl JsonlCursor {
         (&mut file)
             .take(max_bytes as u64)
             .read_until(b'\n', &mut line)?;
+        crate::perf::bytes_read(line.len());
         if line.last() == Some(&b'\n') {
             line.pop();
         }
@@ -307,6 +310,7 @@ impl JsonlCursor {
         file.seek(SeekFrom::Start(read_from))?;
         let mut data = Vec::new();
         file.take(len - read_from).read_to_end(&mut data)?;
+        crate::perf::bytes_read(data.len());
 
         Ok(tail_from_window(
             data,

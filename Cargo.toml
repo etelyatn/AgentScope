@@ -20,4 +20,9 @@ toml = "1.1.8"
 unicode-width = "0.2.3"
 
 [dev-dependencies]
+agentscope = { path = ".", features = ["perf-counters"] }
 tempfile = "3.27.0"
+
+[features]
+# Thread-local work counters for tests/perf_budget.rs; compiled out otherwise.
+perf-counters = []

@@ -216,6 +216,7 @@ pub fn preview(input: &str, max_bytes: usize, max_cols: usize) -> BoundedText {
         }
         end = next;
     }
+    crate::perf::preview_allocated(end);
     BoundedText {
         truncated: end < safe.len(),
         preview: safe[..end].to_string(),

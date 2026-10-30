@@ -3,6 +3,7 @@ pub mod config;
 pub mod discovery;
 pub mod domain;
 pub mod ingest;
+pub mod perf;
 pub mod processes;
 pub mod providers;
 pub mod status;
