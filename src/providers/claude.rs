@@ -2,6 +2,8 @@
 //! Usage aggregation is independent from transcript paging.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -12,9 +14,9 @@ use crate::config::Config;
 use crate::discovery::SourceFile;
 pub use crate::discovery::discover_claude;
 use crate::domain::*;
-use crate::ingest::jsonl::{JsonlCursor, Record};
-use crate::ingest::text::preview;
-use crate::providers::{ProviderDelta, ProviderError};
+use crate::ingest::jsonl::{ContentHash, JsonlCursor, Record};
+use crate::ingest::text::{display_safe, preview};
+use crate::providers::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
 use crate::usage::ClaudeLedger;
 
 fn safe(s: &str) -> BoundedText {
@@ -981,6 +983,352 @@ impl ClaudeScanner {
             removed,
             warnings,
             scan,
+        })
+    }
+}
+
+// Read only the generation consumed by the roster. Never retain transcript bodies
+// between requests, and reject offsets if the scanned prefix has changed.
+fn checked_source<'a>(
+    states: &'a HashMap<PathBuf, State>,
+    key: &SessionKey,
+) -> Result<(&'a Path, u64), ProviderError> {
+    let SourceKey::File(path) = &key.source else {
+        return Err(ProviderError::Unsupported(
+            "not a Claude file session".into(),
+        ));
+    };
+    let state = states
+        .get(path)
+        .filter(|s| {
+            key.provider == Provider::Claude && s.summary.key == *key && s.summary.source_available
+        })
+        .ok_or_else(|| {
+            ProviderError::Unavailable("unknown or unavailable Claude session".into())
+        })?;
+    let cursor = state
+        .cursor
+        .as_ref()
+        .ok_or_else(|| ProviderError::Unavailable("source unavailable".into()))?;
+    let end = cursor.position();
+    let mut file =
+        File::open(path).map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+    let mut hash = ContentHash::new();
+    let mut left = end;
+    let mut buf = [0u8; 8192];
+    while left > 0 {
+        let size = left.min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..size])
+            .map_err(|_| ProviderError::Unavailable("source changed since refresh".into()))?;
+        hash.update(&buf[..size]);
+        left -= size as u64;
+    }
+    if hash.finish() != cursor.content_hash() {
+        return Err(ProviderError::Unavailable(
+            "source changed since refresh".into(),
+        ));
+    }
+    let SourceKey::File(path) = &state.summary.key.source else {
+        unreachable!()
+    };
+    Ok((path, end))
+}
+
+fn event_anchor(event: &Event) -> PageAnchor {
+    PageAnchor {
+        timestamp: event.timestamp,
+        source_order: event.source_order,
+        stable_id: event.id.clone(),
+    }
+}
+
+fn event_size(event: &Event) -> usize {
+    let len = |part: &Option<BoundedText>| part.as_ref().map_or(0, |v| v.preview.len());
+    len(&event.text)
+        + event
+            .tool
+            .as_ref()
+            .map_or(0, |t| t.name.len() + len(&t.input) + len(&t.output))
+}
+
+fn fit_event(event: &mut Event, budget: usize) -> bool {
+    let mut fields: Vec<(&mut String, Option<&mut bool>)> = Vec::new();
+    if let Some(text) = &mut event.text {
+        fields.push((&mut text.preview, Some(&mut text.truncated)));
+    }
+    if let Some(tool) = &mut event.tool {
+        fields.push((&mut tool.name, None));
+        for text in [tool.input.as_mut(), tool.output.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            fields.push((&mut text.preview, Some(&mut text.truncated)));
+        }
+    }
+    let mut left = budget;
+    let mut remaining = fields.len();
+    let mut cut = false;
+    for (text, flag) in fields {
+        let share = left / remaining;
+        remaining -= 1;
+        if text.len() > share {
+            let mut at = share;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            text.truncate(at);
+            if let Some(flag) = flag {
+                *flag = true;
+            }
+            cut = true;
+        }
+        left -= text.len();
+    }
+    cut
+}
+
+type OrderedDiagnostic = (Option<Timestamp>, u64, DiagnosticEntry);
+
+fn load_transcript(
+    path: &Path,
+    end: u64,
+    max: usize,
+    key: &SessionKey,
+) -> Result<(Vec<Event>, Vec<OrderedDiagnostic>), ProviderError> {
+    let mut cursor = JsonlCursor::open(path.to_owned(), max)
+        .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+    let mut records = Vec::new();
+    let mut diagnostics = Vec::new();
+    while cursor.position() < end {
+        if records.len() + diagnostics.len() >= 100_000 {
+            return Err(ProviderError::Unsupported(
+                "session transcript exceeds the 100000-record limit".into(),
+            ));
+        }
+        let record = cursor
+            .next_record()
+            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+        if cursor.position() > end {
+            break;
+        }
+        match record {
+            Some(Record::Json { offset, value }) => {
+                let kind = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let parts = value.pointer("/message/content").and_then(Value::as_array);
+                let hidden_part = parts.is_some_and(|parts| {
+                    parts.iter().any(|p| {
+                        let t = p.get("type").and_then(Value::as_str).unwrap_or("");
+                        !matches!(
+                            t,
+                            "text" | "image" | "thinking" | "tool_use" | "tool_result"
+                        )
+                    })
+                });
+                if !matches!(kind, "user" | "assistant" | "system") || hidden_part {
+                    diagnostics.push((
+                        value.get("timestamp").and_then(timestamp),
+                        offset,
+                        DiagnosticEntry {
+                            locator: locator(key, offset),
+                            label: safe(kind).preview,
+                            hidden: true,
+                        },
+                    ));
+                }
+                records.push((offset, value));
+            }
+            Some(Record::Invalid { offset }) | Some(Record::TooLarge { offset }) => {
+                diagnostics.push((
+                    None,
+                    offset,
+                    DiagnosticEntry {
+                        locator: locator(key, offset),
+                        label: "unavailable record".into(),
+                        hidden: true,
+                    },
+                ));
+            }
+            Some(Record::Incomplete { .. }) | None => break,
+        }
+    }
+    let mut events = map_transcript(key, &records).events;
+    events.sort_by_key(event_anchor);
+    diagnostics.sort_by_key(|(ts, offset, _)| (*ts, *offset));
+    Ok((events, diagnostics))
+}
+
+impl ProviderReader for ClaudeScanner {
+    fn provider(&self) -> Provider {
+        Provider::Claude
+    }
+
+    fn refresh(
+        &mut self,
+        now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<ProviderDelta, ProviderError> {
+        self.scan_roster(now, budget)
+    }
+
+    fn transcript_page(
+        &mut self,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
+        request: PageRequest,
+    ) -> Result<TranscriptPage, ProviderError> {
+        let (path, end) = checked_source(&self.states, key)?;
+        let (events, diagnostics) = load_transcript(path, end, self.config.max_record_bytes, key)?;
+        let position = match anchor.as_ref() {
+            Some(anchor) => match events.binary_search_by_key(anchor, event_anchor) {
+                Ok(pos) => Some(pos),
+                Err(_) => {
+                    return Ok(TranscriptPage {
+                        events: vec![],
+                        diagnostics: vec![],
+                        next: None,
+                        has_more: false,
+                        truncated: false,
+                    });
+                }
+            },
+            None => None,
+        };
+        let forward = direction == PageDirection::Forward;
+        let indices: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(position.map_or(0, |p| p + 1)..events.len())
+        } else {
+            Box::new((0..position.unwrap_or(events.len())).rev())
+        };
+        let mut page = Vec::new();
+        let mut size = 0usize;
+        let mut truncated = false;
+        let mut has_more = false;
+        let mut selected = Vec::new();
+        for index in indices {
+            let mut event = events[index].clone();
+            let cut = fit_event(&mut event, request.max_bytes);
+            let cost = event_size(&event);
+            if !page.is_empty()
+                && (page.len() >= request.max_events.max(1)
+                    || size.saturating_add(cost) > request.max_bytes)
+            {
+                has_more = true;
+                break;
+            }
+            size += cost;
+            truncated |= cut
+                || event.text.as_ref().is_some_and(|t| t.truncated)
+                || event.tool.as_ref().is_some_and(|t| {
+                    t.input.as_ref().is_some_and(|v| v.truncated)
+                        || t.output.as_ref().is_some_and(|v| v.truncated)
+                });
+            page.push(event);
+            selected.push(index);
+        }
+        if !forward {
+            page.reverse();
+            selected.reverse();
+        }
+        let next = if forward { page.last() } else { page.first() }.map(event_anchor);
+        // Assign diagnostics to the next event in total order, or the last event.
+        let mut page_diags = Vec::new();
+        for (ts, offset, diagnostic) in diagnostics {
+            let target = events
+                .partition_point(|event| (event.timestamp, event.source_order) < (ts, offset))
+                .min(events.len().saturating_sub(1));
+            if (events.is_empty() && anchor.is_none()) || selected.contains(&target) {
+                if page_diags.len() < 200 {
+                    page_diags.push(diagnostic);
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+        Ok(TranscriptPage {
+            events: page,
+            diagnostics: page_diags,
+            next,
+            has_more,
+            truncated,
+        })
+    }
+
+    fn count_events_after(
+        &mut self,
+        key: &SessionKey,
+        anchor: &PageAnchor,
+    ) -> Result<usize, ProviderError> {
+        let (path, end) = checked_source(&self.states, key)?;
+        let (events, _) = load_transcript(path, end, self.config.max_record_bytes, key)?;
+        Ok(events.len() - events.partition_point(|e| event_anchor(e) <= *anchor))
+    }
+
+    fn source_record(&mut self, source: &SourceLocator) -> Result<SourceRecord, ProviderError> {
+        let LocatorKind::FileOffset { path, offset } = &source.kind else {
+            return Err(ProviderError::Unsupported(
+                "not a Claude file locator".into(),
+            ));
+        };
+        let (expected, end) = checked_source(&self.states, &source.session)?;
+        if path != expected {
+            return Err(ProviderError::Unsupported(
+                "locator does not belong to session".into(),
+            ));
+        }
+        if *offset >= end {
+            return Err(ProviderError::Unavailable(
+                "record beyond scanned data".into(),
+            ));
+        }
+        let mut file = File::open(path)
+            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+        if *offset > 0 {
+            file.seek(SeekFrom::Start(offset - 1))
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+            let mut prior = [0u8; 1];
+            file.read_exact(&mut prior)
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+            if prior[0] != b'\n' {
+                return Err(ProviderError::Parse(
+                    "locator is not a record boundary".into(),
+                ));
+            }
+        }
+        file.seek(SeekFrom::Start(*offset))
+            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+        let mut bytes = Vec::new();
+        BufReader::new(file)
+            .take((end - offset).min(self.config.max_record_bytes as u64 + 2))
+            .read_until(b'\n', &mut bytes)
+            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+        if bytes.last() != Some(&b'\n') {
+            return Ok(SourceRecord {
+                raw: String::new(),
+                display: String::new(),
+                unavailable: Some("record incomplete or exceeds limit".into()),
+            });
+        }
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        if bytes.len() > self.config.max_record_bytes {
+            return Ok(SourceRecord {
+                raw: String::new(),
+                display: String::new(),
+                unavailable: Some("record exceeds limit".into()),
+            });
+        }
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let display = display_safe(&raw);
+        Ok(SourceRecord {
+            raw,
+            display,
+            unavailable: None,
         })
     }
 }
