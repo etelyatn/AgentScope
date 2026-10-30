@@ -7,3 +7,4 @@ pub mod providers;
 pub mod status;
 pub mod time;
 pub mod usage;
+pub mod worker;
