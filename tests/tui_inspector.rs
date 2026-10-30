@@ -595,11 +595,78 @@ fn invalidation_while_reading_history_rereads_from_the_window_end() {
     assert!(app.apply_transcript(rid, first));
     let t = app.transcript().unwrap();
     assert_eq!(t.selected_event().unwrap().id, "e30");
-    assert_eq!(ids(&app).len(), 70);
+    // The probe page is dropped; the window ends at the re-read old last event
+    // and continues from its own anchor.
+    assert_eq!(ids(&app).len(), 60);
+    assert_eq!(ids(&app).last().unwrap(), "e59");
     assert!(t.has_newer() && !t.has_older());
     let preview = |i: usize| t.events()[i].text.as_ref().unwrap().preview.clone();
     assert_eq!(preview(0), "FIRST-CHANGED");
     assert_eq!(preview(59), "LAST-CHANGED");
+    app.inspector_move(isize::MAX);
+    let (_, from, direction) = load_page(&app.take_requests());
+    assert_eq!(
+        (from, direction),
+        (Some(anchor(59)), PageDirection::Forward)
+    );
+}
+
+#[test]
+fn arrivals_before_the_baseline_response_stay_visible() {
+    let mut app = app_with(summary(100));
+    open(&mut app, forward_page(0..20, true));
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected a baseline CountAfter, got {requests:?}");
+    };
+    // Three events arrive before the worker answers the baseline count.
+    app.apply_roster(vec![summary(103)], vec![]);
+    assert!(app.take_requests().is_empty(), "one count at a time");
+    assert!(app.apply_events_after(*request_id, 83));
+    assert_eq!(app.new_event_count(), 3);
+    assert!(draw(&app, 110, 30).contains("3 new"));
+
+    app.apply_roster(vec![summary(104)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 84));
+    assert_eq!(app.new_event_count(), 4);
+}
+
+#[test]
+fn a_full_probe_does_not_consume_the_reload_cap() {
+    let cap = MAX_LOADED_EVENTS as u64;
+    let mut app = app_with(summary(2 * cap as usize));
+    open(&mut app, forward_page(0..cap, true)); // e0..e19999, e0 selected
+    app.invalidate_transcript(&key());
+    let (rid, from, direction) = load_page(&app.take_requests());
+    assert_eq!(
+        (from, direction),
+        (Some(anchor(cap - 1)), PageDirection::Forward)
+    );
+    // A full probe page of events past the window end.
+    assert!(app.apply_transcript(rid, forward_page(cap..2 * cap, true)));
+    let (rid, from, direction) = load_page(&app.take_requests());
+    assert_eq!(
+        (from, direction),
+        (Some(anchor(2 * cap - 1)), PageDirection::Backward)
+    );
+    // The backward read overlaps the probe, then reaches the whole old window.
+    assert!(app.apply_transcript(rid, backward_page(cap..2 * cap - 1, true)));
+    let (rid, from, _) = load_page(&app.take_requests());
+    assert_eq!(from, Some(anchor(cap)));
+    let mut old = backward_page(0..cap, false);
+    old.events[0].text = Some(text("E0-CHANGED"));
+    assert!(app.apply_transcript(rid, old));
+
+    let t = app.transcript().unwrap();
+    assert!(t.failed().is_none() && !t.reload_capped());
+    assert_eq!(t.events().len(), MAX_LOADED_EVENTS);
+    assert_eq!(t.selected_event().unwrap().id, "e0");
+    assert_eq!(t.events()[0].text.as_ref().unwrap().preview, "E0-CHANGED");
+    assert!(t.has_newer());
 }
 
 #[test]

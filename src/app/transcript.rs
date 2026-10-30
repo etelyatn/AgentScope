@@ -75,6 +75,12 @@ struct Reload {
     /// `probing_end`, else backward (`None` = the tail).
     anchor: Option<PageAnchor>,
     probing_end: bool,
+    /// Events staged from the forward end probe; they only anchor the backward
+    /// read and neither count toward the window cap nor survive the swap.
+    probe_len: usize,
+    /// The old window's last event and its anchor.
+    end_id: Option<String>,
+    end_anchor: Option<PageAnchor>,
     /// Continuation for events newer than the staged window.
     newer: Option<PageAnchor>,
     /// Id of the old window's first event; re-reading it refreshes the boundary.
@@ -104,6 +110,10 @@ pub struct Transcript {
     count_pending: Option<(u64, usize)>,
     /// The first count after opening away from the tail fixes the baseline.
     baseline_pending: bool,
+    /// Roster event totals at opening and now; their difference is the arrivals
+    /// the baseline count cannot see (providers that report a total).
+    open_total: usize,
+    latest_total: usize,
     /// A reload could not reach the reading position within the window cap.
     reload_capped: bool,
     /// Summary at the last probe; a different summary triggers a new count.
@@ -129,6 +139,8 @@ impl Transcript {
             mark: None,
             count_pending: None,
             baseline_pending: false,
+            open_total: probed.as_ref().map_or(0, |s| s.displayed_event_count),
+            latest_total: probed.as_ref().map_or(0, |s| s.displayed_event_count),
             reload_capped: false,
             probed,
             loaded: false,
@@ -253,6 +265,13 @@ impl Transcript {
             anchor: anchor.clone(),
             probing_end,
             newer: None,
+            probe_len: 0,
+            end_id: if probing_end {
+                self.events.last().map(|e| e.id.clone())
+            } else {
+                None
+            },
+            end_anchor: self.newer.clone(),
             boundary: self.events.first().map(|e| e.id.clone()),
         });
         self.begin(request_id, PageKind::Reload);
@@ -352,6 +371,8 @@ impl Transcript {
         request_id: u64,
         summary: &SessionSummary,
     ) -> Option<WorkerRequest> {
+        // Track the roster's total even while a count is outstanding.
+        self.latest_total = summary.displayed_event_count;
         let baseline = self.baseline_pending;
         if !self.loaded
             || self.reload.is_some()
@@ -382,13 +403,15 @@ impl Transcript {
             Some((id, offset)) if id == request_id => {
                 self.count_pending = None;
                 if self.baseline_pending {
-                    // Everything after the window end at open time is history,
-                    // not an arrival.
+                    // The baseline is the opening snapshot: arrivals reported by
+                    // the roster since opening stay visible, and the observed
+                    // offset excludes them.
                     self.baseline_pending = false;
+                    let arrived = self.latest_total.saturating_sub(self.open_total);
                     if let Some(mark) = &mut self.mark {
-                        mark.1 = count;
+                        mark.1 = count.saturating_sub(arrived);
                     }
-                    self.new_events = 0;
+                    self.new_events = arrived;
                 } else {
                     self.new_events = count.saturating_sub(offset);
                 }
@@ -529,6 +552,7 @@ impl Transcript {
                         edge: Edge::Last(next.clone()),
                         diagnostics: page.diagnostics,
                     }];
+                    reload.probe_len = page.events.len();
                     reload.staged = page.events;
                     reload.newer = continuation;
                     reload.anchor = Some(next);
@@ -559,7 +583,8 @@ impl Transcript {
         };
         let found_selection = has(&current);
         let found_boundary = reload.boundary.is_none() || has(&reload.boundary);
-        let capped = reload.staged.len() >= MAX_LOADED_EVENTS;
+        // Probe-only events are not part of the re-read window.
+        let capped = reload.staged.len().saturating_sub(reload.probe_len) >= MAX_LOADED_EVENTS;
         if continuation.is_some() && !(found_selection && found_boundary) && !capped {
             reload.anchor = continuation;
             self.reload = Some(reload);
@@ -573,13 +598,26 @@ impl Transcript {
             self.reload_capped = true;
             return;
         }
+        let mut newer = reload.newer;
+        if reload.probe_len > 0
+            && let Some(end) = reload
+                .end_id
+                .as_ref()
+                .and_then(|id| reload.staged.iter().position(|e| &e.id == id))
+        {
+            // The probe only served to re-read the old last event: drop it, and
+            // continue from that event's own anchor.
+            reload.staged.truncate(end + 1);
+            trim_chunks(&mut reload.chunks, end + 1);
+            newer = reload.end_anchor;
+        }
         self.selected = current
             .and_then(|id| reload.staged.iter().position(|e| e.id == id))
             .unwrap_or(reload.staged.len().saturating_sub(1));
         self.events = reload.staged;
         self.chunks = reload.chunks;
         self.older = continuation;
-        self.newer = reload.newer;
+        self.newer = newer;
         if self.newer.is_none() {
             self.newest_refreshed();
         }
@@ -716,6 +754,28 @@ impl Transcript {
     }
 }
 
+/// Keep only the first `keep` events' worth of chunks. A chunk cut short loses
+/// an end anchor that named a removed event.
+fn trim_chunks(chunks: &mut Vec<Chunk>, keep: usize) {
+    let mut total: usize = chunks.iter().map(|c| c.len).sum();
+    while total > keep {
+        let Some(last) = chunks.last_mut() else {
+            break;
+        };
+        let excess = total - keep;
+        if last.len <= excess {
+            total -= last.len;
+            chunks.pop();
+        } else {
+            last.len -= excess;
+            total = keep;
+            if matches!(last.edge, Edge::Last(_)) {
+                last.edge = Edge::Unknown;
+            }
+            last.diagnostics.clear();
+        }
+    }
+}
 fn edge_of(page: &TranscriptPage, direction: PageDirection) -> Edge {
     match (&page.next, direction) {
         (Some(a), PageDirection::Forward) => Edge::Last(a.clone()),
