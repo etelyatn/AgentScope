@@ -186,6 +186,11 @@ impl App {
         self.generation
     }
 
+    /// The injected clock value used for status and age display.
+    pub fn now(&self) -> Timestamp {
+        self.now
+    }
+
     /// Advance the injected clock; statuses and status filters are recomputed.
     pub fn set_now(&mut self, now: Timestamp) {
         let previous = self.selected_position();

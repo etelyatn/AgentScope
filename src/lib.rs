@@ -7,5 +7,6 @@ pub mod processes;
 pub mod providers;
 pub mod status;
 pub mod time;
+pub mod ui;
 pub mod usage;
 pub mod worker;
