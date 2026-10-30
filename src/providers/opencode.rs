@@ -1392,12 +1392,16 @@ fn advance(
                 let value = row_value(&r);
                 let kind = row_kind(&r, value.as_ref());
                 if r.oversized {
-                    // An id too long to key exactly cannot be counted once.
-                    omitted |= kind.is_none_or(|k| k == "assistant");
-                    // Continue past it without keeping the full id: every id sharing
-                    // this prefix is itself oversized, so sorting after the prefix plus
-                    // the highest code point skips only rows that are omitted anyway.
-                    cursor = Some((r.created, format!("{}{}", r.id, '\u{10FFFF}')));
+                    // An id too long to key exactly cannot be counted once. Legacy
+                    // scans read every role, so the skipped prefix group may hold
+                    // assistant rows that were never examined.
+                    omitted |= tables.legacy || kind.is_none_or(|k| k == "assistant");
+                    // Continue past the whole group of ids sharing this prefix (all
+                    // oversized) with a true upper bound; the full id is not kept.
+                    match prefix_successor(&r.id) {
+                        Some(next) => cursor = Some((r.created, next)),
+                        None => return Ok(false),
+                    }
                 } else {
                     cursor = Some((r.created, r.id.clone()));
                     if kind == Some("assistant") {
@@ -1432,6 +1436,24 @@ fn advance(
         return Ok(Some(finish_evidence(job, Some(derivation.finish()))));
     }
     Ok(Some(finish_evidence(job, None)))
+}
+
+/// Smallest string above every string that starts with `prefix` (byte order of
+/// UTF-8 equals code point order): the last char is incremented, dropping trailing
+/// maximal chars. `None` when no such bound exists.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = match last as u32 + 1 {
+            0xD800 => 0xE000,
+            n => n,
+        };
+        if let Some(c) = char::from_u32(next) {
+            chars.push(c);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 fn finish_evidence(job: &Job, derived: Option<DerivedUsage>) -> Evidence {

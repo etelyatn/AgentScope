@@ -736,3 +736,36 @@ fn lifecycle_completing_on_the_last_allowed_row_defers_derivation() {
         assert_eq!(usage.total, Some(5));
     }
 }
+
+#[test]
+fn ids_sorting_after_a_naive_prefix_cursor_are_still_skipped_once() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    let one = |input: u64| assistant(Some("stop"), tokens(input, 0, 0, 0, 0), None);
+    let prefix = "m".repeat(4097);
+    msg(&conn, "s", "a1", "assistant", 5, one(1));
+    msg(&conn, "s", &"m".repeat(5000), "assistant", 6, one(1000));
+    // Shares the prefix but sorts above `prefix + U+10FFFF`.
+    msg(
+        &conn,
+        "s",
+        &format!("{prefix}\u{10FFFF}x"),
+        "assistant",
+        6,
+        one(1000),
+    );
+    msg(
+        &conn,
+        "s",
+        &format!("{prefix}\u{10FFFF}\u{10FFFF}z"),
+        "assistant",
+        6,
+        one(1000),
+    );
+    msg(&conn, "s", "a2", "assistant", 20, one(100));
+    let (steps, out) = scan_with(&mut scanner_for(&db), budget(1, 100_000_000, 60_000));
+    assert!(steps <= 15, "bounded progress, got {steps} steps");
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Partial);
+    assert_eq!(usage.categories.input, Some(101));
+}

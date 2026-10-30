@@ -375,3 +375,52 @@ fn legacy_message_rows_of_every_kind_spend_the_evidence_budget() {
         "newer user rows reopen"
     );
 }
+
+#[test]
+fn legacy_oversized_prefix_group_makes_derived_usage_partial() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = create_legacy(&db);
+        insert_legacy_session(&conn, &Session::new("s", 1, 100));
+        let assistant = |input: u64| {
+            json!({"role": "assistant", "finish": "stop",
+                   "tokens": {"input": input, "output": 0, "reasoning": 0,
+                              "cache": {"read": 0, "write": 0}}})
+        };
+        message(&conn, "s", "k1", 5, assistant(1));
+        // A user row and an assistant row whose ids share an oversized prefix.
+        message(&conn, "s", &"m".repeat(5000), 6, json!({"role": "user"}));
+        message(
+            &conn,
+            "s",
+            &format!("{}a", "m".repeat(5000)),
+            6,
+            assistant(1000),
+        );
+        message(&conn, "s", "k2", 20, assistant(10));
+    }
+    let mut scanner = scanner_for(&db);
+    let mut out = HashMap::new();
+    for _ in 0..50 {
+        let d = scanner
+            .scan_roster(
+                NOW,
+                RefreshBudget {
+                    max_records: 1,
+                    ..BIG
+                },
+            )
+            .expect("scan");
+        for s in d.sessions {
+            out.insert(s.key.provider_session_id.clone(), s);
+        }
+        if d.scan.done {
+            break;
+        }
+    }
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Partial);
+    assert_eq!(usage.total, None, "a skipped group may hide assistant rows");
+    assert_eq!(usage.categories.input, Some(11));
+}
