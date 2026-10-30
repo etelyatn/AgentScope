@@ -1,16 +1,14 @@
-use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use agentscope::config::{CliOverrides, Config, ConfigError};
+use agentscope::config::{CliOverrides, Config, ConfigError, Env};
 use agentscope::domain::Provider;
 use tempfile::TempDir;
-
-type Env = HashMap<String, String>;
 
 fn env(pairs: &[(&str, &str)]) -> Env {
     pairs
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
         .collect()
 }
 
@@ -363,4 +361,68 @@ fn invalid_price_entries_are_rejected() {
         let toml = format!("[[pricing]]\n{entry}\n");
         assert!(load_from(&toml).is_err(), "{entry}");
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_env_names_are_case_insensitive() {
+    let e = env(&[
+        ("USERPROFILE", "C:\\h"),
+        ("codex_home", "C:\\cx"),
+        ("Claude_Config_Dir", "C:\\cl"),
+        ("xdg_data_home", "C:\\x"),
+    ]);
+    let cfg = try_load(CliOverrides::default(), &e, "").unwrap();
+    assert_eq!(
+        cfg.providers.codex.root,
+        Some(PathBuf::from("C:\\cx").join("sessions"))
+    );
+    assert_eq!(
+        cfg.providers.claude.root,
+        Some(PathBuf::from("C:\\cl").join("projects"))
+    );
+    assert_eq!(
+        cfg.providers.opencode.db,
+        Some(PathBuf::from("C:\\x").join("opencode").join("opencode.db"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_env_names_are_case_sensitive() {
+    let e = env(&[("HOME", "/h"), ("codex_home", "/wrong")]);
+    let cfg = try_load(CliOverrides::default(), &e, "").unwrap();
+    assert_eq!(
+        cfg.providers.codex.root,
+        Some(PathBuf::from("/h").join(".codex").join("sessions"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_env_paths_still_win() {
+    use std::os::unix::ffi::OsStringExt;
+    let bad = OsString::from_vec(b"/tmp/\xff\xfe".to_vec());
+    let mut e = env(&[("HOME", "/h")]);
+    e.insert("CODEX_HOME".into(), bad.clone());
+    e.insert("CLAUDE_CONFIG_DIR".into(), bad.clone());
+    e.insert("XDG_DATA_HOME".into(), bad.clone());
+    let cfg = try_load(
+        CliOverrides::default(),
+        &e,
+        "[providers.codex]\nroot = \"/file\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.providers.codex.root,
+        Some(PathBuf::from(&bad).join("sessions"))
+    );
+    assert_eq!(
+        cfg.providers.claude.root,
+        Some(PathBuf::from(&bad).join("projects"))
+    );
+    assert_eq!(
+        cfg.providers.opencode.db,
+        Some(PathBuf::from(&bad).join("opencode").join("opencode.db"))
+    );
 }

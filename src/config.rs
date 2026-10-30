@@ -6,6 +6,7 @@
 //! environment so callers and tests stay hermetic.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -259,15 +260,26 @@ impl RawPrice {
     }
 }
 
-fn env_path(env: &HashMap<String, String>, key: &str) -> Option<PathBuf> {
-    env.get(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+/// Environment snapshot. Values stay `OsString` so non-Unicode paths survive.
+pub type Env = HashMap<OsString, OsString>;
+
+fn env_path(env: &Env, key: &str) -> Option<PathBuf> {
+    let value = if cfg!(windows) {
+        // Windows environment names are case-insensitive.
+        env.iter()
+            .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(key))
+            .map(|(_, v)| v)
+    } else {
+        env.get(OsStr::new(key))
+    };
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-fn home_dir(env: &HashMap<String, String>) -> Option<PathBuf> {
+fn home_dir(env: &Env) -> Option<PathBuf> {
     env_path(env, "HOME").or_else(|| env_path(env, "USERPROFILE"))
 }
 
-fn default_config_path(env: &HashMap<String, String>) -> Option<PathBuf> {
+fn default_config_path(env: &Env) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         env_path(env, "APPDATA")?
     } else if cfg!(target_os = "macos") {
@@ -291,9 +303,7 @@ fn positive<T: Default + PartialEq>(name: &str, value: T) -> Result<T, ConfigErr
 impl Config {
     /// Loads configuration using the process environment.
     pub fn load(cli: &CliOverrides) -> Result<Self, ConfigError> {
-        let env: HashMap<String, String> = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .collect();
+        let env: Env = std::env::vars_os().collect();
         Self::load_with_env(cli, &env)
     }
 
@@ -301,10 +311,7 @@ impl Config {
     ///
     /// A missing default config file is fine; an explicit `--config` path that
     /// cannot be read is an error.
-    pub fn load_with_env(
-        cli: &CliOverrides,
-        env: &HashMap<String, String>,
-    ) -> Result<Self, ConfigError> {
+    pub fn load_with_env(cli: &CliOverrides, env: &Env) -> Result<Self, ConfigError> {
         let explicit = cli.config.is_some();
         let config_path = cli.config.clone().or_else(|| default_config_path(env));
         let raw = match &config_path {
