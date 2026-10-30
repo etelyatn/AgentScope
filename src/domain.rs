@@ -273,6 +273,14 @@ pub enum ProcessAssociation {
     Unavailable,
 }
 
+/// Display metadata for one model. `id` is the exact-match pricing key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDetail {
+    pub id: String,
+    pub provider: Option<String>,
+    pub variant: Option<String>,
+}
+
 /// Session metadata. `Debug` omits titles, paths, and other content-bearing fields.
 #[derive(Clone, PartialEq)]
 pub struct SessionSummary {
@@ -282,6 +290,8 @@ pub struct SessionSummary {
     pub project: Option<String>,
     pub cwd: Option<PathBuf>,
     pub models: Vec<String>,
+    /// Provider/variant metadata for `models` entries when the provider reports it.
+    pub model_details: Vec<ModelDetail>,
     pub provider_version: Option<String>,
     pub created_at: Option<Timestamp>,
     pub last_event_at: Option<Timestamp>,

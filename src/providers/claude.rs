@@ -437,6 +437,7 @@ impl State {
                 .map(|s| safe(&s.to_string_lossy()).preview),
             cwd: None,
             models: vec![],
+            model_details: vec![],
             provider_version: None,
             created_at: None,
             last_event_at: None,

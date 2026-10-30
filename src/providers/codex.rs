@@ -1014,6 +1014,7 @@ impl CodexScanner {
                 .map(|n| n.to_string_lossy().into_owned()),
             cwd: p.cwd.clone(),
             models: p.models.clone(),
+            model_details: vec![],
             provider_version: p.version.clone(),
             created_at: p.created_at,
             last_event_at: p.last_event,

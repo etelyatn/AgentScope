@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
@@ -18,8 +18,9 @@ use serde_json::Value;
 use super::{ProviderDelta, ProviderError};
 use crate::config::Config;
 use crate::domain::{
-    Lifecycle, Lineage, ProcessAssociation, Provider, RefreshBudget, ScanProgress, SessionKey,
-    SessionLink, SessionSummary, SourceKey, Timestamp, Warning, WarningKey, WarningKind,
+    Lifecycle, Lineage, ModelDetail, ProcessAssociation, Provider, RefreshBudget, ScanProgress,
+    SessionKey, SessionLink, SessionSummary, SourceKey, Timestamp, Warning, WarningKey,
+    WarningKind,
 };
 use crate::ingest::text::preview;
 
@@ -93,7 +94,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
 ];
 
 /// Aggregates only; no extension, file, or text-producing functions.
-const ALLOWED_FUNCTIONS: &[&str] = &["count", "max", "min"];
+const ALLOWED_FUNCTIONS: &[&str] = &["count", "max", "min", "substr"];
 
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
@@ -345,6 +346,7 @@ impl OpenCodeScanner {
     }
 
     fn step(&mut self, budget: RefreshBudget) -> Result<ProviderDelta, ProviderError> {
+        let started = Instant::now();
         let mut warnings = Vec::new();
         let Some(tables) = Tables::for_schema(self.schema) else {
             warnings.push(self.warning(
@@ -396,14 +398,20 @@ impl OpenCodeScanner {
             }
         };
 
-        let limit = budget
-            .max_records
-            .max(1)
-            .min(pass.cap.saturating_sub(pass.processed));
-        let rows = if limit == 0 {
-            Vec::new()
+        let remaining = pass.cap.saturating_sub(pass.processed);
+        let limit = budget.max_records.min(remaining);
+        let (rows, ended) = if limit == 0 {
+            (Vec::new(), false)
         } else {
-            read_page(conn, &tables, self.has_project, pass.cursor.as_ref(), limit)?
+            read_page(
+                conn,
+                &tables,
+                self.has_project,
+                pass.cursor.as_ref(),
+                limit,
+                &budget,
+                started,
+            )?
         };
 
         let mut sessions = Vec::new();
@@ -417,29 +425,33 @@ impl OpenCodeScanner {
             }
         }
         pass.processed += rows.len();
-        let done = rows.len() < limit || pass.processed >= pass.cap;
+        let done = ended || pass.processed >= pass.cap;
         let mut removed = Vec::new();
         if done {
             let conn = self.connection.as_ref().expect("opened");
+            let capped = pass.total > pass.cap;
             let missing: Vec<String> = self
                 .known
                 .keys()
                 .filter(|id| !pass.seen.contains(*id))
                 .cloned()
                 .collect();
-            // A row that moved in the ordering mid-pass was not "seen"; confirm it is gone.
+            // Retained sessions must match this pass's selection. Rows displaced by the
+            // cap are evicted even though they still exist; without a cap, a row that
+            // merely moved in the ordering mid-pass is kept when it still exists.
             for id in missing {
-                let exists: bool = conn
-                    .query_row(
-                        &format!(
-                            "SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)",
-                            tables.session
-                        ),
-                        params![id],
-                        |r| r.get(0),
-                    )
-                    .map_err(map_error)?;
-                if !exists && let Some(summary) = self.known.remove(&id) {
+                let keep = !capped
+                    && conn
+                        .query_row(
+                            &format!(
+                                "SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)",
+                                tables.session
+                            ),
+                            params![id],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .map_err(map_error)?;
+                if !keep && let Some(summary) = self.known.remove(&id) {
                     removed.push(summary.key);
                 }
             }
@@ -471,6 +483,12 @@ impl OpenCodeScanner {
     }
 
     fn summarize(&self, row: &Row, tables: &Tables) -> SessionSummary {
+        let details: Vec<ModelDetail> = row
+            .model
+            .as_deref()
+            .and_then(model_detail)
+            .into_iter()
+            .collect();
         let link = |id: &Option<String>, exists: bool| {
             id.as_ref().map(|id| {
                 if exists {
@@ -497,12 +515,8 @@ impl OpenCodeScanner {
             title_derived: false,
             project,
             cwd: directory.map(PathBuf::from),
-            models: row
-                .model
-                .as_deref()
-                .and_then(model_name)
-                .into_iter()
-                .collect(),
+            models: details.iter().map(|d| d.id.clone()).collect(),
+            model_details: details,
             provider_version: row.version.as_deref().and_then(short),
             created_at: row.created,
             last_event_at: None,
@@ -547,31 +561,91 @@ fn short(text: &str) -> Option<String> {
 }
 
 /// `model` is JSON (`{"id", "providerID", "variant"}`); a bare string is its own id.
-fn model_name(raw: &str) -> Option<String> {
+fn model_detail(raw: &str) -> Option<ModelDetail> {
     match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Object(map)) => map.get("id").and_then(Value::as_str).and_then(short),
-        Ok(Value::String(s)) => short(&s),
+        Ok(Value::Object(map)) => {
+            let text = |name: &str| map.get(name).and_then(Value::as_str).and_then(short);
+            Some(ModelDetail {
+                id: text("id")?,
+                provider: text("providerID"),
+                variant: text("variant"),
+            })
+        }
+        Ok(Value::String(s)) => short(&s).map(bare_model),
         Ok(_) => None,
-        Err(_) => short(raw),
+        Err(_) => short(raw).map(bare_model),
     }
 }
 
+fn bare_model(id: String) -> ModelDetail {
+    ModelDetail {
+        id,
+        provider: None,
+        variant: None,
+    }
+}
+
+/// Per-column SQL bounds so one oversized value can never be materialised whole.
+const ID_CHARS: usize = 512;
+const TEXT_CHARS: usize = 1024;
+const PATH_CHARS: usize = 4096;
+const MODEL_CHARS: usize = 4096;
+const VERSION_CHARS: usize = 128;
+
+fn row_bytes(row: &Row) -> usize {
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    64 + row.id.len()
+        + opt(&row.title)
+        + opt(&row.directory)
+        + opt(&row.project_name)
+        + opt(&row.parent)
+        + opt(&row.fork)
+        + opt(&row.model)
+        + opt(&row.version)
+}
+
+/// Reads up to `limit` rows, stopping early once the byte or time allowance is
+/// spent. A zero byte/time allowance reads nothing; otherwise the first row is
+/// always taken so a pass makes progress (its size is bounded by the column caps).
+/// Returns the rows and whether the result set ended (no more rows to read).
 fn read_page(
     conn: &Connection,
     tables: &Tables,
     has_project: bool,
     cursor: Option<&(i64, String)>,
     limit: usize,
-) -> Result<Vec<Row>, ProviderError> {
+    budget: &RefreshBudget,
+    started: Instant,
+) -> Result<(Vec<Row>, bool), ProviderError> {
+    if budget.max_bytes == 0 || budget.max_millis == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let deadline = Duration::from_millis(budget.max_millis);
     let (project_name, project_join) = if has_project {
-        ("p.name", "LEFT JOIN project p ON p.id = s.project_id")
+        (
+            format!("substr(p.name, 1, {TEXT_CHARS})"),
+            "LEFT JOIN project p ON p.id = s.project_id",
+        )
     } else {
-        ("NULL", "")
+        ("NULL".to_owned(), "")
+    };
+    let fork = if tables.fork == "NULL" {
+        "NULL".to_owned()
+    } else {
+        format!("substr({}, 1, {ID_CHARS})", tables.fork)
+    };
+    let model = if tables.model == "NULL" {
+        "NULL".to_owned()
+    } else {
+        format!("substr({}, 1, {MODEL_CHARS})", tables.model)
     };
     let sql = format!(
-        "SELECT s.id, s.title, s.directory, {project_name}, s.parent_id, \
+        "SELECT substr(s.id, 1, {ID_CHARS}), substr(s.title, 1, {TEXT_CHARS}), \
+            substr(s.directory, 1, {PATH_CHARS}), {project_name}, \
+            substr(s.parent_id, 1, {ID_CHARS}), \
             EXISTS(SELECT 1 FROM {t} x WHERE x.id = s.parent_id), {fork}, \
-            EXISTS(SELECT 1 FROM {t} y WHERE y.id = {fork}), {model}, s.version, \
+            EXISTS(SELECT 1 FROM {t} y WHERE y.id = {fork_raw}), {model}, \
+            substr(s.version, 1, {VERSION_CHARS}), \
             s.time_created, s.time_updated, s.time_archived, \
             (SELECT max(m.time_updated) FROM {m} m WHERE m.session_id = s.id) \
          FROM {t} s {project_join} \
@@ -579,36 +653,44 @@ fn read_page(
          ORDER BY s.time_updated DESC, s.id DESC LIMIT ?3",
         t = tables.session,
         m = tables.message,
-        fork = tables.fork,
-        model = tables.model,
+        fork_raw = tables.fork,
     );
     let (after_time, after_id) = match cursor {
         Some((time, id)) => (*time, id.as_str()),
         None => (i64::MAX, ""),
     };
     let mut stmt = conn.prepare(&sql).map_err(map_error)?;
-    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let rows = stmt
-        .query_map(params![after_time, after_id, limit], |r| {
-            Ok(Row {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                directory: r.get(2)?,
-                project_name: r.get(3)?,
-                parent: r.get(4)?,
-                parent_exists: r.get(5)?,
-                fork: r.get(6)?,
-                fork_exists: r.get(7)?,
-                model: r.get(8)?,
-                version: r.get(9)?,
-                created: r.get(10)?,
-                updated: r.get(11)?,
-                archived: r.get(12)?,
-                message_updated: r.get(13)?,
-            })
-        })
-        .map_err(map_error)?
-        .collect::<Result<Vec<_>, _>>()
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut query = stmt
+        .query(params![after_time, after_id, limit_sql])
         .map_err(map_error)?;
-    Ok(rows)
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(r) = query.next().map_err(map_error)? {
+        let row = Row {
+            id: r.get(0).map_err(map_error)?,
+            title: r.get(1).map_err(map_error)?,
+            directory: r.get(2).map_err(map_error)?,
+            project_name: r.get(3).map_err(map_error)?,
+            parent: r.get(4).map_err(map_error)?,
+            parent_exists: r.get(5).map_err(map_error)?,
+            fork: r.get(6).map_err(map_error)?,
+            fork_exists: r.get(7).map_err(map_error)?,
+            model: r.get(8).map_err(map_error)?,
+            version: r.get(9).map_err(map_error)?,
+            created: r.get(10).map_err(map_error)?,
+            updated: r.get(11).map_err(map_error)?,
+            archived: r.get(12).map_err(map_error)?,
+            message_updated: r.get(13).map_err(map_error)?,
+        };
+        bytes = bytes.saturating_add(row_bytes(&row));
+        rows.push(row);
+        if rows.len() == limit {
+            return Ok((rows, false));
+        }
+        if bytes >= budget.max_bytes || started.elapsed() >= deadline {
+            return Ok((rows, false));
+        }
+    }
+    Ok((rows, true))
 }

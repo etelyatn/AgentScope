@@ -45,6 +45,7 @@ fn summary(
         project: None,
         cwd: None,
         models: vec![],
+        model_details: vec![],
         provider_version: None,
         created_at: None,
         last_event_at: Some(last),

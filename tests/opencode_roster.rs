@@ -548,3 +548,240 @@ fn main_database_is_unchanged_and_only_sidecars_may_change() {
         .unwrap();
     assert!(content.contains("SECRET-CONTENT"));
 }
+
+#[test]
+fn model_keeps_id_for_pricing_and_provider_variant_for_display() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create_v2(&db);
+        let model = model_json("gpt-5", "openai", "high");
+        let mut s = Session::new("a", 1, 3);
+        s.model = Some(&model);
+        insert_session(&w, &s);
+        let mut bare = Session::new("b", 1, 2);
+        bare.model = Some("plain-model");
+        insert_session(&w, &bare);
+    }
+    let out = scan(&mut scanner_for(&db), BIG);
+    let a = &out.sessions["a"];
+    assert_eq!(a.models, vec!["gpt-5".to_string()]);
+    assert_eq!(a.model_details.len(), 1);
+    assert_eq!(a.model_details[0].id, "gpt-5");
+    assert_eq!(a.model_details[0].provider.as_deref(), Some("openai"));
+    assert_eq!(a.model_details[0].variant.as_deref(), Some("high"));
+    let b = &out.sessions["b"];
+    assert_eq!(b.models, vec!["plain-model".to_string()]);
+    assert_eq!(b.model_details[0].provider, None);
+}
+
+#[test]
+fn cap_displaced_sessions_are_evicted_across_refreshes() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    let writer = create_v2(&db);
+    insert_session(&writer, &Session::new("a", 1, 10));
+    insert_session(&writer, &Session::new("b", 1, 20));
+    let mut cfg = config_for_db(&db);
+    cfg.max_sessions = 2;
+    let mut scanner = OpenCodeScanner::new(&cfg).unwrap();
+    let first = scan(&mut scanner, BIG);
+    assert_eq!(first.sessions.len(), 2);
+    assert!(first.removed.is_empty());
+
+    // A newer session displaces the oldest; it still exists but leaves the roster.
+    insert_session(&writer, &Session::new("c", 1, 30));
+    let second = scan(&mut scanner, BIG);
+    assert!(second.sessions.contains_key("c"));
+    let removed: Vec<_> = second
+        .removed
+        .iter()
+        .map(|k| k.provider_session_id.as_str())
+        .collect();
+    assert_eq!(removed, ["a"]);
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|w| w.count == 1 && w.message.contains("max_sessions"))
+    );
+
+    // Retained set stays at the cap and is stable.
+    let third = scan(&mut scanner, BIG);
+    assert!(third.sessions.is_empty() && third.removed.is_empty());
+
+    // The displaced session returns once it is among the newest again.
+    writer
+        .execute("UPDATE session_v2 SET time_updated = 99 WHERE id = 'a'", [])
+        .unwrap();
+    let fourth = scan(&mut scanner, BIG);
+    assert!(fourth.sessions.contains_key("a"));
+    let removed: Vec<_> = fourth
+        .removed
+        .iter()
+        .map(|k| k.provider_session_id.as_str())
+        .collect();
+    assert_eq!(removed, ["b"]);
+}
+
+fn seeded(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create_v2(&db);
+        for i in 0..n {
+            insert_session(&w, &Session::new(&format!("s{i}"), 1, 100 + i as i64));
+        }
+    }
+    (dir, db)
+}
+
+#[test]
+fn exhausted_record_byte_and_time_budgets_read_nothing_and_never_finish() {
+    let (_dir, db) = seeded(3);
+    for budget in [
+        RefreshBudget {
+            max_records: 0,
+            ..BIG
+        },
+        RefreshBudget {
+            max_bytes: 0,
+            ..BIG
+        },
+        RefreshBudget {
+            max_millis: 0,
+            ..BIG
+        },
+    ] {
+        let mut scanner = scanner_for(&db);
+        let d = scanner.scan_roster(NOW, budget).unwrap();
+        assert!(d.sessions.is_empty(), "{budget:?}");
+        assert!(!d.scan.done, "{budget:?}");
+        assert_eq!(d.scan.scanned, 0);
+        // A real budget afterwards completes the same pass.
+        let all = scan(&mut scanner, BIG);
+        assert_eq!(all.sessions.len(), 3);
+    }
+}
+
+#[test]
+fn byte_budget_bounds_a_page_but_always_progresses() {
+    let (_dir, db) = seeded(5);
+    let mut scanner = scanner_for(&db);
+    let tiny = RefreshBudget {
+        max_bytes: 1,
+        ..BIG
+    };
+    let mut calls = 0;
+    let mut seen = 0;
+    loop {
+        let d = scanner.scan_roster(NOW, tiny).unwrap();
+        calls += 1;
+        assert_eq!(
+            d.sessions.len(),
+            1,
+            "one row per call under a 1-byte budget"
+        );
+        seen += d.sessions.len();
+        if d.scan.done {
+            break;
+        }
+        assert!(calls < 20);
+    }
+    assert_eq!(seen, 5);
+}
+
+#[test]
+fn oversized_text_columns_are_bounded_at_the_query() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create_v2(&db);
+        let huge = "x".repeat(2_000_000);
+        let mut s = Session::new("big", 1, 2);
+        s.title = Some(&huge);
+        s.directory = Some(&huge);
+        insert_session(&w, &s);
+    }
+    let out = scan(&mut scanner_for(&db), BIG);
+    let s = &out.sessions["big"];
+    assert!(s.title.len() <= 1024, "title {}", s.title.len());
+    assert!(s.cwd.as_ref().unwrap().as_os_str().len() <= 4096);
+}
+
+/// Column names verified read-only (schema only, no row content) against a local
+/// OpenCode 2.0.29 database. The adapter must accept the real column set.
+#[test]
+fn real_opencode_2_0_29_column_set_is_recognised() {
+    const REAL_V2: &str = "
+CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT, vcs TEXT, name TEXT, icon_url TEXT,
+    icon_url_override TEXT, icon_color TEXT, time_created INTEGER, time_updated INTEGER,
+    time_initialized INTEGER, sandboxes TEXT, commands TEXT, time_active INTEGER, time_archived INTEGER);
+CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+    fork_session_id TEXT, fork_boundary TEXT, slug TEXT, directory TEXT, path TEXT, title TEXT,
+    version TEXT, share_url TEXT, summary_additions INTEGER, summary_deletions INTEGER,
+    summary_files INTEGER, summary_diffs TEXT, metadata TEXT, cost REAL, tokens_input INTEGER,
+    tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+    tokens_cache_write INTEGER, revert TEXT, permission TEXT, agent TEXT, model TEXT,
+    time_created INTEGER, time_updated INTEGER, time_compacting INTEGER, time_archived INTEGER,
+    time_suspended INTEGER, resume_attempts INTEGER, time_idle INTEGER, time_viewed INTEGER,
+    idle_outcome TEXT);
+CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+    time_created INTEGER, time_updated INTEGER, data TEXT);
+";
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create(&db, REAL_V2);
+        w.execute(
+            "INSERT INTO session_v2(id, title, model, time_created, time_updated) VALUES ('s', 't', ?1, 1, 2)",
+            [model_json("m", "p", "v")],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        detect_schema(&open_read_only(&db).unwrap()).unwrap(),
+        Schema::V2
+    );
+    let out = scan(&mut scanner_for(&db), BIG);
+    assert_eq!(
+        out.sessions["s"].model_details[0].provider.as_deref(),
+        Some("p")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_directory_with_required_sidecar_shows_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+    let live = tmp();
+    let live_db = live.path().join("opencode.db");
+    let writer = create_v2(&live_db);
+    insert_session(&writer, &Session::new("hidden", 1, 2));
+
+    let ro = tmp();
+    let db = ro.path().join("opencode.db");
+    fs::copy(&live_db, &db).unwrap();
+    fs::copy(sidecar(&live_db, "-wal"), sidecar(&db, "-wal")).unwrap();
+    fs::set_permissions(ro.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = fs::File::create(ro.path().join("probe"));
+    let result = if probe.is_ok() {
+        // Running as root: permissions are not enforced; nothing to assert.
+        None
+    } else {
+        Some(OpenCodeScanner::new(&config_for_db(&db)))
+    };
+    fs::set_permissions(ro.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    if let Some(result) = result {
+        assert!(
+            matches!(result, Err(ProviderError::Unavailable(_))),
+            "got {:?}",
+            result.err()
+        );
+        assert!(
+            !sidecar(&db, "-shm").exists(),
+            "no sidecar was created or repaired"
+        );
+    }
+    drop(writer);
+}
