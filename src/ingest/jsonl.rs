@@ -1,0 +1,292 @@
+//! Bounded, incremental reading of JSONL files without interpreting provider semantics.
+
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+/// A complete JSON value or a content-free indication of an unusable line.
+pub enum Record {
+    Json {
+        offset: u64,
+        value: serde_json::Value,
+    },
+    Invalid {
+        offset: u64,
+    },
+    TooLarge {
+        offset: u64,
+    },
+    Incomplete {
+        offset: u64,
+    },
+}
+
+// Avoid leaking transcript content through routine debug output.
+impl fmt::Debug for Record {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json { offset, .. } => f
+                .debug_struct("Json")
+                .field("offset", offset)
+                .finish_non_exhaustive(),
+            Self::Invalid { offset } => f.debug_struct("Invalid").field("offset", offset).finish(),
+            Self::TooLarge { offset } => {
+                f.debug_struct("TooLarge").field("offset", offset).finish()
+            }
+            Self::Incomplete { offset } => f
+                .debug_struct("Incomplete")
+                .field("offset", offset)
+                .finish(),
+        }
+    }
+}
+
+/// Strongest portable file identity: Unix `(dev, ino)`; Windows `creation_time`.
+/// Windows length and last-write time are tracked separately in [`Stamp`].
+#[cfg(unix)]
+type FileKey = (u64, u64);
+#[cfg(windows)]
+type FileKey = u64;
+#[cfg(not(any(unix, windows)))]
+type FileKey = ();
+
+#[cfg(unix)]
+fn file_key(meta: &fs::Metadata) -> FileKey {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(windows)]
+fn file_key(meta: &fs::Metadata) -> FileKey {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_key(_meta: &fs::Metadata) -> FileKey {}
+
+/// Identity plus the length and mtime observed at the last check.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    key: FileKey,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            key: file_key(meta),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+}
+
+/// Incremental line reader over a growing file. A trailing partial line is held and
+/// retried once more bytes arrive. Rotation (identity change, shrink, or an mtime change
+/// without growth) resets the cursor to the start of the file and is counted.
+///
+/// Known false negative: replacing a file in place with same-length content and the same
+/// mtime (and, on Windows, the same creation time) is indistinguishable from no change.
+pub struct JsonlCursor {
+    path: PathBuf,
+    reader: BufReader<File>,
+    max_bytes: usize,
+    buffer: Vec<u8>,
+    /// Bytes consumed from the file, including the pending partial line.
+    offset: u64,
+    line_offset: u64,
+    too_large: bool,
+    incomplete_reported: bool,
+    at_eof: bool,
+    stamp: Stamp,
+    rotations: u64,
+}
+
+fn classify(line: &[u8], offset: u64, max_bytes: usize) -> Record {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.len() > max_bytes {
+        return Record::TooLarge { offset };
+    }
+    match serde_json::from_slice(line) {
+        Ok(value) => Record::Json { offset, value },
+        Err(_) => Record::Invalid { offset },
+    }
+}
+
+impl JsonlCursor {
+    pub fn open(path: PathBuf, max_record_bytes: usize) -> io::Result<Self> {
+        let file = File::open(&path)?;
+        let stamp = Stamp::of(&file.metadata()?);
+        Ok(Self {
+            path,
+            reader: BufReader::new(file),
+            max_bytes: max_record_bytes,
+            buffer: Vec::new(),
+            offset: 0,
+            line_offset: 0,
+            too_large: false,
+            incomplete_reported: false,
+            at_eof: false,
+            stamp,
+            rotations: 0,
+        })
+    }
+
+    /// Number of times the source was detected as rotated or truncated and re-read.
+    pub fn rotation_count(&self) -> u64 {
+        self.rotations
+    }
+
+    fn check_rotation(&mut self) -> io::Result<()> {
+        let current = Stamp::of(&fs::metadata(&self.path)?);
+        let rotated = current.key != self.stamp.key
+            || current.len < self.offset
+            || (current.len == self.stamp.len && current.modified != self.stamp.modified);
+        self.stamp = current;
+        if rotated {
+            let file = File::open(&self.path)?;
+            self.stamp = Stamp::of(&file.metadata()?);
+            self.reader = BufReader::new(file);
+            self.buffer.clear();
+            self.offset = 0;
+            self.line_offset = 0;
+            self.too_large = false;
+            self.incomplete_reported = false;
+            self.rotations += 1;
+        }
+        Ok(())
+    }
+
+    /// Returns one outcome. A partial line is retained and retried when more bytes arrive.
+    pub fn next_record(&mut self) -> io::Result<Option<Record>> {
+        if self.at_eof {
+            self.at_eof = false;
+            self.check_rotation()?;
+        }
+        loop {
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                self.at_eof = true;
+                if (self.too_large || !self.buffer.is_empty()) && !self.incomplete_reported {
+                    self.incomplete_reported = true;
+                    return Ok(Some(Record::Incomplete {
+                        offset: self.line_offset,
+                    }));
+                }
+                return Ok(None);
+            }
+            let newline = available.iter().position(|&byte| byte == b'\n');
+            let data_len = newline.unwrap_or(available.len());
+            let consumed = data_len + usize::from(newline.is_some());
+            if !self.too_large {
+                // One byte of slack so a CRLF terminator is not counted against the record.
+                if data_len
+                    > self
+                        .max_bytes
+                        .saturating_add(1)
+                        .saturating_sub(self.buffer.len())
+                {
+                    self.buffer.clear();
+                    self.too_large = true;
+                } else {
+                    self.buffer.extend_from_slice(&available[..data_len]);
+                }
+            }
+            self.reader.consume(consumed);
+            self.offset = self
+                .offset
+                .checked_add(consumed as u64)
+                .ok_or_else(|| io::Error::other("source offset overflow"))?;
+            self.incomplete_reported = false;
+            if newline.is_some() {
+                let offset = self.line_offset;
+                self.line_offset = self.offset;
+                let result = if self.too_large {
+                    Record::TooLarge { offset }
+                } else {
+                    classify(&self.buffer, offset, self.max_bytes)
+                };
+                self.buffer.clear();
+                self.too_large = false;
+                return Ok(Some(result));
+            }
+        }
+    }
+
+    /// Reads the line starting at `offset` (without its terminator), truncated to
+    /// `max_bytes`. Returns `None` at or past end of file. Does not move the cursor.
+    pub fn read_at(&mut self, offset: u64, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+        let mut file = BufReader::new(File::open(&self.path)?);
+        if offset >= file.get_ref().metadata()?.len() {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut line = Vec::new();
+        (&mut file)
+            .take(max_bytes as u64)
+            .read_until(b'\n', &mut line)?;
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Ok(Some(line))
+    }
+
+    /// Returns up to `max_records` of the newest complete lines, oldest first, examining at
+    /// most about `max_bytes` from the end of the file. A partial trailing line and a
+    /// partial leading line are excluded. Does not move the cursor.
+    pub fn tail_records(
+        &mut self,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> io::Result<Vec<Record>> {
+        let mut file = File::open(&self.path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(max_bytes as u64);
+        let read_from = start.saturating_sub(1);
+        file.seek(SeekFrom::Start(read_from))?;
+        let mut data = Vec::new();
+        file.take(len - read_from).read_to_end(&mut data)?;
+
+        let mut base = read_from;
+        if start > 0 {
+            // data[0] is the byte before the window; a line starts at the window only
+            // if that byte ends the previous line.
+            if data[0] == b'\n' {
+                data.remove(0);
+                base += 1;
+            } else if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+                data.drain(..=pos);
+                base += pos as u64 + 1;
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+        let Some(end) = data.iter().rposition(|&b| b == b'\n') else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::new();
+        let mut line_start = 0usize;
+        for (i, _) in data[..=end]
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+        {
+            records.push(classify(
+                &data[line_start..i],
+                base + line_start as u64,
+                self.max_bytes,
+            ));
+            line_start = i + 1;
+        }
+        let skip = records.len().saturating_sub(max_records);
+        records.drain(..skip);
+        Ok(records)
+    }
+}
