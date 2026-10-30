@@ -4,6 +4,138 @@
 use crate::config::{PriceEntry, PriceSchedule};
 use crate::domain::{AggregationClass, CostEstimate, Provider, TokenCategories};
 
+use std::collections::HashSet;
+
+use crate::domain::{ServerToolCounts, UsageSummary};
+
+/// Exact, bounded message identity ledger, independent of transcript retention.
+pub(crate) struct ClaudeLedger {
+    ids: HashSet<String>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    frozen: bool,
+    partial: bool,
+    categories: Option<TokenCategories>,
+    model: Option<String>,
+    mixed_models: bool,
+    server_tools: Option<ServerToolCounts>,
+}
+
+impl ClaudeLedger {
+    pub(crate) fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            ids: HashSet::new(),
+            bytes: 0,
+            max_entries,
+            max_bytes,
+            frozen: false,
+            partial: false,
+            categories: None,
+            model: None,
+            mixed_models: false,
+            server_tools: None,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::new(self.max_entries, self.max_bytes);
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        id: Option<&str>,
+        usage: Option<&crate::domain::UsageObservation>,
+        tools: Option<ServerToolCounts>,
+    ) {
+        if self.frozen {
+            return;
+        }
+        let Some(id) = id.filter(|id| !id.is_empty()) else {
+            self.partial = true;
+            return;
+        };
+        if self.ids.contains(id) {
+            return;
+        }
+        if self.ids.len() >= self.max_entries
+            || id.len() > self.max_bytes.saturating_sub(self.bytes)
+        {
+            self.frozen = true;
+            self.partial = true;
+            return;
+        }
+        // Do not reserve an ID until its usage exists: a later block can supply it.
+        let Some(usage) = usage else {
+            self.partial = true;
+            return;
+        };
+        self.ids.insert(id.to_owned());
+        self.bytes += id.len();
+        if let Some(a) = self.categories.as_mut() {
+            if self.model != usage.model {
+                self.mixed_models = true;
+            }
+            let b = &usage.categories;
+            fn add(a: &mut Option<u64>, b: Option<u64>) {
+                *a = a.and_then(|x| x.checked_add(b?));
+            }
+            add(&mut a.input, b.input);
+            add(&mut a.cached_input, b.cached_input);
+            add(&mut a.cache_write, b.cache_write);
+            add(&mut a.cache_write_5m, b.cache_write_5m);
+            add(&mut a.cache_write_1h, b.cache_write_1h);
+            add(&mut a.cache_read, b.cache_read);
+            add(&mut a.output, b.output);
+            add(&mut a.reasoning, b.reasoning);
+        } else {
+            self.categories = Some(usage.categories.clone());
+            self.model = usage.model.clone();
+        }
+        if let Some(tools) = tools {
+            let counts = self.server_tools.get_or_insert_default();
+            counts.web_search = counts.web_search.saturating_add(tools.web_search);
+            counts.web_fetch = counts.web_fetch.saturating_add(tools.web_fetch);
+        }
+    }
+
+    pub(crate) fn summary(&self, prices: &PriceSchedule) -> Option<UsageSummary> {
+        if self.categories.is_none() && !self.partial {
+            return None;
+        }
+        let categories = self.categories.clone().unwrap_or_default();
+        let model = if self.mixed_models {
+            None
+        } else {
+            self.model.clone()
+        };
+        let mut cost = match &model {
+            Some(model) if !self.partial => {
+                estimate_cost(Provider::Claude, model, &categories, prices)
+            }
+            _ => unknown("partial usage or mixed models"),
+        };
+        if cost.class == AggregationClass::Estimated {
+            cost.note = Some("server-tool fees excluded".into());
+        }
+        Some(UsageSummary {
+            total: claude_total(&categories),
+            categories,
+            model,
+            cost,
+            class: if self.partial {
+                AggregationClass::Partial
+            } else {
+                AggregationClass::Derived
+            },
+        })
+    }
+
+    pub(crate) fn server_tools(&self) -> Option<ServerToolCounts> {
+        self.server_tools
+    }
+}
+
 /// Codex: the latest cumulative `total_tokens` snapshot. Never a sum of
 /// snapshots. Without a reported total, `input + output` (cached input and
 /// reasoning are subsets of those).

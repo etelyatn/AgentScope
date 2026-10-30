@@ -1,5 +1,5 @@
 //! Claude project discovery, roster scanning and persisted content mapping.
-//! Usage aggregation and transcript paging are intentionally separate work.
+//! Usage aggregation is independent from transcript paging.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use crate::domain::*;
 use crate::ingest::jsonl::{JsonlCursor, Record};
 use crate::ingest::text::preview;
 use crate::providers::{ProviderDelta, ProviderError};
+use crate::usage::ClaudeLedger;
 
 fn safe(s: &str) -> BoundedText {
     preview(s, 2048, 2048)
@@ -129,7 +130,23 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
     let mut events: Vec<Event> = Vec::new();
     let mut calls: HashMap<String, usize> = HashMap::new();
     let mut hidden = 0;
+    let mut latest = HashMap::new();
     for (offset, record) in records {
+        if let Some(uuid) = record.get("uuid").and_then(Value::as_str) {
+            let count = match &record["message"]["content"] {
+                Value::Array(parts) => parts.len(),
+                Value::String(_) => 1,
+                _ => 0,
+            };
+            for index in 0..count {
+                latest.insert((uuid, index), *offset);
+            }
+        }
+    }
+    let mut observed_usage = HashSet::new();
+    for (offset, record) in records {
+        let uuid = record.get("uuid").and_then(Value::as_str);
+        let first_event = events.len();
         let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
         let loc = locator(key, *offset);
         let prov = Provenance {
@@ -165,11 +182,7 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                 actor,
                 text: body,
                 tool,
-                usage: if assistant_record {
-                    usage(message, &prov)
-                } else {
-                    None
-                },
+                usage: None,
                 provenance: prov.clone(),
             });
         };
@@ -204,6 +217,9 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
             _ => &[],
         };
         for (index, part) in parts.iter().enumerate() {
+            if uuid.is_some_and(|uuid| latest.get(&(uuid, index)) != Some(offset)) {
+                continue;
+            }
             let typ = part.get("type").and_then(Value::as_str).unwrap_or("");
             match typ {
                 "text" => {
@@ -317,6 +333,20 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                 _ => hidden += 1,
             }
         }
+        if assistant_record && events.len() > first_event {
+            let id = message
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            if id.is_none_or(|id| !observed_usage.contains(id))
+                && let Some(observation) = usage(message, &prov)
+            {
+                events[first_event].usage = Some(observation);
+                if let Some(id) = id {
+                    observed_usage.insert(id.to_owned());
+                }
+            }
+        }
     }
     ClaudeTranscript {
         events,
@@ -333,9 +363,12 @@ struct State {
     emitted: Option<SessionKey>,
     reopen: bool,
     dirty: bool,
+    ledger: ClaudeLedger,
+    parent_usage_seen: bool,
+    side_usage_seen: bool,
 }
 impl State {
-    fn new(source: SourceFile) -> Self {
+    fn new(source: SourceFile, entries: usize, bytes: usize) -> Self {
         let id = source
             .path
             .file_stem()
@@ -387,12 +420,15 @@ impl State {
             emitted: None,
             reopen: false,
             dirty: true,
+            ledger: ClaudeLedger::new(entries, bytes),
+            parent_usage_seen: false,
+            side_usage_seen: false,
         }
     }
-    fn reset(&mut self, source: SourceFile) {
+    fn reset(&mut self, source: SourceFile, entries: usize, bytes: usize) {
         let emitted = self.emitted.take();
         let cursor = self.cursor.take();
-        *self = Self::new(source);
+        *self = Self::new(source, entries, bytes);
         self.emitted = emitted;
         self.cursor = cursor;
     }
@@ -421,7 +457,7 @@ impl State {
         }
         self.dirty = true;
     }
-    fn ingest(&mut self, offset: u64, v: &Value) {
+    fn ingest(&mut self, offset: u64, v: &Value, prices: &crate::config::PriceSchedule) {
         if let Some(id) = string(v, "sessionId") {
             self.summary.key.provider_session_id = id;
         }
@@ -459,6 +495,46 @@ impl State {
                 .or(self.generated.take());
         }
         let msg = &v["message"];
+        let sidechain = v.get("isSidechain").and_then(Value::as_bool) == Some(true);
+        if kind == "assistant" && (!sidechain || !self.parent_usage_seen) {
+            if sidechain {
+                self.side_usage_seen = true;
+            } else {
+                if !self.parent_usage_seen && self.side_usage_seen {
+                    self.ledger.clear();
+                }
+                self.parent_usage_seen = true;
+            }
+            let prov = Provenance {
+                provider: Provider::Claude,
+                source: self.summary.key.source.clone(),
+                locator: locator(&self.summary.key, offset),
+                record_type: kind.into(),
+                provider_version: self.summary.provider_version.clone(),
+            };
+            let observation = usage(msg, &prov);
+            let tools = msg
+                .get("usage")
+                .and_then(|u| u.get("server_tool_use"))
+                .and_then(Value::as_object)
+                .map(|v| ServerToolCounts {
+                    web_search: v
+                        .get("web_search_requests")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    web_fetch: v
+                        .get("web_fetch_requests")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                });
+            self.ledger.observe(
+                msg.get("id").and_then(Value::as_str),
+                observation.as_ref(),
+                tools,
+            );
+            self.summary.usage = self.ledger.summary(prices);
+            self.summary.server_tools = self.ledger.server_tools();
+        }
         if kind == "assistant"
             && let Some(model) = string(msg, "model").map(|s| safe(&s).preview)
             && !self.summary.models.contains(&model)
@@ -522,7 +598,7 @@ struct Pass {
     sources: Vec<SourceFile>,
     next: usize,
 }
-/// Incremental roster scanner; it does not retain transcript bodies or aggregate usage.
+/// Incremental roster scanner; transcript bodies are not retained.
 pub struct ClaudeScanner {
     config: Config,
     states: HashMap<PathBuf, State>,
@@ -566,15 +642,22 @@ impl ClaudeScanner {
             && start.elapsed().as_millis() < u128::from(budget.max_millis)
         {
             let source = pass.sources[pass.next].clone();
-            let state = self
-                .states
-                .entry(source.path.clone())
-                .or_insert_with(|| State::new(source.clone()));
+            let state = self.states.entry(source.path.clone()).or_insert_with(|| {
+                State::new(
+                    source.clone(),
+                    self.config.dedup_ledger_entries,
+                    self.config.dedup_ledger_bytes,
+                )
+            });
             if state.cursor.is_none() {
                 state.cursor =
                     JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
                 if state.cursor.is_some() && state.reopen {
-                    state.reset(source.clone());
+                    state.reset(
+                        source.clone(),
+                        self.config.dedup_ledger_entries,
+                        self.config.dedup_ledger_bytes,
+                    );
                 }
             }
             let Some(cursor) = state.cursor.as_mut() else {
@@ -589,7 +672,11 @@ impl ClaudeScanner {
             let after = cursor.position();
             let rotated = cursor.rotation_count() != rotations;
             if rotated {
-                state.reset(source.clone());
+                state.reset(
+                    source.clone(),
+                    self.config.dedup_ledger_entries,
+                    self.config.dedup_ledger_bytes,
+                );
             }
             bytes = bytes.saturating_add(
                 usize::try_from(if rotated {
@@ -602,7 +689,7 @@ impl ClaudeScanner {
             match result {
                 Ok(Some(Record::Json { offset, value })) => {
                     state.summary.source_available = true;
-                    state.ingest(offset, &value);
+                    state.ingest(offset, &value, &self.config.pricing);
                     count += 1;
                 }
                 Ok(Some(Record::Incomplete { .. })) | Ok(None) => {
