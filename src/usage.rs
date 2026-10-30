@@ -38,10 +38,6 @@ impl ClaudeLedger {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
-        *self = Self::new(self.max_entries, self.max_bytes);
-    }
-
     pub(crate) fn observe(
         &mut self,
         id: Option<&str>,
@@ -115,7 +111,11 @@ impl ClaudeLedger {
             }
             _ => unknown("partial usage or mixed models"),
         };
-        if cost.class == AggregationClass::Estimated {
+        if cost.class == AggregationClass::Estimated
+            && self
+                .server_tools
+                .is_some_and(|counts| counts.web_search != 0 || counts.web_fetch != 0)
+        {
             cost.note = Some("server-tool fees excluded".into());
         }
         Some(UsageSummary {

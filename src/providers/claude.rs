@@ -354,18 +354,53 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
     }
 }
 
+struct ToolRow {
+    offset: u64,
+    index: usize,
+    call: bool,
+    id: Option<String>,
+}
+
+impl ToolRow {
+    fn apply(&self, calls: &mut HashSet<String>) -> usize {
+        if self.call {
+            if let Some(id) = &self.id {
+                calls.insert(id.clone());
+            }
+            1
+        } else if self.id.as_ref().is_some_and(|id| calls.remove(id)) {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+type BlockKey = (Option<String>, u64, usize);
+
+fn block_key(uuid: Option<&str>, offset: u64, index: usize) -> BlockKey {
+    (
+        uuid.map(str::to_owned),
+        if uuid.is_some() { 0 } else { offset },
+        index,
+    )
+}
+
 struct State {
     cursor: Option<JsonlCursor>,
     summary: SessionSummary,
     prompt: Option<String>,
     generated: Option<String>,
     calls: HashSet<String>,
+    tool_rows: HashMap<BlockKey, ToolRow>,
+    tool_count: usize,
     emitted: Option<SessionKey>,
     reopen: bool,
     dirty: bool,
     ledger: ClaudeLedger,
-    parent_usage_seen: bool,
-    side_usage_seen: bool,
+    side_ledger: Option<ClaudeLedger>,
+    parent_seen: bool,
+    block_counts: HashMap<(String, usize), (usize, usize)>,
 }
 impl State {
     fn new(source: SourceFile, entries: usize, bytes: usize) -> Self {
@@ -417,12 +452,15 @@ impl State {
             prompt: None,
             generated: None,
             calls: HashSet::new(),
+            tool_rows: HashMap::new(),
+            tool_count: 0,
             emitted: None,
             reopen: false,
             dirty: true,
             ledger: ClaudeLedger::new(entries, bytes),
-            parent_usage_seen: false,
-            side_usage_seen: false,
+            side_ledger: Some(ClaudeLedger::new(entries, bytes)),
+            parent_seen: false,
+            block_counts: HashMap::new(),
         }
     }
     fn reset(&mut self, source: SourceFile, entries: usize, bytes: usize) {
@@ -496,15 +534,11 @@ impl State {
         }
         let msg = &v["message"];
         let sidechain = v.get("isSidechain").and_then(Value::as_bool) == Some(true);
-        if kind == "assistant" && (!sidechain || !self.parent_usage_seen) {
-            if sidechain {
-                self.side_usage_seen = true;
-            } else {
-                if !self.parent_usage_seen && self.side_usage_seen {
-                    self.ledger.clear();
-                }
-                self.parent_usage_seen = true;
-            }
+        if !sidechain && (kind == "user" || kind == "assistant") {
+            self.parent_seen = true;
+            self.side_ledger = None;
+        }
+        if kind == "assistant" {
             let prov = Provenance {
                 provider: Provider::Claude,
                 source: self.summary.key.source.clone(),
@@ -527,11 +561,20 @@ impl State {
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
                 });
-            self.ledger.observe(
-                msg.get("id").and_then(Value::as_str),
-                observation.as_ref(),
-                tools,
-            );
+            let ledger = if sidechain {
+                self.side_ledger.as_mut()
+            } else {
+                Some(&mut self.ledger)
+            };
+            if let Some(ledger) = ledger {
+                ledger.observe(
+                    msg.get("id").and_then(Value::as_str),
+                    observation.as_ref(),
+                    tools,
+                );
+            }
+        }
+        if self.parent_seen {
             self.summary.usage = self.ledger.summary(prices);
             self.summary.server_tools = self.ledger.server_tools();
         }
@@ -557,6 +600,82 @@ impl State {
             };
             self.prompt = texts.into_iter().filter(|s| !injected(s)).find_map(title);
         }
+        let uuid = v.get("uuid").and_then(Value::as_str);
+        let parts = match &msg["content"] {
+            Value::Array(parts) if kind == "user" || kind == "assistant" => Some(parts.as_slice()),
+            _ => None,
+        };
+        let block_count = if parts.is_some() {
+            parts.map_or(0, <[Value]>::len)
+        } else if (kind == "user" || kind == "assistant") && msg["content"].is_string() {
+            1
+        } else {
+            0
+        };
+        let mut rebuild_tools = false;
+        let mut new_tools = Vec::new();
+        for index in 0..block_count {
+            let key = block_key(uuid, offset, index);
+            let old_tool = self.tool_rows.remove(&key);
+            let revised =
+                uuid.is_some_and(|u| self.block_counts.contains_key(&(u.to_owned(), index)));
+            let part = parts.and_then(|p| p.get(index));
+            let row = part.and_then(|part| {
+                let typ = part.get("type").and_then(Value::as_str);
+                let (call, id) = match (kind, typ) {
+                    ("assistant", Some("tool_use")) => (true, string(part, "id")),
+                    ("user", Some("tool_result")) => (false, string(part, "tool_use_id")),
+                    _ => return None,
+                };
+                Some(ToolRow {
+                    offset,
+                    index,
+                    call,
+                    id,
+                })
+            });
+            if old_tool.is_some() || (revised && row.is_some()) {
+                rebuild_tools = true;
+            }
+            if let Some(row) = row {
+                new_tools.push(key.clone());
+                self.tool_rows.insert(key, row);
+            }
+        }
+        let old_tool_count = self.tool_count;
+        if rebuild_tools {
+            self.calls.clear();
+            let mut rows: Vec<_> = self.tool_rows.values().collect();
+            rows.sort_unstable_by_key(|row| (row.offset, row.index));
+            self.tool_count = rows.into_iter().map(|row| row.apply(&mut self.calls)).sum();
+        } else {
+            for key in &new_tools {
+                self.tool_count += self.tool_rows[key].apply(&mut self.calls);
+            }
+        }
+        self.summary.displayed_event_count =
+            self.summary.displayed_event_count - old_tool_count + self.tool_count;
+        if let Some(uuid) = uuid {
+            for index in 0..block_count {
+                let hidden = parts.and_then(|p| p.get(index)).map_or(0, |part| {
+                    match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "text" | "image" => 0,
+                        "thinking" | "tool_use" if kind == "assistant" => 0,
+                        "tool_result" if kind == "user" => content_text(&part["content"]).1,
+                        _ => 1,
+                    }
+                });
+                if let Some((displayed, old_hidden)) = self
+                    .block_counts
+                    .insert((uuid.to_owned(), index), (0, hidden))
+                {
+                    self.summary.displayed_event_count =
+                        self.summary.displayed_event_count.saturating_sub(displayed);
+                    self.summary.hidden_records =
+                        self.summary.hidden_records.saturating_sub(old_hidden);
+                }
+            }
+        }
         let mapped = map_indexed(&self.summary.key, &[(offset, v)]);
         self.summary.hidden_records += mapped.hidden_records;
         for e in mapped.events {
@@ -564,21 +683,17 @@ impl State {
                 self.summary.last_event_at =
                     Some(self.summary.last_event_at.map_or(t, |old| old.max(t)));
             }
-            if let Some(tool) = e.tool {
-                if tool.orphan
-                    && tool
-                        .call_id
-                        .as_ref()
-                        .is_some_and(|id| self.calls.remove(id))
-                {
-                    continue;
-                }
-                if !tool.orphan
-                    && tool.status == ToolStatus::Pending
-                    && let Some(id) = tool.call_id
-                {
-                    self.calls.insert(id);
-                }
+            if e.tool.is_some() {
+                continue;
+            }
+            if let Some(uuid) = uuid
+                && let Some(index) =
+                    e.id.rsplit(':')
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                && let Some(counts) = self.block_counts.get_mut(&(uuid.to_owned(), index))
+            {
+                counts.0 += 1;
             }
             self.summary.displayed_event_count += 1;
         }
@@ -692,7 +807,22 @@ impl ClaudeScanner {
                     state.ingest(offset, &value, &self.config.pricing);
                     count += 1;
                 }
-                Ok(Some(Record::Incomplete { .. })) | Ok(None) => {
+                Ok(None) => {
+                    state.summary.source_available = true;
+                    if !state.parent_seen
+                        && let Some(ledger) = &state.side_ledger
+                    {
+                        let usage = ledger.summary(&self.config.pricing);
+                        let tools = ledger.server_tools();
+                        if state.summary.usage != usage || state.summary.server_tools != tools {
+                            state.summary.usage = usage;
+                            state.summary.server_tools = tools;
+                            state.dirty = true;
+                        }
+                    }
+                    pass.next += 1;
+                }
+                Ok(Some(Record::Incomplete { .. })) => {
                     state.summary.source_available = true;
                     pass.next += 1;
                 }

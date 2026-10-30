@@ -82,6 +82,7 @@ fn ledger_overflow_freezes_and_marks_partial() {
                 record("a", "first", json!("a")),
                 record("b", "second", json!("b")),
                 record("c", "third", json!("c")),
+                record("d", "first", json!("duplicate after freeze")),
             ],
             entries,
             bytes,
@@ -184,5 +185,106 @@ fn partial_record_revision_keeps_other_blocks() {
         events
             .iter()
             .any(|e| e.text.as_ref().is_some_and(|t| t.preview == "new"))
+    );
+}
+
+#[test]
+fn roster_matches_transcript_after_block_revisions() {
+    let records = vec![
+        record(
+            "a",
+            "m",
+            json!([{"type":"text","text":"old"},{"type":"unknown"},{"type":"thinking","thinking":"keep"}]),
+        ),
+        record(
+            "a",
+            "m",
+            json!([{"type":"unknown"},{"type":"text","text":"new"}]),
+        ),
+    ];
+    let (_dir, _path, mut scanner) = setup(&records, 100, 1000);
+    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let indexed = records
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (i as u64, v))
+        .collect::<Vec<_>>();
+    let mapped = ClaudeScanner::map_transcript(&summary.key, &indexed);
+    assert_eq!(summary.displayed_event_count, mapped.events.len());
+    assert_eq!(summary.hidden_records, mapped.hidden_records);
+}
+
+#[test]
+fn sidechain_first_budget_split_never_exposes_child_as_parent_usage() {
+    let mut side = record("side", "child", json!("child"));
+    side["isSidechain"] = json!(true);
+    side["message"]["usage"]["server_tool_use"] = json!({"web_search_requests":7});
+    let parent_user =
+        json!({"type":"user","uuid":"user","sessionId":"s","message":{"content":"hello"}});
+    let (_dir, _path, mut scanner) = setup(
+        &[
+            side,
+            parent_user,
+            record("parent", "parent", json!("parent")),
+        ],
+        100,
+        1000,
+    );
+    let first = scanner
+        .scan_roster(
+            NOW,
+            RefreshBudget {
+                max_records: 1,
+                ..BIG
+            },
+        )
+        .unwrap()
+        .sessions
+        .remove(0);
+    assert!(first.usage.is_none());
+    assert!(first.server_tools.is_none());
+    let final_summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    assert_eq!(final_summary.usage.unwrap().total, Some(3));
+    assert!(final_summary.server_tools.is_none());
+}
+
+#[test]
+fn parent_without_assistant_does_not_inherit_sidechain_usage() {
+    let mut side = record("side", "child", json!("child"));
+    side["isSidechain"] = json!(true);
+    let parent_user =
+        json!({"type":"user","uuid":"user","sessionId":"s","message":{"content":"hello"}});
+    let (_dir, _path, mut scanner) = setup(&[side, parent_user], 100, 1000);
+    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    assert!(summary.usage.is_none());
+}
+
+#[test]
+fn roster_revision_of_paired_tool_call_matches_transcript() {
+    let records = vec![
+        record(
+            "a",
+            "m",
+            json!([{"type":"tool_use","id":"call","name":"Read","input":{}}]),
+        ),
+        json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":"ok"}]}}),
+        record(
+            "a",
+            "m",
+            json!([{"type":"tool_use","id":"call","name":"Read","input":{}}]),
+        ),
+    ];
+    let (_dir, _path, mut scanner) = setup(&records, 100, 1000);
+    let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+    let indexed = records
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (i as u64, v))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary.displayed_event_count,
+        ClaudeScanner::map_transcript(&summary.key, &indexed)
+            .events
+            .len()
     );
 }
