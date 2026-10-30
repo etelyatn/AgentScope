@@ -711,3 +711,51 @@ fn tab_focus_cycling_retains_the_transcript_and_its_state() {
     press(&mut app, KeyCode::Esc);
     assert!(app.transcript().is_none());
 }
+
+#[test]
+fn search_opened_while_the_first_page_loads_works_once_it_arrives() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    press(&mut app, KeyCode::Enter);
+    let requests = app.take_requests();
+    let Some(WorkerRequest::Select { request_id, key }) = requests.first() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    ch(&mut app, '/');
+    assert!(app.is_editing(), "search opens while loading");
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::Transcript {
+            request_id: *request_id,
+            page: transcript_page(key, &["alpha", "beta", "gamma target"]),
+        },
+    );
+    type_text(&mut app, "target");
+    assert_eq!(app.transcript().unwrap().selected(), 2);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.transcript().unwrap().selected(), 0, "Esc restores");
+}
+
+#[test]
+fn process_panel_follows_the_selected_roster_row_after_leaving_the_inspector() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    open_with(&mut app, &mut ctx, &["one"]);
+    ch(&mut app, 'p');
+    assert_eq!(
+        app.process_view().session.unwrap().key,
+        key_of(Provider::Codex, "codex-1")
+    );
+    press(&mut app, KeyCode::Esc); // close the panel
+    press(&mut app, KeyCode::BackTab); // roster, transcript retained
+    assert_eq!(app.screen, Screen::Roster);
+    ch(&mut app, 'j');
+    ch(&mut app, 'p');
+    assert_eq!(
+        app.process_view().session.unwrap().key,
+        key_of(Provider::Claude, "claude-1")
+    );
+}

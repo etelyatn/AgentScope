@@ -193,12 +193,20 @@ impl App {
             return;
         };
         let (scope, buffer) = (e.scope, e.buffer.clone());
-        let origin = e.origin.clone();
+        let mut origin = e.origin.clone();
         match scope {
             SearchScope::Roster => self.set_query(&buffer),
             SearchScope::Transcript => {
                 if let Some(t) = &mut self.transcript {
                     t.set_search_query(&buffer);
+                    // Search began before any event was loaded: the reader's
+                    // position is whatever is selected once events exist.
+                    if origin.is_none() {
+                        origin = t.selected_event().map(|e| e.id.clone());
+                        if let Some(e) = &mut self.input.editing {
+                            e.origin = origin.clone();
+                        }
+                    }
                     // No match keeps the reader where the search began.
                     let start = origin.as_deref().and_then(|id| t.index_of(id));
                     if let Some(start) = start {
@@ -434,11 +442,10 @@ impl App {
 
     /// Candidates for the open session, or else the selected roster row.
     pub fn process_view(&self) -> ProcessView<'_> {
-        let key = self
-            .transcript
-            .as_ref()
-            .map(|t| t.key().clone())
-            .or_else(|| self.selected.clone());
+        let key = match (self.screen, &self.transcript) {
+            (Screen::Roster, _) | (_, None) => self.selected.clone(),
+            (_, Some(t)) => Some(t.key().clone()),
+        };
         let session = key.and_then(|k| self.sessions.iter().find(|s| s.key == k));
         let snapshot = self.input.processes.as_ref();
         ProcessView {
