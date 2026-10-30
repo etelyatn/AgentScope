@@ -807,7 +807,7 @@ fn stream_rows(
     };
     let sql = format!(
         "SELECT id, time_created, time_updated, substr(type, 1, {TYPE_CHARS}), \
-         CASE WHEN length(data) <= ?2 THEN data END, length(data) \
+         CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, length(CAST(data AS BLOB)) \
          FROM {MESSAGE_TABLE} \
          WHERE session_id = ?1 AND length(id) <= ?3{bound} \
          ORDER BY time_created {order}, id {order}"
@@ -1135,11 +1135,15 @@ impl Mapper<'_> {
     }
 }
 
+/// Anchor whose derived `Ord` (timestamp, source_order, stable_id) equals the SQL
+/// order `(time_created, id, part)`: `source_order` is a constant 0 and `stable_id`
+/// is the exact row id, a NUL, and the zero-padded part index. NUL sorts below every
+/// other byte, so an id that prefixes another still orders first, as in SQL.
 fn anchor_of(e: &Event, row_id: &str) -> PageAnchor {
     PageAnchor {
         timestamp: e.timestamp,
-        source_order: e.source_order,
-        stable_id: row_id.to_owned(),
+        source_order: 0,
+        stable_id: format!("{row_id}\0{:010}", e.source_order),
     }
 }
 
@@ -1168,14 +1172,15 @@ fn push_diag(into: &mut Vec<DiagnosticEntry>, entry: DiagnosticEntry, truncated:
     }
 }
 
-/// An anchor names `(time_created, row id, part index)` of a displayed event.
-fn anchor_parts(anchor: &PageAnchor) -> Result<(i64, usize), ProviderError> {
-    let created = anchor.timestamp.ok_or_else(|| {
-        ProviderError::Unsupported("OpenCode anchors carry the row's time_created".into())
-    })?;
-    let part = usize::try_from(anchor.source_order)
-        .map_err(|_| ProviderError::Unsupported("anchor part index out of range".into()))?;
-    Ok((created, part))
+/// Splits an anchor into `(time_created, row id, part index)`.
+fn anchor_parts(anchor: &PageAnchor) -> Result<(i64, &str, usize), ProviderError> {
+    let bad = || ProviderError::Unsupported("not an OpenCode anchor".into());
+    let created = anchor.timestamp.ok_or_else(bad)?;
+    let (id, part) = anchor.stable_id.rsplit_once('\0').ok_or_else(bad)?;
+    if anchor.source_order != 0 || part.len() != 10 {
+        return Err(bad());
+    }
+    Ok((created, id, part.parse().map_err(|_| bad())?))
 }
 
 impl OpenCodeScanner {
@@ -1252,9 +1257,7 @@ impl OpenCodeScanner {
         request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
         self.check_session(conn, key)?;
-        let at = anchor
-            .map(|a| anchor_parts(a).map(|(created, part)| (created, a.stable_id.as_str(), part)))
-            .transpose()?;
+        let at = anchor.map(|a| anchor_parts(a)).transpose()?;
         let record_cap = self.config.max_record_bytes;
         let mapper = Mapper {
             key,
@@ -1358,7 +1361,7 @@ impl OpenCodeScanner {
         anchor: &PageAnchor,
     ) -> Result<usize, ProviderError> {
         self.check_session(conn, key)?;
-        let (created, at_part) = anchor_parts(anchor)?;
+        let (created, at_id, at_part) = anchor_parts(anchor)?;
         let record_cap = self.config.max_record_bytes;
         let mapper = Mapper {
             key,
@@ -1371,9 +1374,9 @@ impl OpenCodeScanner {
             &key.provider_session_id,
             record_cap,
             PageDirection::Forward,
-            Some((created, anchor.stable_id.as_str())),
+            Some((created, at_id)),
             |row| {
-                let same = row.created == created && row.id == anchor.stable_id;
+                let same = row.created == created && row.id == at_id;
                 count += mapper
                     .map_row(&row, record_cap)
                     .iter()
@@ -1414,7 +1417,7 @@ impl OpenCodeScanner {
         let found = conn
             .query_row(
                 "SELECT session_id, time_created, time_updated, substr(type, 1, ?3), \
-                 CASE WHEN length(data) <= ?2 THEN data END, length(data) \
+                 CASE WHEN length(CAST(data AS BLOB)) <= ?2 THEN data END, length(CAST(data AS BLOB)) \
                  FROM session_message WHERE id = ?1 AND length(id) <= ?4",
                 params![
                     row_id,

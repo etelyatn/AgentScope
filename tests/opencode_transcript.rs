@@ -357,7 +357,7 @@ fn forward_and_backward_pages_are_equivalent_at_equal_timestamps() {
             anchor.source_order,
             anchor.stable_id.as_str()
         ),
-        (Some(500), 0, "b")
+        (Some(500), 0, "b\u{0}0000000000")
     );
     assert!(p.has_more);
     let back = page(
@@ -676,4 +676,137 @@ fn legacy_schema_has_no_transcript_yet() {
         .transcript_page(&key("ses_1"), None, PageDirection::Forward, ALL)
         .unwrap_err();
     assert!(matches!(err, ProviderError::Unsupported(_)), "{err:?}");
+}
+
+#[test]
+fn anchors_are_strictly_monotonic_in_ord_across_equal_timestamps() {
+    let (_d, db, conn) = fixture();
+    // Ids that prefix each other and sort around the separator, equal timestamps.
+    for (id, parts) in [
+        ("a", 2),
+        ("a!", 1),
+        ("ab", 2),
+        ("a\u{1}", 1),
+        ("b", 11),
+        ("a\u{0}x", 1),
+    ] {
+        let content: Vec<_> = (0..parts)
+            .map(|i| json!({"type": "text", "text": format!("{id}{i}")}))
+            .collect();
+        msg(
+            &conn,
+            id,
+            "assistant",
+            500,
+            500,
+            &json!({"content": content}).to_string(),
+        );
+    }
+    let mut s = scanner_for(&db);
+    let full = all(&mut s);
+    let ids: Vec<_> = full.events.iter().map(|e| e.id.clone()).collect();
+    for size in [1usize, 2, 3] {
+        for direction in [PageDirection::Forward, PageDirection::Backward] {
+            let request = PageRequest {
+                max_events: size,
+                max_bytes: 10_000_000,
+            };
+            let mut anchor = None;
+            let mut anchors: Vec<PageAnchor> = Vec::new();
+            let mut got: Vec<Vec<String>> = Vec::new();
+            loop {
+                let p = page(&mut s, anchor.clone(), direction, request);
+                got.push(p.events.iter().map(|e| e.id.clone()).collect());
+                if let Some(n) = &p.next {
+                    anchors.push(n.clone());
+                }
+                if !p.has_more {
+                    break;
+                }
+                anchor = p.next;
+            }
+            for w in anchors.windows(2) {
+                match direction {
+                    PageDirection::Forward => assert!(w[0] < w[1], "{:?}", w),
+                    PageDirection::Backward => assert!(w[0] > w[1], "{:?}", w),
+                }
+            }
+            if direction == PageDirection::Backward {
+                got.reverse();
+            }
+            let flat: Vec<String> = got.into_iter().flatten().collect();
+            assert_eq!(flat, ids, "{direction:?} size {size}");
+        }
+    }
+    // Every event's own anchor, ordered by Ord, matches display order.
+    let mut each: Vec<PageAnchor> = Vec::new();
+    let mut anchors = Vec::new();
+    let mut anchor = None;
+    loop {
+        let p = page(
+            &mut s,
+            anchor.clone(),
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 1,
+                max_bytes: 10_000_000,
+            },
+        );
+        anchors.extend(p.next.clone());
+        if !p.has_more {
+            break;
+        }
+        anchor = p.next;
+    }
+    each.extend(anchors.iter().cloned());
+    let mut sorted = each.clone();
+    sorted.sort();
+    assert_eq!(sorted, each);
+    assert_eq!(each.len(), ids.len());
+}
+
+#[test]
+fn record_cap_is_enforced_in_bytes_for_multibyte_and_nul_text() {
+    let (_d, db, conn) = fixture();
+    // 300 four-byte characters: 300 code points, 1200 bytes.
+    let multibyte = "\u{1F600}".repeat(300);
+    msg(
+        &conn,
+        "m1",
+        "user",
+        10,
+        10,
+        &format!(r#"{{"text":"{multibyte}"}}"#),
+    );
+    // A NUL inside the text; `length()` on TEXT would stop here and under-count.
+    let nul_body = format!(r#"{{"text":"a{}"}}"#, "b".repeat(2_000));
+    conn.execute(
+        "INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
+         VALUES ('m2', 'ses_1', 'user', 0, 20, 20, CAST(?1 AS TEXT) || char(0) || CAST(?1 AS TEXT))",
+        [nul_body],
+    )
+    .expect("insert nul");
+    msg(&conn, "m3", "user", 30, 30, r#"{"text":"small"}"#);
+    let mut config = config_for_db(&db);
+    config.max_record_bytes = 1_000;
+    let mut s = OpenCodeScanner::new(&config).expect("scanner");
+    let p = all(&mut s);
+    let ids: Vec<_> = p.events.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, ["m3#0"]);
+    assert_eq!(p.diagnostics.len(), 2, "{:?}", p.diagnostics);
+    assert!(
+        p.diagnostics.iter().all(|d| d.label.contains("oversized")),
+        "{:?}",
+        p.diagnostics
+    );
+    for d in &p.diagnostics {
+        let rec = s.source_record(&d.locator).expect("record");
+        assert!(rec.raw.is_empty());
+        assert!(rec.unavailable.as_deref().unwrap().contains("1000-byte"));
+    }
+    // Exactly at the cap is accepted (bytes, not code points).
+    config.max_record_bytes = 1_200 + r#"{"text":""}"#.len();
+    let mut s = OpenCodeScanner::new(&config).expect("scanner");
+    let p = all(&mut s);
+    assert_eq!(p.events[0].id, "m1#0");
 }
