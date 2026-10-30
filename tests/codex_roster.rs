@@ -10,7 +10,7 @@ use agentscope::domain::{
 };
 use agentscope::providers::codex::CodexScanner;
 use support::codex::*;
-use support::{NOW, config_for, dated, set_modified, write_lines};
+use support::{NOW, Unreadable, config_for, dated, link_dir, set_modified, write_lines};
 
 const BIG: RefreshBudget = RefreshBudget {
     max_records: 100_000,
@@ -660,4 +660,250 @@ fn chunked_budget_resumes_and_appends_are_read_incrementally() {
     assert_eq!(gone.removed.len(), 1);
     assert_eq!(gone.removed[0].provider_session_id, "b");
     assert!(!gone.warnings.is_empty());
+}
+
+#[test]
+fn changed_session_id_retires_the_previous_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let path = dated(&root, "rollout-late.jsonl");
+    write_lines(&path, &[]);
+    std::fs::write(&path, b"").unwrap();
+    let mut s = scanner(&root);
+    let first = scan_until_done(&mut s, BIG);
+    let old = first.sessions.keys().next().unwrap().clone();
+    assert_eq!(old.provider_session_id, "rollout-late");
+
+    // The file gains metadata: the stem-keyed row must be retired.
+    write_lines(
+        &path,
+        &[session_meta("2026-10-29T10:00:00Z", "real-id", "/p")],
+    );
+    let second = scan_until_done(&mut s, BIG);
+    assert_eq!(second.removed, [old]);
+    assert_eq!(
+        second.sessions.keys().next().unwrap().provider_session_id,
+        "real-id"
+    );
+
+    // A replacement under another ID retires the previous one as well.
+    std::fs::remove_file(&path).unwrap();
+    write_lines(
+        &path,
+        &[
+            session_meta("2026-10-29T10:00:00Z", "other-id", "/p"),
+            user("2026-10-29T10:00:01Z", "padding so the length changes"),
+        ],
+    );
+    let third = scan_until_done(&mut s, BIG);
+    assert_eq!(third.removed.len(), 1);
+    assert_eq!(third.removed[0].provider_session_id, "real-id");
+    assert_eq!(third.sessions.len(), 1);
+    assert_eq!(
+        third.sessions.keys().next().unwrap().provider_session_id,
+        "other-id"
+    );
+}
+
+#[test]
+fn open_cursors_stay_bounded_across_repeated_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let make = |i: u64| {
+        let path = dated(&root, &format!("rollout-{i:03}.jsonl"));
+        write_lines(
+            &path,
+            &[session_meta(
+                "2026-10-29T10:00:00Z",
+                &format!("id{i}"),
+                "/p",
+            )],
+        );
+        set_modified(&path, 1_000 + i);
+    };
+    for i in 0..40 {
+        make(i);
+    }
+    let mut s = scanner(&root);
+    scan_until_done(&mut s, BIG);
+    assert_eq!(s.open_cursors(), 32);
+    // New, newer files push unchanged ones below rank 32: their handles must go.
+    for i in 40..50 {
+        make(i);
+    }
+    let grown = scan_until_done(&mut s, BIG);
+    assert_eq!(grown.sessions.len(), 10);
+    assert_eq!(s.open_cursors(), 32);
+    scan_until_done(&mut s, BIG);
+    assert_eq!(s.open_cursors(), 32);
+}
+
+#[test]
+fn budget_charges_each_records_own_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    for i in 0..5 {
+        write_lines(
+            &dated(&root, &format!("rollout-{i}.jsonl")),
+            &[session_meta(
+                "2026-10-29T10:00:00Z",
+                &format!("id{i}"),
+                "/p",
+            )],
+        );
+    }
+    let one_byte = RefreshBudget {
+        max_records: 1_000,
+        max_bytes: 1,
+        max_millis: 60_000,
+    };
+    let scan = scan_until_done(&mut scanner(&root), one_byte);
+    assert_eq!(scan.sessions.len(), 5);
+    assert!(
+        scan.calls >= 5,
+        "each single-record file must consume budget, got {}",
+        scan.calls
+    );
+}
+
+#[test]
+fn long_cwd_is_preserved_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let cwd = format!("/work/{}/RipperGame", "d".repeat(400));
+    write_lines(
+        &dated(&root, "rollout-long.jsonl"),
+        &[
+            session_meta("2026-10-29T10:00:00Z", "long-cwd", &cwd),
+            turn_context("2026-10-29T10:00:01Z", "gpt-a", &cwd),
+        ],
+    );
+    let scan = scan_until_done(&mut scanner(&root), BIG);
+    let s = only(&scan);
+    assert_eq!(s.cwd.as_deref(), Some(std::path::Path::new(&cwd)));
+    assert_eq!(s.project.as_deref(), Some("RipperGame"));
+}
+
+#[test]
+fn symlinked_descendants_are_skipped_but_a_linked_root_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    write_lines(
+        &outside.join("rollout-out.jsonl"),
+        &[session_meta("2026-10-29T10:00:00Z", "out", "/p")],
+    );
+    let root = dir.path().join("s");
+    write_lines(
+        &dated(&root, "rollout-in.jsonl"),
+        &[session_meta("2026-10-29T10:00:00Z", "in", "/p")],
+    );
+    // Descendant link: never followed. Windows uses a junction; file symlinks
+    // need privilege there and are covered only where the platform allows them.
+    assert!(
+        link_dir(&outside, &root.join("2026").join("linked")),
+        "could not create a link"
+    );
+    let found = discover_codex(&config_for(&root)).unwrap();
+    assert_eq!(found.sources.len(), 1);
+    assert!(found.sources[0].path.ends_with("rollout-in.jsonl"));
+
+    // An explicitly configured root that is itself a link still works.
+    let linked_root = dir.path().join("rootlink");
+    assert!(
+        link_dir(&root, &linked_root),
+        "could not create a root link"
+    );
+    let found = discover_codex(&config_for(&linked_root)).unwrap();
+    assert_eq!(found.sources.len(), 1);
+}
+
+#[test]
+fn unreadable_source_is_retained_one_refresh_then_expires_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let path = dated(&root, "rollout-lock.jsonl");
+    let other = dated(&root, "rollout-ok.jsonl");
+    write_lines(
+        &path,
+        &[session_meta("2026-10-29T10:00:00Z", "locked", "/p")],
+    );
+    write_lines(&other, &[session_meta("2026-10-29T10:00:00Z", "ok", "/p")]);
+    let lock = Unreadable::new(&path);
+    if !lock.active {
+        eprintln!("cannot make a file unreadable here (elevated?); skipping");
+        return;
+    }
+    let mut s = scanner(&root);
+    let first = scan_until_done(&mut s, BIG);
+    let row = first
+        .sessions
+        .values()
+        .find(|r| r.key.source == SourceKey::File(path.clone()))
+        .expect("retained row");
+    assert!(!row.source_available);
+    assert!(warning(row, "#unavailable").is_some());
+    assert!(first.removed.is_empty());
+
+    // Second refresh: still unreadable, so the row expires with a warning.
+    let second = scan_until_done(&mut s, BIG);
+    assert_eq!(second.removed.len(), 1);
+    assert_eq!(second.removed[0].source, SourceKey::File(path.clone()));
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|w| w.key.source.ends_with("#expired"))
+    );
+    assert!(second.sessions.is_empty());
+
+    // Expired and still unreadable: no flapping row reappears.
+    let third = scan_until_done(&mut s, BIG);
+    assert!(third.sessions.is_empty() && third.removed.is_empty());
+
+    // Once readable again it comes back.
+    lock.release();
+    let back = scan_until_done(&mut s, BIG);
+    let row = back.sessions.values().next().expect("recovered row");
+    assert_eq!(row.key.provider_session_id, "locked");
+    assert!(row.source_available);
+}
+
+#[test]
+fn token_usage_record_forms_are_all_read_and_latest_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let cases = [
+        (
+            "payload",
+            usage_record("2026-10-29T10:00:02Z", usage(5, 0, 5, 0, 10)),
+        ),
+        (
+            "top",
+            usage_record_top_level("2026-10-29T10:00:02Z", usage(5, 0, 5, 0, 10)),
+        ),
+        (
+            "event",
+            usage_record_event("2026-10-29T10:00:02Z", usage(5, 0, 5, 0, 10)),
+        ),
+    ];
+    for (id, line) in cases {
+        write_lines(
+            &dated(&root, &format!("rollout-{id}.jsonl")),
+            &[
+                session_meta("2026-10-29T10:00:00Z", id, "/p"),
+                usage_record("2026-10-29T10:00:01Z", usage(900, 0, 90, 0, 990)),
+                line,
+            ],
+        );
+    }
+    let scan = scan_until_done(&mut scanner(&root), BIG);
+    assert_eq!(scan.sessions.len(), 3);
+    for s in scan.sessions.values() {
+        assert_eq!(
+            s.usage.as_ref().unwrap().total,
+            Some(10),
+            "{}",
+            s.key.provider_session_id
+        );
+    }
 }

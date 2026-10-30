@@ -37,3 +37,73 @@ pub fn set_modified(path: &Path, secs_after_epoch: u64) {
 pub fn dated(root: &Path, name: &str) -> PathBuf {
     root.join("2026").join("10").join("29").join(name)
 }
+
+/// Creates a directory symlink (Unix) or junction (Windows, no privilege needed).
+/// Returns false when the platform refuses.
+pub fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+/// True when `path` can no longer be opened for reading after `lock` ran.
+pub struct Unreadable {
+    #[cfg(windows)]
+    _held: Option<File>,
+    #[cfg(unix)]
+    path: PathBuf,
+    pub active: bool,
+}
+
+impl Unreadable {
+    pub fn new(path: &Path) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = File::options().read(true).share_mode(0).open(path).ok();
+            let active = File::open(path).is_err();
+            Self {
+                _held: held,
+                active,
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).ok();
+            let active = File::open(path).is_err();
+            Self {
+                path: path.to_path_buf(),
+                active,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Self { active: false }
+        }
+    }
+
+    pub fn release(self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644)).ok();
+        }
+    }
+}

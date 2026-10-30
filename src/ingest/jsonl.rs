@@ -136,6 +136,11 @@ impl JsonlCursor {
         })
     }
 
+    /// Bytes consumed from the file so far, including a held partial line.
+    pub fn position(&self) -> u64 {
+        self.offset
+    }
+
     /// Number of times the source was detected as rotated or truncated and re-read.
     pub fn rotation_count(&self) -> u64 {
         self.rotations

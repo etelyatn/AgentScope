@@ -85,3 +85,17 @@ pub fn token_count(ts: &str, total: Value, window: Option<u64>) -> String {
         }}),
     )
 }
+
+/// `token_usage_record` body at the top level of the record (no `payload`).
+pub fn usage_record_top_level(ts: &str, thread: Value) -> String {
+    json!({"timestamp": ts, "type": "token_usage_record", "thread_token_usage": thread}).to_string()
+}
+
+/// `token_usage_record` carried as an `event_msg` subtype.
+pub fn usage_record_event(ts: &str, thread: Value) -> String {
+    record(
+        ts,
+        "event_msg",
+        json!({"type": "token_usage_record", "thread_token_usage": thread}),
+    )
+}

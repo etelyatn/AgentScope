@@ -57,6 +57,12 @@ fn text_field(v: &Value, key: &str) -> Option<String> {
     (!clean.trim().is_empty()).then_some(clean)
 }
 
+/// Unbounded, unsanitized path text: paths must stay exact; only display text is bounded.
+fn path_field(v: &Value, key: &str) -> Option<PathBuf> {
+    let s = field(v, key).as_str()?;
+    (!s.trim().is_empty()).then(|| PathBuf::from(s))
+}
+
 fn parse_ts(v: &Value) -> Option<Timestamp> {
     let parsed = DateTime::parse_from_rfc3339(v.as_str()?).ok()?;
     Some(parsed.timestamp_millis())
@@ -153,7 +159,7 @@ impl Parsed {
                     self.models.push(model);
                 }
                 if self.cwd.is_none() {
-                    self.cwd = text_field(payload, "cwd").map(PathBuf::from);
+                    self.cwd = path_field(payload, "cwd");
                 }
             }
             Some("response_item") => self.response_item(payload, ts),
@@ -181,8 +187,8 @@ impl Parsed {
         }
         self.meta_seen = true;
         self.id = text_field(p, "id").or_else(|| text_field(p, "session_id"));
-        if let Some(cwd) = text_field(p, "cwd") {
-            self.cwd = Some(PathBuf::from(cwd));
+        if let Some(cwd) = path_field(p, "cwd") {
+            self.cwd = Some(cwd);
         }
         self.version = text_field(p, "cli_version");
         self.created_at = parse_ts(field(p, "timestamp")).or(ts);
@@ -256,10 +262,13 @@ struct FileState {
     parsed: Parsed,
     rotations_seen: u64,
     rotation_warnings: u32,
-    last_offset: u64,
     reached_eof: bool,
     available: bool,
+    /// Unavailable at the end of a completed pass; expires after the next one.
+    retained: bool,
     dirty: bool,
+    /// Key last sent to consumers, so an ID change can retire the old row.
+    emitted: Option<SessionKey>,
     /// Duplicate-ID count and parent link as last emitted.
     context: (usize, Option<SessionLink>),
 }
@@ -272,10 +281,11 @@ impl FileState {
             parsed: Parsed::default(),
             rotations_seen: 0,
             rotation_warnings: 0,
-            last_offset: 0,
             reached_eof: false,
             available: true,
+            retained: false,
             dirty: true,
+            emitted: None,
             context: (1, None),
         }
     }
@@ -285,7 +295,6 @@ impl FileState {
         self.cursor = None;
         self.parsed = Parsed::default();
         self.rotations_seen = 0;
-        self.last_offset = 0;
         self.reached_eof = false;
         self.dirty = true;
     }
@@ -359,6 +368,8 @@ fn warn(path: &Path, label: &str, kind: WarningKind, message: String, count: u32
 pub struct CodexScanner {
     config: Config,
     states: HashMap<PathBuf, FileState>,
+    /// Sources that stayed unreadable for a full refresh; probed silently until readable.
+    expired: HashSet<PathBuf>,
     pass: Option<Pass>,
 }
 
@@ -367,8 +378,14 @@ impl CodexScanner {
         Ok(Self {
             config: config.clone(),
             states: HashMap::new(),
+            expired: HashSet::new(),
             pass: None,
         })
+    }
+
+    /// Number of rollout files currently held open (bounded by `KEEP_CURSORS`).
+    pub fn open_cursors(&self) -> usize {
+        self.states.values().filter(|s| s.cursor.is_some()).count()
     }
 
     /// Reads as many new records as `budget` allows and returns the sessions that
@@ -408,20 +425,36 @@ impl CodexScanner {
         let mut removed = Vec::new();
         if done {
             let live: HashSet<&Path> = pass.sources.iter().map(|s| s.path.as_path()).collect();
-            let gone: Vec<PathBuf> = self
-                .states
-                .keys()
-                .filter(|p| !live.contains(p.as_path()))
-                .cloned()
-                .collect();
-            for path in gone {
+            self.expired.retain(|p| live.contains(p.as_path()));
+            let mut gone: Vec<(PathBuf, &str, &str)> = Vec::new();
+            for (path, state) in &mut self.states {
+                if !live.contains(path.as_path()) {
+                    gone.push((
+                        path.clone(),
+                        "#removed",
+                        "session file is no longer present",
+                    ));
+                } else if !state.available && state.retained {
+                    gone.push((
+                        path.clone(),
+                        "#expired",
+                        "source stayed unreadable; row removed",
+                    ));
+                } else if !state.available {
+                    state.retained = true;
+                }
+            }
+            for (path, label, message) in gone {
                 if let Some(state) = self.states.remove(&path) {
-                    removed.push(state.key());
+                    if label == "#expired" {
+                        self.expired.insert(path.clone());
+                    }
+                    removed.extend(state.emitted.clone());
                     warnings.push(warn(
                         &path,
-                        "#removed",
+                        label,
                         WarningKind::Unavailable,
-                        "session file is no longer present".into(),
+                        message.into(),
                         1,
                     ));
                 }
@@ -436,7 +469,8 @@ impl CodexScanner {
         if !done {
             self.pass = Some(pass);
         }
-        let sessions = self.emit_changed();
+        let (sessions, retired) = self.emit_changed();
+        removed.extend(retired);
         Ok(ProviderDelta {
             sessions,
             removed,
@@ -447,10 +481,20 @@ impl CodexScanner {
 
     fn advance(&mut self, source: SourceFile, keep: bool, meter: &mut Meter) -> Advance {
         let max_record_bytes = self.config.max_record_bytes;
+        if self.expired.contains(&source.path) {
+            if std::fs::File::open(&source.path).is_err() {
+                return Advance::Done;
+            }
+            self.expired.remove(&source.path);
+        }
         let state = self
             .states
             .entry(source.path.clone())
             .or_insert_with(|| FileState::new(source.clone()));
+        if !keep && state.reached_eof {
+            // Bound open handles to the newest sources even when nothing changed.
+            state.cursor = None;
+        }
         let unchanged = state.source.len == source.len && state.source.modified == source.modified;
         if state.reached_eof && unchanged && state.available {
             return Advance::Done;
@@ -475,14 +519,24 @@ impl CodexScanner {
             let Some(cursor) = state.cursor.as_mut() else {
                 return Advance::Done;
             };
+            let before = cursor.position();
             let next = cursor.next_record();
+            let after = cursor.position();
+            // A rotation restarts at 0, so everything read since is new.
+            let consumed = if after >= before {
+                after - before
+            } else {
+                after
+            };
+            meter.bytes = meter
+                .bytes
+                .saturating_add(usize::try_from(consumed).unwrap_or(usize::MAX));
             let rotations = cursor.rotation_count();
             if rotations > state.rotations_seen {
                 // The file was replaced or truncated: restart its parse state.
                 state.parsed = Parsed::default();
                 state.rotations_seen = rotations;
                 state.rotation_warnings += 1;
-                state.last_offset = 0;
                 state.dirty = true;
             }
             let record = match next {
@@ -491,6 +545,7 @@ impl CodexScanner {
                     state.reached_eof = true;
                     state.dirty |= !state.available;
                     state.available = true;
+                    state.retained = false;
                     if !keep {
                         state.cursor = None;
                     }
@@ -503,7 +558,6 @@ impl CodexScanner {
                     state.cursor = None;
                     state.parsed = Parsed::default();
                     state.rotations_seen = 0;
-                    state.last_offset = 0;
                     state.reached_eof = false;
                     return Advance::Done;
                 }
@@ -511,28 +565,16 @@ impl CodexScanner {
             state.reached_eof = false;
             state.dirty |= !state.available;
             state.available = true;
-            let offset = match record {
-                Record::Json { offset, ref value } => {
-                    state.parsed.apply(value);
-                    offset
-                }
-                Record::Invalid { offset } => {
-                    state.parsed.malformed += 1;
-                    offset
-                }
-                Record::TooLarge { offset } => {
-                    state.parsed.oversized += 1;
-                    offset
-                }
+            state.retained = false;
+            match record {
+                Record::Json { ref value, .. } => state.parsed.apply(value),
+                Record::Invalid { .. } => state.parsed.malformed += 1,
+                Record::TooLarge { .. } => state.parsed.oversized += 1,
                 // A partial trailing line is held by the cursor until it completes.
                 Record::Incomplete { .. } => continue,
-            };
+            }
             state.dirty = true;
             meter.records += 1;
-            meter.bytes = meter.bytes.saturating_add(
-                usize::try_from(offset.saturating_sub(state.last_offset)).unwrap_or(usize::MAX),
-            );
-            state.last_offset = offset;
             if meter.spent() {
                 return Advance::Exhausted;
             }
@@ -540,7 +582,7 @@ impl CodexScanner {
     }
 
     /// Refreshes duplicate-ID and parent-link context, then drains dirty sessions.
-    fn emit_changed(&mut self) -> Vec<SessionSummary> {
+    fn emit_changed(&mut self) -> (Vec<SessionSummary>, Vec<SessionKey>) {
         let mut by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for (path, state) in &self.states {
             by_id.entry(state.id()).or_default().push(path.clone());
@@ -577,10 +619,19 @@ impl CodexScanner {
             .into_iter()
             .map(|p| self.summarize(&self.states[p]))
             .collect();
+        let mut retired = Vec::new();
         for state in self.states.values_mut() {
-            state.dirty = false;
+            if state.dirty {
+                let key = state.key();
+                if let Some(old) = state.emitted.replace(key.clone())
+                    && old != key
+                {
+                    retired.push(old);
+                }
+                state.dirty = false;
+            }
         }
-        summaries
+        (summaries, retired)
     }
 
     /// The most recently persisted source with that ID; a tie at the top is ambiguous.

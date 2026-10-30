@@ -96,7 +96,7 @@ pub fn discover_codex(config: &Config) -> Result<Discovery, ProviderError> {
             warnings,
         });
     };
-    // The root is an explicit user choice; only entries beneath it are never followed.
+    // An explicitly configured root may itself be a link; links beneath it are never followed.
     if !fs::metadata(root).is_ok_and(|m| m.is_dir()) {
         warnings.push(warning(
             root.display().to_string(),
