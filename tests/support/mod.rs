@@ -4,6 +4,7 @@
 pub mod claude;
 pub mod codex;
 pub mod opencode;
+pub mod world;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};

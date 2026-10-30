@@ -1,6 +1,6 @@
 # AgentScope Architecture
 
-**Status: proposed design — not a description of implemented code.**
+**Status: v1 implemented (2026-10-30). Read-only, privacy, and boundary claims below are covered by `tests/read_only.rs`, `tests/privacy.rs`, and `tests/acceptance.rs` on synthetic fixtures; items marked "future" are not implemented.**
 
 This document records durable architectural boundaries. Update it as components are implemented and their behavior is validated. Requirements and acceptance scenarios live in [PRODUCT.md](PRODUCT.md).
 
@@ -32,7 +32,7 @@ This document records durable architectural boundaries. Update it as components 
 
 **Application state and TUI** hold a roster, selection, filters, and transcript navigation. Renderers consume normalized data and should not parse raw provider files on every keypress.
 
-## 3. Proposed minimal domain vocabulary
+## 3. Minimal domain vocabulary
 
 | Concept | Purpose |
 |---|---|
@@ -43,7 +43,7 @@ This document records durable architectural boundaries. Update it as components 
 | Usage observation | Model, input/output/cache tokens, aggregation scope, provider evidence |
 | Process observation | PID + start time + sample time, metrics, possible session association |
 
-These are design concepts, not instructions to create a large interface hierarchy before the first parser exists.
+The shared provider interface and the types above are implemented in `src/domain.rs` and `src/providers/`; the vocabulary is intentionally small.
 
 ## 4. Read-only and format safety
 
@@ -59,9 +59,12 @@ Keep **session lifecycle**, **process observation**, and **activity/health infer
 
 Token records can be cumulative, per-request, or repeated streams. Provider-specific aggregation tests are required before presenting totals. Show `Reported`, `Derived`, `Estimated`, or `Unknown` where appropriate; missing cost must not be displayed as `$0.00`.
 
-## 6. Implementation sequencing
+## 6. Implemented structure and deliberate omissions
 
-Start with a Codex discovery/parser slice and a small view. Introduce a shared provider interface only when two real adapters need it. Add live refresh, accounting, Claude Code, OpenCode, and optional process observation incrementally. **Do not** implement an event bus, daemon, remote API, cache database, or async runtime solely to prepare for future features.
+- **Threads and channels:** one background worker thread owns every provider reader (`ProviderReader`: bounded `refresh`, paged `transcript_page`, `count_events_after`, `source_record`) and the process sampler. The UI thread exchanges `WorkerRequest`/`WorkerEvent` messages over standard-library channels and never parses provider files on a keypress.
+- **Bounded work:** each refresh call is limited by record, byte, and time budgets; roster size, page size, record size, loaded-event count, and the Claude dedup ledger are capped, with tests in `tests/perf_budget.rs`.
+- **Known gap:** roster scans stream each file once rather than reading only headers/tails (metadata-only scan deferred); see the benchmark note.
+- **Deliberately absent:** event bus, daemon, remote API, cache database, async runtime, network access, and any provider write path.
 
 ## 7. Future expansion (out of MVP)
 
@@ -74,4 +77,4 @@ For orchestrator integration, correlation between Hermes tasks and provider sess
 - [ADR-0001: Passive, read-only observation](decisions/0001-passive-read-only-observation.md)
 - [ADR-0002: Read-only OpenCode access and WAL sidecars](decisions/0002-opencode-readonly-wal-sidecars.md)
 
-Architecture implementation status and source compatibility are expected to evolve as tests against real provider versions become available.
+Source compatibility is verified only against synthetic fixtures and, read-only, against codex-cli 0.159.2, Claude Code 2.1.311, and opencode 2.0.29 on one Windows machine. Provider formats are internal and may change; unsupported records are reported, not guessed.

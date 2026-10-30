@@ -2,9 +2,28 @@
 
 **Version:** 0.2 (proposal)<br>
 **Date:** 27 October 2026<br>
-**Status:** Proposed requirements (not implemented)<br>
+**Status:** Requirements document; v1 implemented and verified on synthetic fixtures, partially validated on real data (see [Implementation status](#implementation-status))<br>
 **Product category:** Local-first developer observability tool<br>
 **Initial interface:** Terminal User Interface (TUI)
+
+## Implementation status
+
+*Updated 2026-10-30. The sections below remain the product requirements; this section records what was actually verified.*
+
+| Area | Status |
+|---|---|
+| Codex, Claude Code, OpenCode adapters, roster, transcript explorer, usage, status, process candidates, TUI | Implemented. AC-01..AC-10 pass on synthetic fixtures through the real adapters, worker thread, and keyboard path (`tests/acceptance.rs`). |
+| Read-only (§10, AC-08) | Verified on fixtures: session files, the main OpenCode database, mtimes, and permissions unchanged; credential tables denied by the SQLite authorizer; `auth.json`/credential files never discovered (`tests/read_only.rs`). **Exception:** SQLite may create/update OpenCode `-shm`/`-wal` sidecars ([ADR-0002](decisions/0002-opencode-readonly-wal-sidecars.md)); the claim is "no writes to session content, databases, configuration, permissions, or credentials", not "byte-identical directory". |
+| Privacy (§10, AC-09) | Verified on fixtures: sentinel secrets absent from Debug output, warnings, errors, and rendered screens; control sequences neutralized; credential-shaped text masked by default (`tests/privacy.rs`). Masking is best effort. |
+| Real data | Read-only adapter smoke on one Windows developer machine (codex-cli 0.159.2, Claude Code 2.1.311, opencode 2.0.29): all three providers listed, pages opened, no provider file removed or shrunk; counts only were recorded. No interactive real-data TUI run, no macOS/Linux run, no live-append against a running agent on real data. |
+| Performance (§11) | Deterministic work budgets enforced; timings measured on Windows only ([benchmarks](superpowers/notes/2026-10-30-benchmarks.md)). |
+
+**Known deviations from the requirements above:**
+
+- The roster scan is not the header/tail metadata-only pass the design called for; adapters stream each file once (bounded per call). Deferred.
+- Process-to-session matching needs the session ID on a command line, so most sessions show `Unmatched` or same-provider *candidates*; Windows does not expose other processes' working directories.
+- Cost estimates require a user-supplied exact provider+model price; otherwise cost is `Unknown`.
+- macOS and Linux are unvalidated; OpenCode and macOS are not benchmarked.
 
 ## 1. Executive summary
 
@@ -340,11 +359,13 @@ These are engineering targets, not claims of measured performance. Define a benc
 
 **AC-07 — Missing data:** Unavailable cost, missing completion event, or ambiguous process matching display Unknown/Unmatched instead of misleading zeros or hard failures.
 
-**AC-08 — Read-only regression:** Running all acceptance tests never changes provider session files, databases, or running processes.
+**AC-08 — Read-only regression:** Running all acceptance tests never changes provider session files, the main provider database, configuration, permissions, credentials, or running processes. The only permitted filesystem change is SQLite's transient OpenCode `-shm`/`-wal` sidecars (ADR-0002).
 
 **AC-09 — Privacy:** Raw terminal control sequences are neutralized and known test secrets are masked in the default transcript display.
 
 **AC-10 — Keyboard UX:** A user can discover a session, open its transcript, inspect a tool result, search, and return to the roster without a mouse.
+
+**Verification (2026-10-30):** each scenario has a fixture-backed test in `tests/acceptance.rs` (`ac01_…` through `ac09_…`, and `acceptance_scenarios_ac01_to_ac10_have_exercised_paths` for the keyboard-only AC-10 flow), with the full read-only and privacy suites in `tests/read_only.rs` and `tests/privacy.rs`. AC-01/AC-03/AC-04 were also exercised read-only against real local stores (counts only) but not with an independently running real agent, and AC-10 was not run interactively on real data. For AC-08, SQLite's transient OpenCode `-shm`/`-wal` sidecars are the single permitted change ([ADR-0002](decisions/0002-opencode-readonly-wal-sidecars.md)); session files, the main database, configuration, permissions, and credentials must remain unchanged, and AgentScope never signals or alters processes.
 
 ## 13. Risks, dependencies, and mitigations
 

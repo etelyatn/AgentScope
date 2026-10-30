@@ -1,6 +1,6 @@
 # AgentScope v1 — Three-Provider Read-Only TUI
 
-**Status:** Draft for approval<br>
+**Status:** Implemented; verified on synthetic fixtures and a read-only real-data smoke on Windows (2026-10-30). Not verified: interactive real-data TUI, macOS/Linux. See README "Verification status" and "Known limitations".<br>
 **Date:** 2026-10-29<br>
 **Scope:** Full documented MVP (option B)<br>
 **Related:** [PRODUCT.md](../../PRODUCT.md), [ARCHITECTURE.md](../../ARCHITECTURE.md), [ADR-0001](../../decisions/0001-passive-read-only-observation.md), [ADR-0002](../../decisions/0002-opencode-readonly-wal-sidecars.md)
