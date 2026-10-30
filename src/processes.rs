@@ -115,15 +115,59 @@ fn provider_name(provider: Provider) -> &'static str {
     }
 }
 
-/// Index of the provider program in `argv`: argv[0], or argv[1..3] when argv[0]
-/// is a script runtime (`node /path/opencode …`).
+/// Runtime options that consume the next token.
+const RUNTIME_VALUE_OPTS: &[&str] = &[
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--conditions",
+    "-C",
+    "--env-file",
+    "--inspect-port",
+    "--config",
+    "-c",
+];
+
+/// Index of the script a runtime invocation executes, or `None` (eval mode,
+/// no script). Only options before the script are skipped.
+fn runtime_script(argv: &[&str]) -> Option<usize> {
+    let mut i = 1;
+    let mut first = true;
+    while i < argv.len() {
+        let a = argv[i];
+        if matches!(a, "-e" | "--eval" | "-p" | "--print") {
+            return None;
+        }
+        if RUNTIME_VALUE_OPTS.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if first && a == "run" && stem(argv[0]) != "node" {
+            first = false;
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Index of the provider program in `argv`: argv[0], or the script actually
+/// executed by a script runtime (`node /path/opencode …`). Script arguments
+/// are never treated as the program.
 fn locate(provider: Provider, argv: &[&str]) -> Option<usize> {
     let name = provider_name(provider);
     if stem(argv.first()?) == name {
         return Some(0);
     }
     if RUNTIMES.contains(&stem(argv[0]).as_str()) {
-        return (1..argv.len().min(3)).find(|&i| stem(argv[i]) == name);
+        return runtime_script(argv).filter(|&i| stem(argv[i]) == name);
     }
     None
 }
@@ -154,11 +198,17 @@ pub fn identity_matches(provider: Provider, argv: &[&str], id: &str) -> bool {
 /// Scan flag arguments for `flag <id>` / `prefix<id>`. A fork flag makes the
 /// id a parent reference, not the running session. `--` ends option parsing.
 fn flag_value(args: &[&str], flags: &[&str], prefix: &str, fork: &str, id: &str) -> bool {
+    let value_opts: &[&str] = if prefix == "--resume=" {
+        CLAUDE_VALUE_OPTS
+    } else {
+        OPENCODE_VALUE_OPTS
+    };
     let mut found = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--" {
+        if a == "--" || a == "-p" || a == "--print" {
+            // Everything after a print/prompt switch or `--` is prompt-shaped.
             break;
         }
         if a == fork {
@@ -171,11 +221,58 @@ fn flag_value(args: &[&str], flags: &[&str], prefix: &str, fork: &str, id: &str)
             i += 1;
         } else if a.strip_prefix(prefix) == Some(id) {
             found = true;
+        } else if value_opts.contains(&a) {
+            // The next token is this option's value, never an identity flag.
+            i += 1;
         }
         i += 1;
     }
     found
 }
+
+const CLAUDE_VALUE_OPTS: &[&str] = &[
+    "--system-prompt",
+    "--append-system-prompt",
+    "--model",
+    "--fallback-model",
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--tools",
+    "--mcp-config",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--settings",
+    "--setting-sources",
+    "--session-id",
+    "--output-format",
+    "--input-format",
+    "--max-turns",
+    "--agents",
+    "--plugin-dir",
+    "--betas",
+    "--name",
+    "-n",
+    "--debug-file",
+];
+
+const OPENCODE_VALUE_OPTS: &[&str] = &[
+    "-m",
+    "--model",
+    "--agent",
+    "--prompt",
+    "--port",
+    "--hostname",
+    "--log-level",
+    "--mode",
+    "--title",
+    "--format",
+    "--variant",
+    "--file",
+    "-f",
+];
 
 fn argv_refs(p: &ProcessInfo) -> Option<Vec<&str>> {
     p.argv
@@ -187,7 +284,13 @@ fn is_candidate(provider: Provider, p: &ProcessInfo) -> bool {
     if stem(&p.executable) == provider_name(provider) {
         return true;
     }
-    argv_refs(p).is_some_and(|a| locate(provider, &a).is_some())
+    argv_refs(p).is_some_and(|a| {
+        locate(provider, &a).is_some()
+            // A runtime running some other script that mentions the provider is
+            // only a candidate, never a strong match.
+            || (RUNTIMES.contains(&stem(a[0]).as_str())
+                && a[1..].iter().any(|x| stem(x) == provider_name(provider)))
+    })
 }
 
 /// Processes that look like the provider's CLI. Candidates are not matches.
@@ -201,11 +304,13 @@ pub fn candidates(provider: Provider, snapshot: &ProcessSnapshot) -> Vec<&Proces
 
 /// Sample the OS process list. Environments and memory are never requested.
 pub fn observe_processes(now: Timestamp) -> Result<ProcessSnapshot, ProcessError> {
-    let kind = ProcessRefreshKind::nothing()
+    let mut kind = ProcessRefreshKind::nothing()
         .with_cmd(UpdateKind::Always)
         .with_exe(UpdateKind::Always)
-        .with_cwd(UpdateKind::Always)
         .with_user(UpdateKind::Always);
+    if CWD_OBSERVED {
+        kind = kind.with_cwd(UpdateKind::Always);
+    }
     let mut sys = System::new().map_err(|_| ProcessError::Unavailable)?;
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     let own_user = sysinfo::get_current_pid()
@@ -216,11 +321,9 @@ pub fn observe_processes(now: Timestamp) -> Result<ProcessSnapshot, ProcessError
         .processes()
         .values()
         .map(|p| {
-            // Another user's command line and cwd are never surfaced.
-            let foreign = match (&own_user, p.user_id()) {
-                (Some(me), Some(them)) => me != them,
-                _ => false,
-            };
+            // Command line and cwd are retained only when same-user ownership
+            // is positively established; unknown ownership discloses nothing.
+            let foreign = !ownership_confirmed(own_user.as_ref(), p.user_id());
             let argv: Vec<String> = p
                 .cmd()
                 .iter()
@@ -235,7 +338,7 @@ pub fn observe_processes(now: Timestamp) -> Result<ProcessSnapshot, ProcessError
                 pid_u32(p.pid()),
                 (started > 0).then(|| (started as i64).saturating_mul(1000)),
                 executable,
-                if foreign {
+                if foreign || !CWD_OBSERVED {
                     None
                 } else {
                     p.cwd().map(PathBuf::from)
@@ -309,4 +412,15 @@ pub fn associate(session: &SessionSummary, snapshot: &ProcessSnapshot) -> Proces
     } else {
         ProcessAssociation::Unmatched
     }
+}
+
+/// Whether this platform's cwd is read. Windows needs ReadProcessMemory on the
+/// target to obtain a cwd, which is beyond the command-line-only exception in
+/// spec §9.4, so it is never requested there (cwd shows `Unknown`).
+pub const CWD_OBSERVED: bool = !cfg!(windows);
+
+/// Same-user ownership must be positively established (both known and equal);
+/// unknown ownership is treated as foreign.
+pub fn ownership_confirmed<T: PartialEq>(me: Option<&T>, them: Option<&T>) -> bool {
+    matches!((me, them), (Some(a), Some(b)) if a == b)
 }

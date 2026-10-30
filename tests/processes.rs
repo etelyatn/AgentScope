@@ -270,3 +270,84 @@ fn observer_matches_spawned_binary_with_synthetic_session_id() {
     }
     assert!(matches!(got_other, ProcessAssociation::Candidates { .. }));
 }
+
+#[test]
+fn option_values_never_carry_identity_flags() {
+    assert!(!matches(
+        "claude",
+        &["--system-prompt", "--resume=01a1", "-p", "hello"]
+    ));
+    assert!(!matches("claude", &["--system-prompt", "--resume", "01a1"]));
+    assert!(!matches(
+        "claude",
+        &["--append-system-prompt", "-r", "01a1"]
+    ));
+    assert!(!matches("opencode", &["--prompt", "--session=ses_01a1"]));
+    assert!(!matches("opencode", &["-m", "-s", "ses_01a1"]));
+    // A real identity flag after an unrelated option's value still matches.
+    assert!(matches("claude", &["--model", "opus", "--resume", "01a1"]));
+    assert!(matches("opencode", &["--agent", "build", "-s", "ses_01a1"]));
+}
+
+#[test]
+fn runtime_script_must_be_the_provider_program() {
+    let id = "ses_01a1";
+    assert!(!identity_matches(
+        Provider::OpenCode,
+        &["node", "/tmp/other.js", "opencode", "--session", id],
+        id
+    ));
+    assert!(!identity_matches(
+        Provider::OpenCode,
+        &["node", "-e", "x", "opencode", "--session", id],
+        id
+    ));
+    assert!(identity_matches(
+        Provider::OpenCode,
+        &[
+            "node",
+            "--require",
+            "/x/hook.js",
+            "/y/opencode",
+            "--session",
+            id
+        ],
+        id
+    ));
+    assert!(identity_matches(
+        Provider::OpenCode,
+        &["bun", "run", "/y/opencode", "-s", id],
+        id
+    ));
+    // Such an invocation is still a visible candidate.
+    let s = session(Provider::OpenCode, id, None);
+    let snapshot = snap(vec![proc(
+        9,
+        "node",
+        None,
+        Some(&["node", "/tmp/other.js", "opencode", "--session", id]),
+    )]);
+    assert_eq!(
+        associate(&s, &snapshot),
+        ProcessAssociation::Candidates { count: 1 }
+    );
+}
+
+#[test]
+fn unknown_ownership_is_not_confirmed() {
+    use agentscope::processes::ownership_confirmed;
+    assert!(ownership_confirmed(Some(&1), Some(&1)));
+    assert!(!ownership_confirmed(Some(&1), Some(&2)));
+    assert!(!ownership_confirmed(None, Some(&1)));
+    assert!(!ownership_confirmed(Some(&1), None));
+    assert!(!ownership_confirmed::<u32>(None, None));
+}
+
+#[test]
+fn windows_cwd_is_never_observed() {
+    assert_eq!(agentscope::processes::CWD_OBSERVED, !cfg!(windows));
+    if cfg!(windows) {
+        let snapshot = observe_processes(0).unwrap();
+        assert!(snapshot.processes.iter().all(|p| p.cwd.is_none()));
+    }
+}
