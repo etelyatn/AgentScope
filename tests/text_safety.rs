@@ -229,3 +229,15 @@ fn masks_whitespace_separated_credential_arguments() {
     assert_eq!(redact("--password --verbose"), "--password --verbose");
     assert_eq!(redact("the password policy"), "the password policy");
 }
+
+#[test]
+fn credential_arguments_with_separators_are_still_masked() {
+    for text in [
+        "--password = hunter2",
+        "--api-key : value",
+        "--password: hunter2",
+    ] {
+        let out = redact(text);
+        assert!(!out.contains("hunter2") && !out.contains("value"), "{out}");
+    }
+}

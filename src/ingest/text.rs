@@ -155,7 +155,7 @@ static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 static CLI_ARG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"(?i)(--?[\w-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\s+)",
-        r#"("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s"'-][^\s]*)"#,
+        r#"("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s"'=:-][^\s]*)"#,
     ))
     .expect("valid regex")
 });

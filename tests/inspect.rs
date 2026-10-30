@@ -16,7 +16,7 @@ fn inspects_synthetic_messages_safely_and_reports_bad_records() {
         "{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic-id\"}}\n",
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}}\n",
         "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
-        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi \\u001b[31m sk-test-secret password = synthetic-password --password synthetic-private-value --api-key synthetic-private-key Authorization: Bearer synthetic-bearer\"}]}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi \\u001b[31m sk-test-secret password = synthetic-password --password synthetic-private-value --api-key synthetic-private-key --password = synthetic-spaced-secret Authorization: Bearer synthetic-bearer\"}]}}\n",
         "not json\n",
         "{\"type\":\"partial\"}"
     );
@@ -41,6 +41,7 @@ fn inspects_synthetic_messages_safely_and_reports_bad_records() {
     assert!(!stdout.contains("synthetic-bearer"));
     assert!(!stdout.contains("synthetic-private-value"));
     assert!(!stdout.contains("synthetic-private-key"));
+    assert!(!stdout.contains("synthetic-spaced-secret"));
     assert!(stderr.contains("Invalid"));
     assert!(stderr.contains("Incomplete"));
 }

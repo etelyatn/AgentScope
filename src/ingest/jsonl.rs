@@ -142,13 +142,11 @@ impl JsonlCursor {
     }
 
     fn check_rotation(&mut self) -> io::Result<()> {
+        // Sample the path first, then the held handle: a writer appending between the two
+        // samples can only make the handle look larger, never the path.
         let current = Stamp::of(&fs::metadata(&self.path)?);
-        // The held handle still describes the file we are reading; if the path no longer
-        // matches it (identity, length, or mtime), the path was replaced. This also catches
-        // Windows "tunneled" replacements that keep the old creation time.
         let held = Stamp::of(&self.reader.get_ref().metadata()?);
-        let rotated = current != held
-            || current.len < self.offset
+        let rotated = path_replaced(current, held, self.offset)
             || (current.len == self.stamp.len && current.modified != self.stamp.modified);
         if rotated {
             // Open first; commit stamp and handle together so a failed reopen is retried.
@@ -271,6 +269,16 @@ impl JsonlCursor {
     }
 }
 
+/// True if the path (sampled before `held`) no longer refers to the held file. Growth is
+/// not replacement; this also catches Windows "tunneled" replacements that keep the
+/// creation time but are larger than the file we hold.
+fn path_replaced(path: Stamp, held: Stamp, consumed: u64) -> bool {
+    path.key != held.key
+        || path.len < consumed
+        || path.len > held.len
+        || (path.len == held.len && path.modified != held.modified)
+}
+
 /// Parses complete lines from a window read at `read_from`. When `has_lead`, `data[0]` is
 /// the byte before the window proper. A short or empty buffer (the file was truncated
 /// while being read) yields no records rather than panicking.
@@ -322,7 +330,29 @@ fn tail_from_window(
 
 #[cfg(test)]
 mod tests {
-    use super::tail_from_window;
+    use super::{FileKey, Stamp, path_replaced, tail_from_window};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn append_between_samples_is_not_a_replacement() {
+        let key: FileKey = Default::default();
+        let t = SystemTime::UNIX_EPOCH;
+        let path = Stamp {
+            key,
+            len: 10,
+            modified: Some(t),
+        };
+        let held = Stamp {
+            key,
+            len: 15,
+            modified: Some(t + Duration::from_secs(1)),
+        };
+        assert!(!path_replaced(path, held, 10));
+        // A larger path than the held file is a replacement.
+        assert!(path_replaced(held, path, 10));
+        // Shrink below the consumed offset is a replacement.
+        assert!(path_replaced(path, held, 11));
+    }
 
     #[test]
     fn truncated_tail_window_returns_nothing_instead_of_panicking() {
