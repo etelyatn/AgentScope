@@ -942,3 +942,62 @@ fn rotation_charges_the_replacements_full_bytes() {
         "replacement's full bytes must exhaust the budget"
     );
 }
+
+#[test]
+fn cursorless_rewrite_reports_invalidated_but_append_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let target = dated(&root, "rollout-000.jsonl");
+    let body = |text: &str| {
+        [
+            session_meta("2026-10-29T10:00:00Z", "id0", "/p"),
+            user("2026-10-29T10:00:01Z", "question"),
+            assistant("2026-10-29T10:00:02Z", text),
+        ]
+    };
+    write_lines(&target, &body("first answer"));
+    set_modified(&target, 1_000);
+    for i in 1..40u64 {
+        let path = dated(&root, &format!("rollout-{i:03}.jsonl"));
+        write_lines(
+            &path,
+            &[session_meta(
+                "2026-10-29T10:00:00Z",
+                &format!("id{i}"),
+                "/p",
+            )],
+        );
+        set_modified(&path, 1_000 + i);
+    }
+    let mut s = scanner(&root);
+    scan_until_done(&mut s, BIG);
+    scan_until_done(&mut s, BIG);
+    assert_eq!(s.open_cursors(), 32, "the oldest rollout lost its cursor");
+
+    // Pure append: prefix intact, so nothing already readable changed.
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&target)
+        .unwrap();
+    use std::io::Write;
+    writeln!(f, "{}", assistant("2026-10-29T10:00:03Z", "more")).unwrap();
+    set_modified(&target, 1_000); // stays the oldest rollout, so no cursor
+    let appended = s.scan_roster(NOW, BIG).unwrap();
+    assert!(appended.invalidated.is_empty());
+
+    // Rewrite: same event count, different content, no cursor to notice.
+    write_lines(&target, &body("third answer!!"));
+    set_modified(&target, 1_000);
+    let mut invalidated = vec![];
+    loop {
+        let d = s.scan_roster(NOW, BIG).unwrap();
+        invalidated.extend(d.invalidated);
+        if d.scan.done {
+            break;
+        }
+    }
+    assert!(
+        invalidated.iter().any(|k| k.provider_session_id == "id0"),
+        "rewrite without a cursor must invalidate: {invalidated:?}"
+    );
+}

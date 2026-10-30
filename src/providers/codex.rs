@@ -768,7 +768,11 @@ impl CodexScanner {
         }
         if state.cursor.is_none() && state.reached_eof {
             // The cursor was dropped to bound open files; rebuild from the start.
+            // A pure append keeps the consumed prefix intact; a rewrite does not,
+            // and loaded pages built from the old bytes are then stale.
+            let rewritten = !state.source_intact();
             state.restart(source);
+            state.invalidated |= rewritten;
         } else {
             state.source = source;
         }
