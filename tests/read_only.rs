@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use agentscope::app::App;
+use agentscope::app::{App, Screen, SourceState};
 use agentscope::discovery::{discover_claude, discover_codex};
 use agentscope::domain::{Thresholds, WarningKind};
 use agentscope::providers::opencode::open_read_only;
@@ -18,9 +18,23 @@ use agentscope::worker::{WorkerHandle, WorkerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use support::world::*;
 
-type Meta = BTreeMap<PathBuf, (u64, std::time::SystemTime, bool)>;
+type Meta = BTreeMap<PathBuf, (u64, std::time::SystemTime, u32)>;
 
-/// (len, mtime, readonly) of every non-sidecar file.
+/// Unix: full mode bits (0644 -> 0600 is detected). Windows: only the read-only attribute;
+/// NTFS ACLs are not inspected, so permission verification there is partial.
+fn permission_bits(m: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(m.permissions().readonly())
+    }
+}
+
+/// (len, mtime, permission bits) of every non-sidecar file; permission bits of directories.
 fn metadata(world: &World) -> Meta {
     all_paths(world.dir.path())
         .into_iter()
@@ -30,12 +44,11 @@ fn metadata(world: &World) -> Meta {
         })
         .filter_map(|rel| {
             let m = fs::metadata(world.dir.path().join(&rel)).ok()?;
-            m.is_file().then(|| {
-                (
-                    rel,
-                    (m.len(), m.modified().unwrap(), m.permissions().readonly()),
-                )
-            })
+            if m.is_dir() {
+                // Directory mtimes legitimately move when a sidecar appears; permissions must not.
+                return Some((rel, (0, std::time::UNIX_EPOCH, permission_bits(&m))));
+            }
+            Some((rel, (m.len(), m.modified().unwrap(), permission_bits(&m))))
         })
         .collect()
 }
@@ -122,25 +135,55 @@ fn full_worker_and_tui_session_leaves_provider_data_unchanged() {
         ..RosterContext::default()
     };
     wait_for(&mut app, &mut ctx, &worker, |a| a.total_sessions() == 3);
-    // Open every session, expand, and request source records.
+    // Visit every session: open, expand, view its source record, then close the source
+    // overlay and the inspector, and confirm we are back on the roster before moving on.
+    // Start at the first row so `j` visits each session exactly once.
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+    let mut visited = Vec::new();
     for _ in 0..3 {
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let selected = app.selected_key().expect("a selected session");
+        assert!(
+            !visited.contains(&selected),
+            "each iteration is a new session"
+        );
+        visited.push(selected.clone());
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Inspector);
         flush_requests(&mut app, &worker);
         wait_for(&mut app, &mut ctx, &worker, |a| {
             a.transcript().is_some_and(|t| t.loaded())
         });
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
-        );
+        assert_eq!(app.transcript().unwrap().key(), &selected);
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Char('v')));
+        assert_eq!(app.screen, Screen::Source);
         flush_requests(&mut app, &worker);
-        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        wait_for(&mut app, &mut ctx, &worker, |a| {
+            a.source_view()
+                .is_some_and(|v| !matches!(v.state, SourceState::Loading))
+        });
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            app.screen,
+            Screen::Inspector,
+            "Esc closes the source overlay"
         );
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Roster, "second Esc returns to roster");
+        assert!(app.transcript().is_none());
+        assert_eq!(app.selected_key(), Some(selected));
+        handle_key(&mut app, key(KeyCode::Char('j')));
     }
+    let mut providers: Vec<_> = visited
+        .iter()
+        .map(|k| format!("{:?}", k.provider))
+        .collect();
+    providers.sort();
+    assert_eq!(providers, ["Claude", "Codex", "OpenCode"]);
     let _ = worker.tx.send(WorkerRequest::Refresh);
     assert!(worker.shutdown(), "worker exits cleanly");
 

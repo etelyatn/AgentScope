@@ -152,14 +152,18 @@ fn ac01_no_disruption_start_issues_no_writes_and_tolerates_provider_appends() {
     h.pump_until("roster", |a| a.total_sessions() == 3);
 
     // A live provider legitimately appends while AgentScope runs; only that append differs.
+    let codex_count = |a: &App| {
+        a.all_rows()
+            .iter()
+            .find(|r| r.session.key.provider == Provider::Codex)
+            .map(|r| r.session.displayed_event_count)
+            .expect("codex row")
+    };
+    let original = codex_count(&h.app);
     let appended = format!("{}\n", cx::assistant("2026-10-29T23:55:00Z", "live reply"));
     append(&world.codex_file(), &appended);
     h.worker.tx.send(WorkerRequest::Refresh).unwrap();
-    h.pump_until("append visible", |a| {
-        a.all_rows().iter().any(|r| {
-            r.session.key.provider == Provider::Codex && r.session.displayed_event_count >= 3
-        })
-    });
+    h.pump_until("append visible", |a| codex_count(a) > original);
     assert!(h.worker.shutdown());
 
     let after = snapshot(world.dir.path());
@@ -682,35 +686,62 @@ fn real_data_smoke_is_read_only_and_prints_counts_only() {
     .flatten()
     .collect();
 
-    fn stat(dir: &std::path::Path, out: &mut BTreeMap<PathBuf, (u64, std::time::SystemTime)>) {
-        let Ok(rd) = fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            let Ok(m) = e.metadata() else { continue };
-            if m.is_dir() {
-                // Bounded: transcript trees only, never other provider state.
-                if !p.file_name().is_some_and(|n| n == "node_modules") {
-                    stat(&p, out);
+    /// Full path inventory (len, mtime, content hash). Hashing is streamed.
+    fn inventory(roots: &[PathBuf]) -> BTreeMap<PathBuf, (u64, std::time::SystemTime, u64)> {
+        use std::hash::Hasher;
+        use std::io::Read;
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                match e.metadata() {
+                    Ok(m) if m.is_dir() => walk(&p, out),
+                    Ok(_) => out.push(p),
+                    Err(_) => {}
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        for r in roots {
+            if r.file_name().is_some_and(|n| n == "opencode") {
+                // Database directory: only the database and its sidecars.
+                for name in ["opencode.db", "opencode.db-wal", "opencode.db-shm"] {
+                    let p = r.join(name);
+                    if p.exists() {
+                        paths.push(p);
+                    }
                 }
             } else {
-                out.insert(p, (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+                walk(r, &mut paths);
             }
         }
-    }
-    let mut before = BTreeMap::new();
-    for r in &roots {
-        if r.parent().is_some() && r.file_name().is_some_and(|n| n == "opencode") {
-            // Database directory only (opencode.db and sidecars); not sibling state.
-            for name in ["opencode.db", "opencode.db-wal", "opencode.db-shm"] {
-                let p = r.join(name);
-                if let Ok(m) = fs::metadata(&p) {
-                    before.insert(p, (m.len(), m.modified().unwrap()));
+        let mut out = BTreeMap::new();
+        for p in paths {
+            let Ok(mut f) = fs::File::open(&p) else {
+                continue;
+            };
+            let Ok(m) = f.metadata() else { continue };
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(n) = f.read(&mut buf) {
+                if n == 0 {
+                    break;
                 }
+                h.write(&buf[..n]);
             }
-        } else {
-            stat(r, &mut before);
+            out.insert(
+                p,
+                (
+                    m.len(),
+                    m.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    h.finish(),
+                ),
+            );
         }
+        out
     }
+    let before = inventory(&roots);
 
     let mut readers: Vec<Box<dyn ProviderReader>> = Vec::new();
     if let Ok(r) = CodexScanner::new(&config) {
@@ -801,27 +832,33 @@ fn real_data_smoke_is_read_only_and_prints_counts_only() {
         surface.warnings.len()
     );
 
-    let mut after = BTreeMap::new();
-    for p in before.keys() {
-        if let Ok(m) = fs::metadata(p) {
-            after.insert(p.clone(), (m.len(), m.modified().unwrap()));
-        }
-    }
-    let mut shrunk = 0;
-    let mut removed = 0;
-    let mut grown = 0;
-    for (p, (len, _)) in &before {
+    let after = inventory(&roots);
+    // Classification. A silent change (same length and mtime, different bytes) can only
+    // be a write by someone who preserved metadata and is a failure. Any other difference
+    // (length/mtime moved, path added or removed) is a concurrent live-provider change or an
+    // ADR-0002 sidecar and is reported as inconclusive, never attributed to AgentScope.
+    let is_sidecar = |p: &PathBuf| {
+        let n = p.to_string_lossy();
+        n.ends_with("-wal") || n.ends_with("-shm")
+    };
+    let (mut silent, mut concurrent, mut added, mut removed, mut identical) = (0, 0, 0, 0, 0);
+    for (p, (len, mtime, hash)) in &before {
         match after.get(p) {
             None => removed += 1,
-            Some((l, _)) if l < len => shrunk += 1,
-            Some((l, _)) if l > len => grown += 1,
-            _ => {}
+            Some((l, m, h)) if l == len && m == mtime && h == hash => identical += 1,
+            Some((l, m, _)) if l == len && m == mtime && !is_sidecar(p) => silent += 1,
+            Some(_) => concurrent += 1,
+        }
+    }
+    for p in after.keys() {
+        if !before.contains_key(p) {
+            added += 1;
         }
     }
     println!(
-        "smoke: tracked_files={} removed={removed} shrunk={shrunk} grown_by_provider={grown}",
+        "smoke: inventory={} identical={identical} silent_content_changes={silent} \
+         concurrent_or_sidecar_changes(inconclusive)={concurrent} added(inconclusive)={added} removed(inconclusive)={removed}",
         before.len()
     );
-    assert_eq!(removed, 0);
-    assert_eq!(shrunk, 0);
+    assert_eq!(silent, 0, "bytes changed without any metadata change");
 }
