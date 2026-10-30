@@ -10,10 +10,13 @@
 
 use std::collections::HashSet;
 
-use crate::domain::{DiagnosticEntry, Event, PageAnchor, PageDirection, TranscriptPage};
+use crate::domain::{
+    DiagnosticEntry, Event, PageAnchor, PageDirection, SessionKey, SessionSummary, TranscriptPage,
+};
 use crate::worker::WorkerRequest;
 
-/// Most events kept loaded; farther pages are dropped (spec §10.3).
+/// Most events kept loaded; farther pages are dropped (spec §10.3). The worker
+/// also never requests a page larger than this.
 pub const MAX_LOADED_EVENTS: usize = 20_000;
 /// Distance from a window edge at which the next page is requested.
 const NEAR_EDGE: usize = 5;
@@ -29,6 +32,9 @@ pub enum PageKind {
     Newer,
     /// Backward from the tail (`G`/`End`). Replaces the window.
     Tail,
+    /// Re-read the loaded range after an in-place change, keeping the selected
+    /// event. Pages are staged and swapped in once the selection is reached.
+    Reload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,8 +60,18 @@ struct Chunk {
     diagnostics: Vec<DiagnosticEntry>,
 }
 
+/// A reload in progress: forward pages from the window start, not yet shown.
+struct Reload {
+    staged: Vec<Event>,
+    chunks: Vec<Chunk>,
+    /// Anchor to continue forward from.
+    anchor: Option<PageAnchor>,
+    /// The event to keep selected.
+    target: Option<String>,
+}
+
 pub struct Transcript {
-    key: crate::domain::SessionKey,
+    key: SessionKey,
     events: Vec<Event>,
     chunks: Vec<Chunk>,
     selected: usize,
@@ -64,15 +80,22 @@ pub struct Transcript {
     /// `Some` while newer events exist: the anchor to page forward from.
     newer: Option<PageAnchor>,
     pending: Option<Pending>,
+    reload: Option<Reload>,
+    /// The last load failed for good; `r` retries it.
+    failed: Option<PageKind>,
     expanded: HashSet<String>,
-    /// Displayed-event count at the moment the newest events were last loaded.
-    baseline: usize,
+    /// Events counted after the loaded newest end (`N new`).
+    new_events: usize,
+    /// In-flight count request and how many loaded events follow its anchor.
+    count_pending: Option<(u64, usize)>,
+    /// Summary at the last probe; a different summary triggers a new count.
+    probed: Option<SessionSummary>,
     /// True once any page has been applied.
     loaded: bool,
 }
 
 impl Transcript {
-    pub(super) fn new(key: crate::domain::SessionKey, baseline: usize) -> Self {
+    pub(super) fn new(key: SessionKey, probed: Option<SessionSummary>) -> Self {
         Self {
             key,
             events: Vec::new(),
@@ -81,13 +104,17 @@ impl Transcript {
             older: None,
             newer: None,
             pending: None,
+            reload: None,
+            failed: None,
             expanded: HashSet::new(),
-            baseline,
+            new_events: 0,
+            count_pending: None,
+            probed,
             loaded: false,
         }
     }
 
-    pub fn key(&self) -> &crate::domain::SessionKey {
+    pub fn key(&self) -> &SessionKey {
         &self.key
     }
 
@@ -132,14 +159,14 @@ impl Transcript {
         self.pending.map(|p| p.kind)
     }
 
-    /// Forget the load in flight (it failed for good), so a later action may retry.
-    pub(super) fn abort_pending(&mut self) {
-        self.pending = None;
+    /// The kind of load that failed for good, if any.
+    pub fn failed(&self) -> Option<PageKind> {
+        self.failed
     }
 
-    /// Events persisted since the newest events were last loaded.
-    pub fn new_events(&self, displayed_count: usize) -> usize {
-        displayed_count.saturating_sub(self.baseline)
+    /// Events persisted after the newest loaded event.
+    pub fn new_events(&self) -> usize {
+        self.new_events
     }
 
     /// Carry user-visible state (expansion) over to a replacement transcript.
@@ -147,11 +174,17 @@ impl Transcript {
         self.expanded = previous.expanded.clone();
     }
 
+    fn begin(&mut self, request_id: u64, kind: PageKind) {
+        self.pending = Some(Pending { request_id, kind });
+        self.failed = None;
+        self.count_pending = None;
+        if kind != PageKind::Reload {
+            self.reload = None;
+        }
+    }
+
     pub(super) fn select_request(&mut self, request_id: u64) -> WorkerRequest {
-        self.pending = Some(Pending {
-            request_id,
-            kind: PageKind::Initial,
-        });
+        self.begin(request_id, PageKind::Initial);
         WorkerRequest::Select {
             request_id,
             key: self.key.clone(),
@@ -160,10 +193,7 @@ impl Transcript {
 
     /// Request the newest page. A new request supersedes any load in flight.
     pub(super) fn tail_request(&mut self, request_id: u64) -> WorkerRequest {
-        self.pending = Some(Pending {
-            request_id,
-            kind: PageKind::Tail,
-        });
+        self.begin(request_id, PageKind::Tail);
         WorkerRequest::LoadPage {
             request_id,
             key: self.key.clone(),
@@ -172,11 +202,87 @@ impl Transcript {
         }
     }
 
-    /// The page to fetch next, if the selection is near a window edge and no
-    /// load is in flight.
-    pub(super) fn next_load(&mut self, request_id: u64) -> Option<WorkerRequest> {
-        if self.pending.is_some() || !self.loaded {
+    /// Re-read from the window start forward, keeping the selected event. The
+    /// window start is retained (it is the anchor event), so the request
+    /// continues from its anchor with nothing skipped or repeated. Returns
+    /// `None` before the first page has arrived.
+    pub(super) fn reload_request(&mut self, request_id: u64) -> Option<WorkerRequest> {
+        if !self.loaded {
             return None;
+        }
+        let (staged, chunks) = match (&self.older, self.events.first()) {
+            (Some(anchor), Some(first)) => (
+                vec![first.clone()],
+                vec![Chunk {
+                    len: 1,
+                    edge: Edge::First(anchor.clone()),
+                    diagnostics: Vec::new(),
+                }],
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        let anchor = self.older.clone();
+        self.reload = Some(Reload {
+            staged,
+            chunks,
+            anchor: anchor.clone(),
+            target: self.selected_event().map(|e| e.id.clone()),
+        });
+        self.begin(request_id, PageKind::Reload);
+        Some(self.forward_request(request_id, anchor))
+    }
+
+    fn forward_request(&self, request_id: u64, anchor: Option<PageAnchor>) -> WorkerRequest {
+        WorkerRequest::LoadPage {
+            request_id,
+            key: self.key.clone(),
+            anchor,
+            direction: PageDirection::Forward,
+        }
+    }
+
+    /// Retry the load that failed for good. `None` when nothing failed or a
+    /// load is already in flight.
+    pub(super) fn retry_request(&mut self, request_id: u64) -> Option<WorkerRequest> {
+        if self.pending.is_some() {
+            return None;
+        }
+        match self.failed? {
+            PageKind::Initial => Some(self.select_request(request_id)),
+            PageKind::Tail => Some(self.tail_request(request_id)),
+            PageKind::Reload => self.reload_request(request_id),
+            PageKind::Older | PageKind::Newer => {
+                // The edge load is re-requested by the next `next_load`.
+                self.failed = None;
+                None
+            }
+        }
+    }
+
+    /// A load or count request failed. Only the matching request is aborted;
+    /// a superseded request's failure is ignored.
+    pub(super) fn fail_request(&mut self, request_id: u64) {
+        if let Some(pending) = self.pending.filter(|p| p.request_id == request_id) {
+            self.pending = None;
+            self.failed = Some(pending.kind);
+            if pending.kind == PageKind::Reload {
+                self.reload = None;
+            }
+        }
+        if self.count_pending.is_some_and(|(id, _)| id == request_id) {
+            self.count_pending = None;
+        }
+    }
+
+    /// The page to fetch next, if a reload is mid-way, or the selection is near
+    /// a window edge, and no load is in flight.
+    pub(super) fn next_load(&mut self, request_id: u64) -> Option<WorkerRequest> {
+        if self.pending.is_some() || !self.loaded || self.failed.is_some() {
+            return None;
+        }
+        if let Some(anchor) = self.reload.as_ref().map(|r| r.anchor.clone()) {
+            self.begin(request_id, PageKind::Reload);
+            return Some(self.forward_request(request_id, anchor));
         }
         let (kind, anchor, direction) = if self.selected < NEAR_EDGE && self.older.is_some() {
             (PageKind::Older, self.older.clone(), PageDirection::Backward)
@@ -185,13 +291,70 @@ impl Transcript {
         } else {
             return None;
         };
-        self.pending = Some(Pending { request_id, kind });
+        self.begin(request_id, kind);
         Some(WorkerRequest::LoadPage {
             request_id,
             key: self.key.clone(),
             anchor,
             direction,
         })
+    }
+
+    /// Ask for the number of events after the newest loaded one when `summary`
+    /// differs from the last probe and the window ends at the tail.
+    pub(super) fn count_request(
+        &mut self,
+        request_id: u64,
+        summary: &SessionSummary,
+    ) -> Option<WorkerRequest> {
+        if !self.loaded
+            || self.pending.is_some()
+            || self.reload.is_some()
+            || self.newer.is_some()
+            || self.count_pending.is_some()
+            || self.probed.as_ref() == Some(summary)
+        {
+            return None;
+        }
+        if self.events.is_empty() {
+            // Nothing to anchor a count on: re-read from the start.
+            self.probed = Some(summary.clone());
+            return self.reload_request(request_id);
+        }
+        // Newest chunk with a known anchor, and how many loaded events follow it.
+        let mut start = 0;
+        let mut found = None;
+        for chunk in &self.chunks {
+            if chunk.len > 0 {
+                found = Some((chunk, start));
+            }
+            start += chunk.len;
+        }
+        let (chunk, chunk_start) = found?;
+        let (anchor, loaded_after) = match &chunk.edge {
+            Edge::Last(a) => (a.clone(), 0),
+            Edge::First(a) => (a.clone(), self.events.len() - chunk_start - 1),
+            Edge::Unknown => return None,
+        };
+        self.probed = Some(summary.clone());
+        self.count_pending = Some((request_id, loaded_after));
+        Some(WorkerRequest::CountAfter {
+            request_id,
+            key: self.key.clone(),
+            anchor,
+        })
+    }
+
+    /// Apply a count response. Stale responses are ignored.
+    pub(super) fn apply_count(&mut self, request_id: u64, count: usize) -> bool {
+        match self.count_pending {
+            Some((id, loaded_after)) if id == request_id => {
+                self.count_pending = None;
+                self.new_events = count.saturating_sub(loaded_after);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -222,18 +385,26 @@ impl Transcript {
         }
     }
 
+    /// The newest end was just (re)loaded: nothing is unread, and any count in
+    /// flight predates it.
+    fn newest_refreshed(&mut self) {
+        self.new_events = 0;
+        self.count_pending = None;
+    }
+
     /// Merge a page response. Returns `false` (and changes nothing) when the
     /// response does not answer the load in flight.
-    pub(super) fn apply_page(
-        &mut self,
-        request_id: u64,
-        page: TranscriptPage,
-        displayed_count: usize,
-    ) -> bool {
+    pub(super) fn apply_page(&mut self, request_id: u64, page: TranscriptPage) -> bool {
         let Some(pending) = self.pending.filter(|p| p.request_id == request_id) else {
             return false;
         };
         self.pending = None;
+        if page.events.len() > MAX_LOADED_EVENTS {
+            // Cannot be kept without losing the page's anchor; treat as failed.
+            self.fail_oversized(pending.kind);
+            return true;
+        }
+        self.failed = None;
         self.loaded = true;
         let continuation = if page.has_more {
             page.next.clone()
@@ -246,16 +417,23 @@ impl Transcript {
                 self.older = None;
                 self.newer = continuation;
                 self.selected = 0;
+                if self.newer.is_none() {
+                    self.newest_refreshed();
+                }
             }
             PageKind::Tail => {
                 self.replace(page, PageDirection::Backward);
                 self.older = continuation;
                 self.newer = None;
                 self.selected = self.events.len().saturating_sub(1);
+                self.newest_refreshed();
             }
             PageKind::Newer => {
                 self.append(page);
                 self.newer = continuation;
+                if self.newer.is_none() {
+                    self.newest_refreshed();
+                }
                 self.drop_front();
             }
             PageKind::Older => {
@@ -263,11 +441,55 @@ impl Transcript {
                 self.older = continuation;
                 self.drop_back();
             }
-        }
-        if self.newer.is_none() {
-            self.baseline = displayed_count;
+            PageKind::Reload => self.apply_reload(page, continuation),
         }
         true
+    }
+
+    fn fail_oversized(&mut self, kind: PageKind) {
+        self.failed = Some(kind);
+        if kind == PageKind::Reload {
+            self.reload = None;
+        }
+    }
+
+    fn apply_reload(&mut self, mut page: TranscriptPage, continuation: Option<PageAnchor>) {
+        let Some(mut reload) = self.reload.take() else {
+            return;
+        };
+        let known: HashSet<&str> = reload.staged.iter().map(|e| e.id.as_str()).collect();
+        page.events.retain(|e| !known.contains(e.id.as_str()));
+        reload.chunks.push(Chunk {
+            len: page.events.len(),
+            edge: edge_of(&page, PageDirection::Forward),
+            diagnostics: page.diagnostics,
+        });
+        reload.staged.extend(page.events);
+        let found = reload
+            .target
+            .as_ref()
+            .is_some_and(|t| reload.staged.iter().any(|e| &e.id == t));
+        if continuation.is_some() && !found && reload.staged.len() < MAX_LOADED_EVENTS {
+            reload.anchor = continuation;
+            self.reload = Some(reload);
+            return;
+        }
+        // The selection is reached (or gone): swap the refreshed window in.
+        let current = self.selected_event().map(|e| e.id.clone());
+        let at = |id: &Option<String>| {
+            id.as_ref()
+                .and_then(|id| reload.staged.iter().position(|e| &e.id == id))
+        };
+        self.selected = at(&current)
+            .or_else(|| at(&reload.target))
+            .unwrap_or(reload.staged.len().saturating_sub(1));
+        self.events = reload.staged;
+        self.chunks = reload.chunks;
+        self.newer = continuation;
+        if self.newer.is_none() {
+            self.newest_refreshed();
+        }
+        self.drop_front();
     }
 
     fn replace(&mut self, page: TranscriptPage, direction: PageDirection) {

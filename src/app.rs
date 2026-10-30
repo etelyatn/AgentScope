@@ -151,6 +151,7 @@ impl App {
         self.sessions = sessions;
         self.warnings = warnings;
         self.rebuild(previous);
+        self.probe_transcript();
     }
 
     /// Apply a worker roster publication. Returns `false` (and changes nothing)
@@ -328,8 +329,8 @@ impl App {
         self.screen = Screen::Roster;
     }
 
-    /// Reload the open transcript from its oldest page, keeping expansion.
-    /// Used when the session changed in place and when the worker is replaced.
+    /// Restart the open transcript from its oldest page, keeping expansion.
+    /// Used when the worker is replaced (its selection state is gone).
     pub fn restart_transcript(&mut self) {
         if let Some(old) = self.transcript.take() {
             let key = old.key().clone();
@@ -337,36 +338,57 @@ impl App {
         }
     }
 
-    /// The worker reported that `key` changed in place. This is not a new event.
+    /// The worker reported that `key` changed in place. Re-read the loaded
+    /// range and keep the selected event, so live activity never moves the
+    /// reading position. This is not a new event.
     pub fn invalidate_transcript(&mut self, key: &SessionKey) {
-        if self.transcript.as_ref().is_some_and(|t| t.key() == key) {
-            self.restart_transcript();
+        if self.transcript.as_ref().is_none_or(|t| t.key() != key) {
+            return;
+        }
+        let id = self.next_request_id();
+        let request = self.transcript.as_mut().and_then(|t| t.reload_request(id));
+        match request {
+            Some(request) => self.outbox.push(request),
+            // The first page has not arrived yet; ask for it again.
+            None => self.restart_transcript(),
         }
     }
 
     /// Merge a worker page response. Stale or unrequested responses are ignored.
     pub fn apply_transcript(&mut self, request_id: u64, page: TranscriptPage) -> bool {
-        let Some(count) = self
-            .transcript
-            .as_ref()
-            .map(|t| self.displayed_count(t.key()))
-        else {
-            return false;
-        };
         let applied = self
             .transcript
             .as_mut()
-            .is_some_and(|t| t.apply_page(request_id, page, count));
+            .is_some_and(|t| t.apply_page(request_id, page));
         if applied {
             self.pump_transcript();
         }
         applied
     }
 
-    /// The page load failed for good; allow the user to trigger it again.
-    pub fn transcript_load_failed(&mut self) {
+    /// Apply a worker count of events after the newest loaded one.
+    pub fn apply_events_after(&mut self, request_id: u64, count: usize) -> bool {
+        self.transcript
+            .as_mut()
+            .is_some_and(|t| t.apply_count(request_id, count))
+    }
+
+    /// A page or count request failed for good. Only the matching in-flight
+    /// request is aborted; failures of superseded requests are ignored.
+    pub fn transcript_load_failed(&mut self, request_id: u64) {
         if let Some(t) = &mut self.transcript {
-            t.abort_pending();
+            t.fail_request(request_id);
+        }
+    }
+
+    /// `r` in the inspector: retry a failed load.
+    pub fn retry_transcript(&mut self) {
+        let id = self.request_seq + 1;
+        if let Some(t) = &mut self.transcript
+            && let Some(request) = t.retry_request(id)
+        {
+            self.request_seq = id;
+            self.outbox.push(request);
         }
     }
 
@@ -385,25 +407,14 @@ impl App {
         self.pump_transcript();
     }
 
-    /// `G`/`End`: jump to the newest event, loading the tail page when the
-    /// window does not already end at it.
+    /// `G`/`End`: always reload the newest page from the tail. Content can
+    /// change without the row count growing (a paired tool result), so the
+    /// window is never assumed current.
     pub fn inspector_last(&mut self) {
-        let Some(t) = &self.transcript else {
-            return;
-        };
-        let current =
-            !t.has_newer() && t.loaded() && t.new_events(self.displayed_count(t.key())) == 0;
-        if current {
-            if let Some(t) = &mut self.transcript {
-                t.select_last();
-            }
-            self.pump_transcript();
-        } else {
-            let id = self.next_request_id();
-            if let Some(t) = &mut self.transcript {
-                let request = t.tail_request(id);
-                self.outbox.push(request);
-            }
+        let id = self.next_request_id();
+        if let Some(t) = &mut self.transcript {
+            let request = t.tail_request(id);
+            self.outbox.push(request);
         }
     }
 
@@ -413,18 +424,9 @@ impl App {
         }
     }
 
-    /// Events persisted since the newest page was loaded (`N new`).
+    /// Events persisted after the newest loaded one (`N new`).
     pub fn new_event_count(&self) -> usize {
-        self.transcript
-            .as_ref()
-            .map_or(0, |t| t.new_events(self.displayed_count(t.key())))
-    }
-
-    fn displayed_count(&self, key: &SessionKey) -> usize {
-        self.sessions
-            .iter()
-            .find(|s| &s.key == key)
-            .map_or(0, |s| s.displayed_event_count)
+        self.transcript.as_ref().map_or(0, Transcript::new_events)
     }
 
     fn next_request_id(&mut self) -> u64 {
@@ -434,7 +436,8 @@ impl App {
 
     fn start_transcript(&mut self, key: SessionKey, previous: Option<Transcript>) {
         let id = self.next_request_id();
-        let mut transcript = Transcript::new(key.clone(), self.displayed_count(&key));
+        let summary = self.sessions.iter().find(|s| s.key == key).cloned();
+        let mut transcript = Transcript::new(key, summary);
         if let Some(previous) = &previous {
             transcript.carry_over(previous);
         }
@@ -448,6 +451,25 @@ impl App {
         let id = self.request_seq + 1;
         if let Some(t) = &mut self.transcript
             && let Some(request) = t.next_load(id)
+        {
+            self.request_seq = id;
+            self.outbox.push(request);
+        }
+    }
+
+    /// When the open session's summary changed, ask the worker how many events
+    /// follow the newest loaded one. Counting goes through the adapter's
+    /// `count_events_after`, so it works for every provider.
+    fn probe_transcript(&mut self) {
+        let Some(key) = self.transcript.as_ref().map(|t| t.key().clone()) else {
+            return;
+        };
+        let Some(summary) = self.sessions.iter().find(|s| s.key == key).cloned() else {
+            return;
+        };
+        let id = self.request_seq + 1;
+        if let Some(t) = &mut self.transcript
+            && let Some(request) = t.count_request(id, &summary)
         {
             self.request_seq = id;
             self.outbox.push(request);

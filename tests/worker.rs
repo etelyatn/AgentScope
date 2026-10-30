@@ -19,6 +19,8 @@ struct Script {
     refresh_calls: usize,
     page_calls: usize,
     page_requests: Vec<(Option<PageAnchor>, PageDirection)>,
+    page_max_events: Vec<usize>,
+    count: usize,
     endless: bool,
 }
 
@@ -139,7 +141,7 @@ impl ProviderReader for Fake {
         _key: &SessionKey,
         anchor: Option<PageAnchor>,
         direction: PageDirection,
-        _request: PageRequest,
+        request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
         if let Some((entered, gate)) = &self.page_gate {
             let _ = entered.send(());
@@ -148,6 +150,7 @@ impl ProviderReader for Fake {
         let mut s = self.script.lock().unwrap();
         s.page_calls += 1;
         s.page_requests.push((anchor, direction));
+        s.page_max_events.push(request.max_events);
         s.pages.pop_front().unwrap_or_else(|| Ok(empty_page()))
     }
     fn count_events_after(
@@ -155,7 +158,7 @@ impl ProviderReader for Fake {
         _key: &SessionKey,
         _anchor: &PageAnchor,
     ) -> Result<usize, ProviderError> {
-        Ok(0)
+        Ok(self.script.lock().unwrap().count)
     }
     fn source_record(&mut self, _locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
         Ok(SourceRecord {
@@ -673,5 +676,79 @@ fn requests_are_serviced_at_provider_boundaries() {
     );
     gate_b.send(()).unwrap();
     until(&h, finished(1));
+    assert!(h.shutdown());
+}
+
+fn select(h: &WorkerHandle, id: u64, k: &SessionKey) {
+    h.tx.send(WorkerRequest::Select {
+        request_id: id,
+        key: k.clone(),
+    })
+    .unwrap();
+}
+
+fn anchor(n: u64) -> PageAnchor {
+    PageAnchor {
+        timestamp: Some(n as i64),
+        source_order: n,
+        stable_id: format!("e{n}"),
+    }
+}
+
+#[test]
+fn count_after_is_answered_with_the_adapter_count() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    script.lock().unwrap().count = 7;
+    let h = spawn(fake(Provider::Codex, &script));
+    let k = key(Provider::Codex, "a");
+    select(&h, 1, &k);
+    until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    h.tx.send(WorkerRequest::CountAfter {
+        request_id: 2,
+        key: k,
+        anchor: anchor(3),
+    })
+    .unwrap();
+    let events = until(&h, |e| matches!(e, WorkerEvent::EventsAfter { .. }));
+    assert!(matches!(
+        events.last(),
+        Some(WorkerEvent::EventsAfter {
+            request_id: 2,
+            count: 7
+        })
+    ));
+    assert!(h.shutdown());
+}
+
+#[test]
+fn page_failures_carry_the_request_id() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    script
+        .lock()
+        .unwrap()
+        .pages
+        .push_back(Err(ProviderError::Parse("bad".into())));
+    let h = spawn(fake(Provider::Codex, &script));
+    select(&h, 5, &key(Provider::Codex, "a"));
+    let events = until(&h, |e| matches!(e, WorkerEvent::LoadFailed { .. }));
+    assert!(matches!(
+        events.last(),
+        Some(WorkerEvent::LoadFailed { request_id: 5 })
+    ));
+    assert!(h.shutdown());
+}
+
+#[test]
+fn requested_page_size_never_exceeds_the_ui_window() {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let mut c = config();
+    c.max_page_events = 1_000_000;
+    let h = WorkerHandle::spawn(vec![Box::new(fake(Provider::Codex, &script))], c);
+    select(&h, 1, &key(Provider::Codex, "a"));
+    until(&h, |e| matches!(e, WorkerEvent::Transcript { .. }));
+    assert_eq!(
+        script.lock().unwrap().page_max_events,
+        vec![agentscope::app::MAX_LOADED_EVENTS]
+    );
     assert!(h.shutdown());
 }

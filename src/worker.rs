@@ -61,6 +61,12 @@ pub enum WorkerRequest {
         anchor: Option<PageAnchor>,
         direction: PageDirection,
     },
+    /// Count events after `anchor` (new-event counting, spec §10.3).
+    CountAfter {
+        request_id: u64,
+        key: SessionKey,
+        anchor: PageAnchor,
+    },
     LoadSource {
         request_id: u64,
         locator: SourceLocator,
@@ -88,6 +94,16 @@ pub enum WorkerEvent {
     Source {
         request_id: u64,
         record: SourceRecord,
+    },
+    /// Number of events after the anchor of a `CountAfter` request.
+    EventsAfter {
+        request_id: u64,
+        count: usize,
+    },
+    /// A page or count request failed for good. Carries the request identity so
+    /// only the matching in-flight request is aborted.
+    LoadFailed {
+        request_id: u64,
     },
     Processes {
         snapshot: ProcessSnapshot,
@@ -190,6 +206,11 @@ enum LoadKind {
     Source {
         request_id: u64,
         locator: SourceLocator,
+    },
+    Count {
+        request_id: u64,
+        key: SessionKey,
+        anchor: PageAnchor,
     },
 }
 
@@ -395,6 +416,20 @@ impl Worker {
                     direction,
                 });
             }
+            WorkerRequest::CountAfter {
+                request_id,
+                key,
+                anchor,
+            } => {
+                if self.page_is_stale(request_id, &key) {
+                    return;
+                }
+                self.push_load(LoadKind::Count {
+                    request_id,
+                    key,
+                    anchor,
+                });
+            }
             WorkerRequest::LoadSource {
                 request_id,
                 locator,
@@ -465,7 +500,11 @@ impl Worker {
                     return None;
                 }
                 let request = PageRequest {
-                    max_events: self.config.max_page_events,
+                    // A replacement page must fit the UI window (spec §10.3).
+                    max_events: self
+                        .config
+                        .max_page_events
+                        .min(crate::app::MAX_LOADED_EVENTS),
                     max_bytes: self.config.max_page_bytes,
                 };
                 let result = match self.reader_index(key.provider) {
@@ -496,6 +535,42 @@ impl Worker {
                     Err(err) => {
                         let warning = failure_warning(key.provider, "transcript", &err);
                         self.emit(WorkerEvent::Warning { warning });
+                        self.emit(WorkerEvent::LoadFailed { request_id });
+                        None
+                    }
+                }
+            }
+            LoadKind::Count {
+                request_id,
+                key,
+                anchor,
+            } => {
+                if self.page_is_stale(request_id, &key) {
+                    return None;
+                }
+                let result = match self.reader_index(key.provider) {
+                    Some(i) => guard(|| self.readers[i].count_events_after(&key, &anchor)),
+                    None => Err(ProviderError::Unsupported("no adapter for provider".into())),
+                };
+                self.drain_requests();
+                if self.shutting_down || self.page_is_stale(request_id, &key) {
+                    return None;
+                }
+                match result {
+                    Ok(count) => {
+                        self.emit(WorkerEvent::EventsAfter { request_id, count });
+                        None
+                    }
+                    Err(ProviderError::Unavailable(_)) => Some(PendingLoad {
+                        kind: LoadKind::Count {
+                            request_id,
+                            key,
+                            anchor,
+                        },
+                        retry_at: Some(Instant::now() + RETRY_DELAY),
+                    }),
+                    Err(_) => {
+                        self.emit(WorkerEvent::LoadFailed { request_id });
                         None
                     }
                 }

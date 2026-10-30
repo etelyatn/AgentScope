@@ -175,7 +175,10 @@ fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Char('G') | KeyCode::End => app.inspector_last(),
         KeyCode::Enter => app.inspector_toggle(),
         KeyCode::Esc | KeyCode::Backspace => app.close_inspector(),
-        KeyCode::Char('r') => return KeyAction::Refresh,
+        KeyCode::Char('r') => {
+            app.retry_transcript();
+            return KeyAction::Refresh;
+        }
         _ => {}
     }
     KeyAction::None
@@ -201,11 +204,10 @@ fn drain_worker(app: &mut App, ctx: &mut RosterContext, worker: &WorkerHandle) -
             }) => {
                 app.apply_roster_generation(generation, sessions, warnings, scan);
             }
-            Ok(WorkerEvent::Warning { warning }) => {
-                if warning.key.source == "transcript" {
-                    app.transcript_load_failed();
-                }
-                app.apply_warning(warning);
+            Ok(WorkerEvent::Warning { warning }) => app.apply_warning(warning),
+            Ok(WorkerEvent::LoadFailed { request_id }) => app.transcript_load_failed(request_id),
+            Ok(WorkerEvent::EventsAfter { request_id, count }) => {
+                app.apply_events_after(request_id, count);
             }
             Ok(WorkerEvent::RefreshFinished { .. }) => ctx.last_refresh = Some(clock_label()),
             Ok(WorkerEvent::Transcript { request_id, page }) => {

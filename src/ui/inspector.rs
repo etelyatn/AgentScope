@@ -229,7 +229,11 @@ fn status_line(app: &App, transcript: &Transcript) -> String {
         Some(PageKind::Older) => parts.push("Loading older…".into()),
         Some(PageKind::Newer) => parts.push("Loading newer…".into()),
         Some(PageKind::Initial | PageKind::Tail) => parts.push("Loading…".into()),
+        Some(PageKind::Reload) => parts.push("Refreshing…".into()),
         None => {}
+    }
+    if transcript.failed().is_some() {
+        parts.push("Load failed — r retries".into());
     }
     let new = app.new_event_count();
     if new > 0 {
@@ -254,7 +258,9 @@ fn status_line(app: &App, transcript: &Transcript) -> String {
 fn render_timeline(frame: &mut Frame, transcript: &Transcript, body: Rect, palette: Palette) {
     let events = transcript.events();
     if events.is_empty() {
-        let text = if transcript.loaded() {
+        let text = if transcript.failed().is_some() {
+            "Could not load this transcript. Press r to retry."
+        } else if transcript.loaded() {
             "No events in this transcript."
         } else {
             "Loading…"
@@ -288,7 +294,10 @@ fn render_timeline(frame: &mut Frame, transcript: &Transcript, body: Rect, palet
             }
         }
         match selected_end {
+            // Advance while the selection is cut off, or not reached at all
+            // because rows above it (expanded) fill the viewport.
             Some(end) if end > height && start < selected => start += 1,
+            None if start < selected => start += 1,
             _ => break lines,
         }
     };

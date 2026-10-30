@@ -333,10 +333,8 @@ fn loads_forward_and_backward_pages_without_duplicates() {
     assert!(app.take_requests().is_empty());
     assert!(!app.transcript().unwrap().has_newer());
 
-    // `G` with more events than loaded asks for the tail, Backward from none.
-    // Fifteen events arrived since the window was loaded.
-    let grown = summary(25);
-    app.apply_roster(vec![grown], vec![]);
+    // `G` always reloads the tail, Backward from none, even when the window
+    // already ends there: content can change without the row count growing.
     app.inspector_last();
     let (tail_id, tail_anchor, direction) = load_page(&app.take_requests());
     assert_eq!((tail_anchor, direction), (None, PageDirection::Backward));
@@ -417,6 +415,22 @@ fn new_events_are_counted_without_scrolling_or_loading() {
     assert_eq!(app.new_event_count(), 0);
 
     app.apply_roster(vec![summary(6)], vec![]);
+    // The count goes through the worker (`count_events_after`), anchored on
+    // the newest loaded event.
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::CountAfter {
+            request_id,
+            anchor: a,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert_eq!(a, &anchor(2));
+    assert!(!app.apply_events_after(request_id + 9, 3), "stale response");
+    assert!(app.apply_events_after(*request_id, 3));
     assert_eq!(app.new_event_count(), 3);
     assert_eq!(app.transcript().unwrap().selected(), 1, "no auto-scroll");
     assert_eq!(ids(&app).len(), 3, "no auto-load");
@@ -424,12 +438,219 @@ fn new_events_are_counted_without_scrolling_or_loading() {
     let out = draw(&app, 110, 30);
     assert!(out.contains("3 new"), "{out}");
 
-    // An in-place change reloads from the start, and is not a new event.
+    // An in-place change is a reload, not a new event.
     app.invalidate_transcript(&key());
     assert!(matches!(
         app.take_requests().as_slice(),
-        [WorkerRequest::Select { .. }]
+        [WorkerRequest::LoadPage {
+            direction: PageDirection::Forward,
+            anchor: None,
+            ..
+        }]
     ));
+    assert_eq!(app.new_event_count(), 3);
+}
+
+#[test]
+fn counts_after_a_backward_page_exclude_the_loaded_tail() {
+    let mut app = app_with(summary(60));
+    open(&mut app, forward_page(0..1, false));
+    app.inspector_last();
+    let (id, _, _) = load_page(&app.take_requests());
+    // Tail page 20..60: its anchor is the first event, so 39 loaded events
+    // follow it and a count of 42 means 3 are new.
+    assert!(app.apply_transcript(id, backward_page(20..60, true)));
+    app.apply_roster(vec![summary(63)], vec![]);
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::CountAfter {
+            request_id,
+            anchor: a,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert_eq!(a, &anchor(20));
+    assert!(app.apply_events_after(*request_id, 42));
+    assert_eq!(app.new_event_count(), 3);
+}
+
+#[test]
+fn loading_older_history_keeps_the_unread_count() {
+    let mut app = app_with(summary(60));
+    open(&mut app, forward_page(0..1, false));
+    app.inspector_last();
+    let (id, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(id, backward_page(20..60, true)));
+    app.apply_roster(vec![summary(63)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 42));
+    assert_eq!(app.new_event_count(), 3);
+
+    app.inspector_move(isize::MIN);
+    let (older_id, _, direction) = load_page(&app.take_requests());
+    assert_eq!(direction, PageDirection::Backward);
+    assert!(app.apply_transcript(older_id, backward_page(0..20, false)));
+    assert_eq!(
+        app.new_event_count(),
+        3,
+        "older pages do not refresh the tail"
+    );
+    assert!(draw(&app, 110, 30).contains("3 new"));
+
+    // Reloading the newest end does clear it.
+    app.inspector_last();
+    let (tail_id, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(tail_id, backward_page(23..63, true)));
+    assert_eq!(app.new_event_count(), 0);
+}
+
+#[test]
+fn invalidation_reloads_the_loaded_range_and_keeps_the_selected_event() {
+    let mut app = app_with(summary(160));
+    open(&mut app, forward_page(0..1, false));
+    app.inspector_last();
+    let (id, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(id, backward_page(100..160, true)));
+    app.inspector_move(-29); // e130
+    assert!(app.take_requests().is_empty());
+    assert_eq!(
+        app.transcript().unwrap().selected_event().unwrap().id,
+        "e130"
+    );
+
+    app.invalidate_transcript(&key());
+    let (rid, from, direction) = load_page(&app.take_requests());
+    assert_eq!(
+        (from, direction),
+        (Some(anchor(100)), PageDirection::Forward)
+    );
+    // The first page stops short of the selection: the old window stays on
+    // screen and the next page is requested.
+    assert!(app.apply_transcript(rid, forward_page(101..111, true)));
+    assert_eq!(ids(&app).len(), 60, "old window shown until the swap");
+    let (rid, from, _) = load_page(&app.take_requests());
+    assert_eq!(from, Some(anchor(110)));
+    assert!(app.apply_transcript(rid, forward_page(111..161, false)));
+
+    let t = app.transcript().unwrap();
+    assert_eq!(t.selected_event().unwrap().id, "e130");
+    let loaded = ids(&app);
+    assert_eq!(loaded.first().unwrap(), "e100");
+    assert_eq!(loaded.last().unwrap(), "e160");
+    let unique: HashSet<_> = loaded.iter().collect();
+    assert_eq!(unique.len(), loaded.len());
+    assert!(t.has_older() && !t.has_newer());
+}
+
+#[test]
+fn g_reloads_the_tail_even_when_the_row_count_is_unchanged() {
+    let mut app = app_with(summary(3));
+    open(&mut app, forward_page(0..3, false));
+    app.inspector_last();
+    let (_, anchor_sent, direction) = load_page(&app.take_requests());
+    assert_eq!((anchor_sent, direction), (None, PageDirection::Backward));
+}
+
+#[test]
+fn keeps_the_selected_row_visible_when_expanded_rows_fill_the_viewport() {
+    let mut app = app_with(summary(5));
+    let long: String = (0..8).map(|i| format!("line {i}\n")).collect();
+    let events: Vec<Event> = (0..4)
+        .map(|i| event(i, EventKind::AssistantMessage, &format!("{long}tail {i}")))
+        .chain([event(4, EventKind::UserPrompt, "SELECTED-ROW")])
+        .collect();
+    open(&mut app, page(events, None, false));
+    for _ in 0..4 {
+        app.inspector_toggle();
+        app.inspector_move(1);
+    }
+    assert_eq!(app.transcript().unwrap().selected(), 4);
+    let out = draw(&app, 80, 20);
+    assert!(out.contains("> "), "{out}");
+    assert!(out.contains("SELECTED-ROW"), "{out}");
+}
+
+#[test]
+fn a_failed_initial_load_is_shown_and_retried() {
+    let mut app = app_with(summary(1));
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    app.transcript_load_failed(*request_id);
+    let out = draw(&app, 110, 30);
+    assert!(!out.contains("Loading…"), "{out}");
+    assert!(out.contains("Could not load this transcript"), "{out}");
+    assert!(out.contains("r retries"), "{out}");
+
+    app.retry_transcript();
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::Select {
+            request_id: retry, ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected a new Select, got {requests:?}");
+    };
+    assert_ne!(retry, request_id);
+    assert!(app.apply_transcript(*retry, page(vec![msg(0)], None, false)));
+    let out = draw(&app, 110, 30);
+    assert!(out.contains("message 0"), "{out}");
+    assert!(!out.contains("r retries"), "{out}");
+}
+
+#[test]
+fn a_superseded_load_failure_does_not_abort_the_current_request() {
+    let mut app = app_with(summary(20));
+    open(&mut app, forward_page(0..5, true));
+    let (newer_id, _, _) = load_page(&app.take_requests());
+    app.inspector_last(); // supersedes the newer-page load
+    let (tail_id, _, _) = load_page(&app.take_requests());
+    assert_ne!(newer_id, tail_id);
+
+    app.transcript_load_failed(newer_id);
+    assert!(app.transcript().unwrap().failed().is_none());
+    assert!(app.transcript().unwrap().loading().is_some());
+    assert!(app.apply_transcript(tail_id, backward_page(15..20, false)));
+    assert_eq!(ids(&app).len(), 5);
+
+    // A failure for the request that is current does abort it.
+    app.inspector_last();
+    let (current, _, _) = load_page(&app.take_requests());
+    app.transcript_load_failed(current);
+    assert!(app.transcript().unwrap().failed().is_some());
+}
+
+#[test]
+fn a_replacement_page_larger_than_the_window_is_rejected() {
+    let mut app = app_with(summary(1));
+    assert!(app.open_inspector());
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    let big = forward_page(0..(MAX_LOADED_EVENTS as u64 + 1), true);
+    assert!(app.apply_transcript(*request_id, big));
+    assert!(ids(&app).is_empty());
+    assert!(app.transcript().unwrap().failed().is_some());
+    // A page of exactly the cap fits and keeps its continuation anchor.
+    app.retry_transcript();
+    let requests = app.take_requests();
+    let [WorkerRequest::Select { request_id, .. }] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    let full = forward_page(0..MAX_LOADED_EVENTS as u64, true);
+    assert!(app.apply_transcript(*request_id, full));
+    assert_eq!(ids(&app).len(), MAX_LOADED_EVENTS);
+    assert!(app.transcript().unwrap().has_newer());
 }
 
 #[test]
