@@ -12,7 +12,9 @@ use crate::ingest::text::display_safe;
 use crate::time::relative_label;
 
 use super::RosterContext;
-use super::widgets::{Palette, fit, process_text, provider_name, status_text, tokens_text};
+use super::widgets::{
+    Palette, fit, process_text, provider_name, search_prompt, status_text, tokens_text,
+};
 
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 20;
@@ -120,13 +122,18 @@ pub fn render_roster(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         )),
         table_head,
     );
+    let (footer_text, footer_style) = match app.search_input() {
+        Some((_, text)) => (search_prompt(&display_safe(text)), palette.title()),
+        None => (
+            "Enter inspect  / search  f filter  s sort  r refresh  p procs  ? help  q quit"
+                .to_string(),
+            palette.dim(),
+        ),
+    };
     frame.render_widget(
         Paragraph::new(Line::styled(
-            fit(
-                "j/k move  Enter open  s sort  S reverse  r refresh  q quit",
-                area.width as usize,
-            ),
-            palette.dim(),
+            fit(&footer_text, area.width as usize),
+            footer_style,
         )),
         footer,
     );

@@ -16,6 +16,8 @@ use crate::domain::{
 };
 use crate::worker::WorkerRequest;
 
+use super::search::TranscriptSearch;
+
 /// Most events kept loaded; farther pages are dropped (spec §10.3). The worker
 /// also never requests a page larger than this.
 pub const MAX_LOADED_EVENTS: usize = 20_000;
@@ -121,6 +123,7 @@ pub struct Transcript {
     probed: Option<SessionSummary>,
     /// True once any page has been applied.
     loaded: bool,
+    search: TranscriptSearch,
 }
 
 impl Transcript {
@@ -145,6 +148,7 @@ impl Transcript {
             reload_capped: false,
             probed,
             loaded: false,
+            search: TranscriptSearch::default(),
         }
     }
 
@@ -233,6 +237,58 @@ impl Transcript {
     /// Carry user-visible state (expansion) over to a replacement transcript.
     pub(super) fn carry_over(&mut self, previous: &Transcript) {
         self.expanded = previous.expanded.clone();
+        self.search.set_query(previous.search.query());
+    }
+
+    /// The active transcript search query (empty when none).
+    pub fn search_query(&self) -> &str {
+        self.search.query()
+    }
+
+    pub(super) fn set_search_query(&mut self, query: &str) {
+        self.search.set_query(query);
+    }
+
+    /// Loaded events matching the search (spec §10.4: loaded events only).
+    pub fn match_count(&self) -> usize {
+        self.search.matches(&self.events).len()
+    }
+
+    pub fn is_match(&self, index: usize) -> bool {
+        self.search
+            .matches(&self.events)
+            .binary_search(&index)
+            .is_ok()
+    }
+
+    /// Zero-based rank of the selected event among the matches, if it is one.
+    pub fn match_position(&self) -> Option<usize> {
+        self.search
+            .matches(&self.events)
+            .binary_search(&self.selected)
+            .ok()
+    }
+
+    /// The match nearest `from` in the given direction, wrapping around.
+    /// `inclusive` lets `from` itself match.
+    pub(super) fn match_from(&self, from: usize, forward: bool, inclusive: bool) -> Option<usize> {
+        let matches = self.search.matches(&self.events);
+        if forward {
+            let at = matches.partition_point(|&m| if inclusive { m < from } else { m <= from });
+            matches.get(at).or_else(|| matches.first()).copied()
+        } else {
+            let at = matches.partition_point(|&m| if inclusive { m <= from } else { m < from });
+            at.checked_sub(1)
+                .and_then(|i| matches.get(i))
+                .or_else(|| matches.last())
+                .copied()
+        }
+    }
+
+    pub(super) fn select_index(&mut self, index: usize) {
+        if !self.events.is_empty() {
+            self.selected = index.min(self.events.len() - 1);
+        }
     }
 
     fn begin(&mut self, request_id: u64, kind: PageKind) {
@@ -501,6 +557,7 @@ impl Transcript {
             return false;
         };
         self.pending = None;
+        self.search.invalidate();
         if page.events.len() > MAX_LOADED_EVENTS {
             // Cannot be kept without losing the page's anchor; treat as failed.
             self.fail_oversized(pending.kind);

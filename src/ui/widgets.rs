@@ -7,6 +7,22 @@ use crate::domain::{ProcessAssociation, Provider, StatusLabel};
 
 pub const ELLIPSIS: char = '…';
 
+/// Longest tail of the search text shown in the prompt.
+const PROMPT_TAIL: usize = 40;
+
+/// The footer line while a search is edited. Long text keeps its end (the
+/// part being typed) visible. Input must already be display-safe.
+pub fn search_prompt(text: &str) -> String {
+    let count = text.chars().count();
+    let shown: String = if count > PROMPT_TAIL {
+        let tail: String = text.chars().skip(count - PROMPT_TAIL).collect();
+        format!("{ELLIPSIS}{tail}")
+    } else {
+        text.to_string()
+    };
+    format!("Search: {shown}_   Enter keep  Esc cancel  Ctrl+u clear")
+}
+
 /// Fit `text` into exactly `width` columns: truncate with a visible marker or
 /// pad with spaces. Input must already be display-safe.
 pub fn fit(text: &str, width: usize) -> String {

@@ -16,7 +16,7 @@ use crate::time::format_local;
 
 use super::RosterContext;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
-use super::widgets::{Palette, fit, provider_name, status_text, tokens_text};
+use super::widgets::{Palette, fit, provider_name, search_prompt, status_text, tokens_text};
 
 const MARKER_W: usize = 2;
 const TIME_W: usize = 5;
@@ -69,14 +69,16 @@ pub fn render_inspector(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         )),
         status,
     );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            fit(
-                "j/k move  Enter expand  g oldest  G newest  Esc back  q quit  d details  v source  D diagnostics",
-                width,
-            ),
+    let (footer_text, footer_style) = match app.search_input() {
+        Some((_, text)) => (search_prompt(&display_safe(text)), palette.title()),
+        None => (
+            "j/k move  Enter expand  / search  n/N match  d details  Esc back  ? help  q quit"
+                .to_string(),
             palette.dim(),
-        )),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(fit(&footer_text, width), footer_style)),
         footer,
     );
 }
@@ -208,7 +210,7 @@ fn server_tools_text(s: &SessionSummary) -> String {
     }
 }
 
-fn process_line(process: &ProcessAssociation) -> String {
+pub(super) fn process_line(process: &ProcessAssociation) -> String {
     match process {
         ProcessAssociation::Matched { pid, .. } => format!("matched — PID {pid}"),
         ProcessAssociation::Candidates { count } => {
@@ -225,6 +227,17 @@ fn process_line(process: &ProcessAssociation) -> String {
 
 fn status_line(app: &App, transcript: &Transcript) -> String {
     let mut parts: Vec<String> = Vec::new();
+    if !transcript.search_query().trim().is_empty() {
+        parts.push(match transcript.match_count() {
+            0 => "no matches (loaded events)".to_string(),
+            n => format!(
+                "match {}/{n} (loaded events)",
+                transcript
+                    .match_position()
+                    .map_or_else(|| "-".to_string(), |p| (p + 1).to_string())
+            ),
+        });
+    }
     match transcript.loading() {
         Some(PageKind::Older) => parts.push("Loading older…".into()),
         Some(PageKind::Newer) => parts.push("Loading newer…".into()),
@@ -290,6 +303,7 @@ fn render_timeline(frame: &mut Frame, transcript: &Transcript, body: Rect, palet
                 event,
                 transcript.is_expanded(event),
                 i == selected,
+                transcript.is_match(i),
                 width,
                 palette,
             ));
@@ -372,6 +386,7 @@ fn event_lines(
     event: &Event,
     expanded: bool,
     selected: bool,
+    matched: bool,
     width: usize,
     palette: Palette,
 ) -> Vec<Line<'static>> {
@@ -384,7 +399,11 @@ fn event_lines(
     let body = fit(&row_body(event), width.saturating_sub(fixed));
     let text = format!(
         "{}{}  {}{body}{suffix}",
-        if selected { "> " } else { "  " },
+        match (selected, matched) {
+            (true, _) => "> ",
+            (false, true) => "* ",
+            (false, false) => "  ",
+        },
         fit(&clock(event.timestamp), TIME_W),
         fit(actor_label(event), ACTOR_W),
     );

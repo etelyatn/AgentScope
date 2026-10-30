@@ -12,8 +12,11 @@ use crate::domain::{
 use crate::status::synthesize;
 use crate::worker::WorkerRequest;
 
+mod input;
 mod overlay;
+mod search;
 mod transcript;
+pub use input::{FilterItem, FilterTarget, Panel, ProcessView, SearchScope};
 pub use overlay::{MAX_SOURCE_BYTES, SourceState, SourceView};
 pub use transcript::{MAX_LOADED_EVENTS, PageKind, Transcript};
 
@@ -122,6 +125,7 @@ pub struct App {
     request_seq: u64,
     outbox: Vec<WorkerRequest>,
     overlays: overlay::Overlays,
+    input: input::InputState,
 }
 
 impl App {
@@ -146,6 +150,7 @@ impl App {
             request_seq: 0,
             outbox: Vec::new(),
             overlays: overlay::Overlays::default(),
+            input: input::InputState::default(),
         }
     }
 

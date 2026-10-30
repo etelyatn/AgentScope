@@ -36,7 +36,9 @@ Options:
   --version                 Print version
   --help                    Print this help
 
-Keys: j/k move, g/G first/last, s sort, S reverse, r refresh, q or Ctrl+c quit.";
+Keys: j/k move, g/G first/last, Enter open, / search, n/N next/previous match, f filter,
+      s sort (S reverse), r refresh, p process candidates, D diagnostics, v source,
+      x redaction, ? help, q or Ctrl+c quit.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
