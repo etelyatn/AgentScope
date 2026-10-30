@@ -137,7 +137,13 @@ fn runtime_script(argv: &[&str]) -> Option<usize> {
     let mut first = true;
     while i < argv.len() {
         let a = argv[i];
-        if matches!(a, "-e" | "--eval" | "-p" | "--print") {
+        if matches!(a, "-e" | "--eval" | "-p" | "--print")
+            || a.starts_with("--eval=")
+            || a.starts_with("--print=")
+            || (a.starts_with('-')
+                && !a.starts_with("--")
+                && matches!(a.as_bytes().get(1), Some(b'e' | b'p')))
+        {
             return None;
         }
         if RUNTIME_VALUE_OPTS.contains(&a) {
@@ -204,23 +210,26 @@ fn flag_value(args: &[&str], flags: &[&str], prefix: &str, fork: &str, id: &str)
         OPENCODE_VALUE_OPTS
     };
     let mut found = false;
+    let mut printing = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--" || a == "-p" || a == "--print" {
-            // Everything after a print/prompt switch or `--` is prompt-shaped.
+        if a == "--" {
             break;
         }
-        if a == fork {
+        if a == "-p" || a == "--print" {
+            // Later tokens are prompt-shaped and cannot supply identity, but a
+            // later fork flag still makes the id a parent reference.
+            printing = true;
+        } else if a == fork {
             return false;
-        }
-        if flags.contains(&a) {
-            if args.get(i + 1) == Some(&id) {
+        } else if flags.contains(&a) {
+            if !printing && args.get(i + 1) == Some(&id) {
                 found = true;
             }
             i += 1;
         } else if a.strip_prefix(prefix) == Some(id) {
-            found = true;
+            found |= !printing;
         } else if value_opts.contains(&a) {
             // The next token is this option's value, never an identity flag.
             i += 1;
@@ -232,6 +241,14 @@ fn flag_value(args: &[&str], flags: &[&str], prefix: &str, fork: &str, id: &str)
 
 const CLAUDE_VALUE_OPTS: &[&str] = &[
     "--system-prompt",
+    "--system-prompt-file",
+    "--append-system-prompt-file",
+    "--effort",
+    "--max-budget-usd",
+    "--json-schema",
+    "--agent",
+    "--file",
+    "--max-thinking-tokens",
     "--append-system-prompt",
     "--model",
     "--fallback-model",

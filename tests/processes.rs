@@ -351,3 +351,48 @@ fn windows_cwd_is_never_observed() {
         assert!(snapshot.processes.iter().all(|p| p.cwd.is_none()));
     }
 }
+
+#[test]
+fn file_valued_options_and_fork_after_print() {
+    assert!(!matches(
+        "claude",
+        &["--system-prompt-file", "--resume=01a1"]
+    ));
+    assert!(!matches(
+        "claude",
+        &["--append-system-prompt-file", "-r", "01a1"]
+    ));
+    assert!(!matches(
+        "claude",
+        &["--resume", "01a1", "--print", "--fork-session", "hello"]
+    ));
+    assert!(!matches(
+        "claude",
+        &["--resume", "01a1", "-p", "--fork-session", "hello"]
+    ));
+    assert!(matches("claude", &["--resume", "01a1", "--print", "hello"]));
+    assert!(!matches("claude", &["-p", "--resume", "01a1"]));
+}
+
+#[test]
+fn attached_eval_switches_are_not_scripts() {
+    let id = "ses_01a1";
+    for ev in ["--eval=1", "--print=1", "-e1", "-pe", "-p"] {
+        assert!(
+            !identity_matches(
+                Provider::OpenCode,
+                &[
+                    "node",
+                    "--require",
+                    "/tmp/hook.js",
+                    ev,
+                    "opencode",
+                    "--session",
+                    id
+                ],
+                id
+            ),
+            "{ev}"
+        );
+    }
+}
