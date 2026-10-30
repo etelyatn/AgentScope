@@ -195,3 +195,195 @@ fn title_precedence_and_duplicate_sessions_are_separate_sources() {
     assert!(first.source_available && second.source_available);
     assert_ne!(first.key, second.key);
 }
+
+#[test]
+fn replacement_rebuilds_summary_without_replaying_old_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("projects");
+    let file = root.join("p/session.jsonl");
+    write_lines(
+        &file,
+        &[
+            message("user", "old", json!("old prompt with padding")).to_string(),
+            json!({"type":"attachment"}).to_string(),
+        ],
+    );
+    let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
+    let first = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(first.sessions[0].hidden_records, 1);
+    write_lines(&file, &[message("user", "new", json!("new")).to_string()]);
+    let second = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(second.sessions[0].title, "new");
+    assert_eq!(second.sessions[0].displayed_event_count, 1);
+    assert_eq!(second.sessions[0].hidden_records, 0);
+}
+
+#[test]
+fn unknown_blocks_including_tool_results_are_counted_hidden() {
+    let records = vec![
+        message(
+            "assistant",
+            "a",
+            json!([{"type":"redacted_thinking"},{"type":"document"},{"type":"server_tool_use"}]),
+        ),
+        message(
+            "user",
+            "b",
+            json!([{"type":"tool_result","tool_use_id":"missing","content":[{"type":"text","text":"ok"},{"type":"document"},{"type":"web_search_tool_result"}]}]),
+        ),
+    ];
+    let mapped = map(records);
+    assert_eq!(mapped.events.len(), 1);
+    assert_eq!(mapped.hidden_records, 5);
+}
+
+#[test]
+fn duplicate_ids_warn_and_explicit_parent_is_not_inferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("projects");
+    let a = root.join("a/a.jsonl");
+    let b = root.join("b/b.jsonl");
+    let mut child = message("user", "u", json!("hello"));
+    child["isSidechain"] = json!(true);
+    child["parentSessionId"] = json!("parent-session");
+    write_lines(&a, &[child.to_string()]);
+    let mut other_record = message("user", "v", json!("other"));
+    other_record["parentUuid"] = json!("ordinary-message-parent");
+    write_lines(&b, &[other_record.to_string()]);
+    let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
+    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(delta.sessions.len(), 2);
+    for s in &delta.sessions {
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.message.contains("Duplicate ID"))
+        );
+    }
+    let child = delta
+        .sessions
+        .iter()
+        .find(|s| s.key.source == SourceKey::File(a.clone()))
+        .unwrap();
+    assert_eq!(
+        child.lineage.parent,
+        Some(agentscope::domain::SessionLink::Unresolved(
+            "parent-session".into()
+        ))
+    );
+    assert!(child.lineage.sidechain);
+    let other = delta
+        .sessions
+        .iter()
+        .find(|s| s.key.source == SourceKey::File(b.clone()))
+        .unwrap();
+    assert_eq!(other.lineage.parent, None);
+    std::fs::remove_file(b).unwrap();
+    let next = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(next.removed.len(), 1);
+    assert_eq!(next.sessions.len(), 1);
+    assert!(
+        !next.sessions[0]
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("Duplicate ID"))
+    );
+}
+
+#[test]
+fn sidechain_parent_uuid_is_kept_unresolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("projects");
+    let mut record = message("assistant", "child", json!("response"));
+    record["isSidechain"] = json!(true);
+    record["parentUuid"] = json!("parent-record");
+    write_lines(&root.join("p/child.jsonl"), &[record.to_string()]);
+    let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
+    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(
+        delta.sessions[0].lineage.parent,
+        Some(agentscope::domain::SessionLink::Unresolved(
+            "parent-record".into()
+        ))
+    );
+}
+
+#[test]
+fn retiring_stem_key_when_session_id_arrives_on_later_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("projects");
+    let file = root.join("p/stem.jsonl");
+    write_lines(
+        &file,
+        &[
+            json!({"type":"attachment"}).to_string(),
+            message("user", "u", json!("hello")).to_string(),
+        ],
+    );
+    let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
+    let tiny = RefreshBudget {
+        max_records: 1,
+        ..BIG
+    };
+    let first = scanner.scan_roster(NOW, tiny).unwrap();
+    assert_eq!(first.sessions[0].key.provider_session_id, "stem");
+    let old = first.sessions[0].key.clone();
+    let second = scanner.scan_roster(NOW, tiny).unwrap();
+    assert_eq!(second.sessions[0].key.provider_session_id, "session");
+    assert_eq!(second.removed, vec![old]);
+}
+
+#[test]
+fn malformed_and_oversized_lines_are_warnings_not_auxiliary() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("projects");
+    let file = root.join("p/session.jsonl");
+    write_lines(
+        &file,
+        &[
+            "not json".into(),
+            format!("\"{}\"", "x".repeat(300)),
+            message("user", "u", json!("ok")).to_string(),
+        ],
+    );
+    let mut cfg = config(&root);
+    cfg.max_record_bytes = 250;
+    let mut scanner = ClaudeScanner::new(&cfg).unwrap();
+    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    let s = &delta.sessions[0];
+    assert_eq!(s.hidden_records, 0);
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.key.kind == agentscope::domain::WarningKind::Parse)
+    );
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.key.kind == agentscope::domain::WarningKind::Unsupported)
+    );
+}
+
+#[test]
+fn roster_pairs_more_than_256_outstanding_tool_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("projects");
+    let file = root.join("p/session.jsonl");
+    let calls: Vec<_> = (0..300)
+        .map(|i| json!({"type":"tool_use","id":format!("t{i}"),"name":"Read","input":{}}))
+        .collect();
+    let results: Vec<_> = (0..300)
+        .map(|i| json!({"type":"tool_result","tool_use_id":format!("t{i}"),"content":"ok"}))
+        .collect();
+    let records = [
+        message("assistant", "a", json!(calls)),
+        message("user", "b", json!(results)),
+    ];
+    write_lines(
+        &file,
+        &records.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    );
+    let mut scanner = ClaudeScanner::new(&config(&root)).unwrap();
+    let delta = scanner.scan_roster(NOW, BIG).unwrap();
+    assert_eq!(delta.sessions[0].displayed_event_count, 300);
+}

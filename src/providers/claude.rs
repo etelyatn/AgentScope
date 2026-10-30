@@ -87,19 +87,26 @@ fn locator(key: &SessionKey, offset: u64) -> SourceLocator {
         kind: LocatorKind::FileOffset { path, offset },
     }
 }
-fn content_text(v: &Value) -> String {
+fn content_text(v: &Value) -> (String, usize) {
     match v {
-        Value::String(s) => s.clone(),
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("text") => p.get("text").and_then(Value::as_str),
-                Some("image") => Some("[image]"),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+        Value::String(s) => (s.clone(), 0),
+        Value::Array(a) => {
+            let mut hidden = 0;
+            let text = a
+                .iter()
+                .filter_map(|p| match p.get("type").and_then(Value::as_str) {
+                    Some("text") => p.get("text").and_then(Value::as_str),
+                    Some("image") => Some("[image]"),
+                    _ => {
+                        hidden += 1;
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (text, hidden)
+        }
+        _ => (String::new(), 0),
     }
 }
 
@@ -272,7 +279,9 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                 }
                 "tool_result" if kind == "user" => {
                     let id = string(part, "tool_use_id");
-                    let output = safe(&content_text(&part["content"]));
+                    let (content, unknown) = content_text(&part["content"]);
+                    hidden += unknown;
+                    let output = safe(&content);
                     let status = if part.get("is_error").and_then(Value::as_bool) == Some(true) {
                         ToolStatus::Error
                     } else {
@@ -305,7 +314,7 @@ fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript 
                         );
                     }
                 }
-                _ => {}
+                _ => hidden += 1,
             }
         }
     }
@@ -321,6 +330,8 @@ struct State {
     prompt: Option<String>,
     generated: Option<String>,
     calls: HashSet<String>,
+    emitted: Option<SessionKey>,
+    reopen: bool,
     dirty: bool,
 }
 impl State {
@@ -373,8 +384,42 @@ impl State {
             prompt: None,
             generated: None,
             calls: HashSet::new(),
+            emitted: None,
+            reopen: false,
             dirty: true,
         }
+    }
+    fn reset(&mut self, source: SourceFile) {
+        let emitted = self.emitted.take();
+        let cursor = self.cursor.take();
+        *self = Self::new(source);
+        self.emitted = emitted;
+        self.cursor = cursor;
+    }
+    fn warning(&mut self, label: &str, kind: WarningKind, message: &str) {
+        let source = match &self.summary.key.source {
+            SourceKey::File(p) => format!("{}#{label}", p.display()),
+            _ => label.into(),
+        };
+        if let Some(w) = self
+            .summary
+            .warnings
+            .iter_mut()
+            .find(|w| w.key.source == source)
+        {
+            w.count = w.count.saturating_add(1);
+        } else {
+            self.summary.warnings.push(Warning {
+                key: WarningKey {
+                    provider: Provider::Claude,
+                    source,
+                    kind,
+                },
+                message: message.into(),
+                count: 1,
+            });
+        }
+        self.dirty = true;
     }
     fn ingest(&mut self, offset: u64, v: &Value) {
         if let Some(id) = string(v, "sessionId") {
@@ -390,6 +435,16 @@ impl State {
         }
         self.summary.lineage.sidechain |=
             v.get("isSidechain").and_then(Value::as_bool) == Some(true);
+        if let Some(parent) =
+            string(v, "parentSessionId").or_else(|| string(v, "parent_session_id"))
+        {
+            self.summary.lineage.parent = Some(SessionLink::Unresolved(parent));
+        } else if self.summary.lineage.sidechain
+            && self.summary.lineage.parent.is_none()
+            && let Some(parent) = string(v, "parentUuid")
+        {
+            self.summary.lineage.parent = Some(SessionLink::Unresolved(parent));
+        }
         if let Some(t) = v.get("timestamp").and_then(timestamp) {
             self.summary.created_at = Some(self.summary.created_at.map_or(t, |old| old.min(t)));
             self.summary.last_persisted_at =
@@ -445,7 +500,6 @@ impl State {
                 if !tool.orphan
                     && tool.status == ToolStatus::Pending
                     && let Some(id) = tool.call_id
-                    && self.calls.len() < 256
                 {
                     self.calls.insert(id);
                 }
@@ -519,6 +573,9 @@ impl ClaudeScanner {
             if state.cursor.is_none() {
                 state.cursor =
                     JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
+                if state.cursor.is_some() && state.reopen {
+                    state.reset(source.clone());
+                }
             }
             let Some(cursor) = state.cursor.as_mut() else {
                 state.summary.source_available = false;
@@ -527,10 +584,20 @@ impl ClaudeScanner {
                 continue;
             };
             let before = cursor.position();
+            let rotations = cursor.rotation_count();
             let result = cursor.next_record();
             let after = cursor.position();
+            let rotated = cursor.rotation_count() != rotations;
+            if rotated {
+                state.reset(source.clone());
+            }
             bytes = bytes.saturating_add(
-                usize::try_from(after.saturating_sub(before)).unwrap_or(usize::MAX),
+                usize::try_from(if rotated {
+                    after
+                } else {
+                    after.saturating_sub(before)
+                })
+                .unwrap_or(usize::MAX),
             );
             match result {
                 Ok(Some(Record::Json { offset, value })) => {
@@ -542,15 +609,24 @@ impl ClaudeScanner {
                     state.summary.source_available = true;
                     pass.next += 1;
                 }
-                Ok(Some(_)) => {
+                Ok(Some(Record::Invalid { .. })) => {
                     state.summary.source_available = true;
-                    state.summary.hidden_records += 1;
-                    state.dirty = true;
+                    state.warning("malformed", WarningKind::Parse, "malformed records skipped");
+                    count += 1;
+                }
+                Ok(Some(Record::TooLarge { .. })) => {
+                    state.summary.source_available = true;
+                    state.warning(
+                        "oversized",
+                        WarningKind::Unsupported,
+                        "oversized records skipped",
+                    );
                     count += 1;
                 }
                 Err(_) => {
                     state.summary.source_available = false;
                     state.cursor = None;
+                    state.reopen = true;
                     state.dirty = true;
                     pass.next += 1;
                 }
@@ -562,11 +638,45 @@ impl ClaudeScanner {
             let live: HashSet<_> = pass.sources.iter().map(|s| &s.path).collect();
             self.states.retain(|p, s| {
                 let keep = live.contains(p);
-                if !keep {
-                    removed.push(s.summary.key.clone());
+                if !keep && let Some(key) = s.emitted.take() {
+                    removed.push(key);
                 }
                 keep
             });
+        }
+        let mut ids: HashMap<String, usize> = HashMap::new();
+        for state in self.states.values() {
+            *ids.entry(state.summary.key.provider_session_id.clone())
+                .or_default() += 1;
+        }
+        for state in self.states.values_mut() {
+            let count = ids[&state.summary.key.provider_session_id];
+            let source = match &state.summary.key.source {
+                SourceKey::File(p) => format!("{}#duplicate-id", p.display()),
+                _ => "#duplicate-id".into(),
+            };
+            let previous = state
+                .summary
+                .warnings
+                .iter()
+                .find(|w| w.key.source == source)
+                .map(|w| w.count);
+            let wanted = (count > 1).then(|| u32::try_from(count).unwrap_or(u32::MAX));
+            if previous != wanted {
+                state.summary.warnings.retain(|w| w.key.source != source);
+                if let Some(count) = wanted {
+                    state.summary.warnings.push(Warning {
+                        key: WarningKey {
+                            provider: Provider::Claude,
+                            source,
+                            kind: WarningKind::Unsupported,
+                        },
+                        message: "Duplicate ID: another source shares this session ID".into(),
+                        count,
+                    });
+                }
+                state.dirty = true;
+            }
         }
         let scan = ScanProgress {
             provider: Provider::Claude,
@@ -582,6 +692,11 @@ impl ClaudeScanner {
             .values_mut()
             .filter_map(|s| {
                 if s.dirty {
+                    if let Some(old) = s.emitted.replace(s.summary.key.clone())
+                        && old != s.summary.key
+                    {
+                        removed.push(old);
+                    }
                     s.dirty = false;
                     Some(s.summary.clone())
                 } else {
