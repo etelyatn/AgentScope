@@ -649,3 +649,131 @@ fn growing_in_place_rewrite_resets_state_and_invalidates() {
         ["new first", "new second", "new third", "new fourth"]
     );
 }
+
+#[test]
+fn middle_only_rewrite_followed_by_append_is_detected_exactly() {
+    use std::io::Seek;
+    let (_dir, path, mut s, key) = setup(&[
+        assistant("a", json!("first record stays the same")),
+        assistant("b", json!("MIDDLE-OLD-CONTENT")),
+        assistant("c", json!("last record stays the same")),
+    ]);
+    // Rewrite only the middle record, same length, preserving head and tail bytes.
+    let original = std::fs::read(&path).unwrap();
+    let at = original
+        .windows(18)
+        .position(|w| w == b"MIDDLE-OLD-CONTENT")
+        .unwrap() as u64;
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(std::io::SeekFrom::Start(at)).unwrap();
+    f.write_all(b"MIDDLE-NEW-CONTENT").unwrap();
+    f.flush().unwrap();
+    drop(f);
+    append(&path, &[assistant("d", json!("appended"))]);
+
+    let delta = s.refresh(NOW, BUDGET).unwrap();
+    assert!(delta.invalidated.contains(&key), "{:?}", delta.invalidated);
+    let page = s
+        .transcript_page(
+            &key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                ..PAGE
+            },
+        )
+        .expect("pages are readable after the rebuild");
+    let texts: Vec<_> = page
+        .events
+        .iter()
+        .map(|e| e.text.as_ref().unwrap().preview.clone())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "first record stays the same",
+            "MIDDLE-NEW-CONTENT",
+            "last record stays the same",
+            "appended"
+        ]
+    );
+}
+
+#[test]
+fn prefix_verification_is_resumable_under_a_small_budget() {
+    let records: Vec<Value> = (0..40)
+        .map(|i| assistant(&format!("u{i}"), json!("x".repeat(2000))))
+        .collect();
+    let (_dir, path, mut s, key) = setup(&records);
+    append(&path, &[assistant("extra", json!("more"))]);
+    let small = RefreshBudget {
+        max_records: 1000,
+        max_bytes: 16 * 1024,
+        max_millis: 60_000,
+    };
+    let mut steps = 0;
+    let mut last = None;
+    loop {
+        let d = s.refresh(NOW, small).unwrap();
+        steps += 1;
+        if let Some(x) = d.sessions.into_iter().next() {
+            last = Some(x);
+        }
+        if d.scan.done {
+            break;
+        }
+        assert!(steps < 1000);
+    }
+    assert!(steps >= 5, "80 KB verified at 16 KB per step: {steps}");
+    assert_eq!(last.unwrap().displayed_event_count, 41);
+    assert!(
+        s.transcript_page(&key, None, PageDirection::Forward, PAGE)
+            .is_ok()
+    );
+}
+
+#[test]
+fn tool_use_without_stop_reason_after_end_turn_reopens_the_turn() {
+    use agentscope::domain::{Lifecycle, StatusLabel};
+    let (_dir, path, mut s, _key) = setup(&[
+        stamped("user", "u1", "2026-10-29T10:00:00Z", None, json!("go")),
+        stamped(
+            "assistant",
+            "a1",
+            "2026-10-29T10:00:01Z",
+            Some("end_turn"),
+            json!("done"),
+        ),
+    ]);
+    // Establish the completed state through an append so it is emitted.
+    append(
+        &path,
+        &[stamped(
+            "assistant",
+            "a2",
+            "2026-10-29T10:00:02Z",
+            Some("end_turn"),
+            json!("really done"),
+        )],
+    );
+    let done = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert_eq!(status_label(&done), StatusLabel::Complete);
+    let completed_at = done.last_completion.unwrap();
+    // Streamed assistant record: tool_use block, null stop_reason, no user record.
+    append(
+        &path,
+        &[stamped(
+            "assistant",
+            "a3",
+            "2026-10-29T10:05:00Z",
+            None,
+            json!([{"type":"tool_use","id":"t9","name":"Bash","input":{}}]),
+        )],
+    );
+    let open = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert!(open.unfinished_work);
+    assert_eq!(open.lifecycle, Lifecycle::Ongoing);
+    assert_eq!(open.last_completion, Some(completed_at));
+    assert_ne!(status_label(&open), StatusLabel::Complete);
+}

@@ -141,14 +141,7 @@ pub struct JsonlCursor {
     stamp: Stamp,
     rotations: u64,
     hash: ContentHash,
-    /// First and last [`SAMPLE`] consumed bytes, kept so a consumer can cheaply
-    /// check the consumed prefix without re-reading it.
-    head: Vec<u8>,
-    tail: Vec<u8>,
 }
-
-/// Bytes sampled at each end of the consumed prefix.
-const SAMPLE: usize = 512;
 
 fn classify(line: &[u8], offset: u64, max_bytes: usize) -> Record {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -179,33 +172,7 @@ impl JsonlCursor {
             stamp,
             rotations: 0,
             hash: ContentHash::new(),
-            head: Vec::new(),
-            tail: Vec::new(),
         })
-    }
-
-    /// Bounded check that the file still starts with, and its consumed prefix still
-    /// ends with, the bytes this cursor read (at most `2 * 512` bytes read). Like
-    /// the Codex and large-file fingerprints this is sampling: a rewrite that
-    /// preserves both samples is not detected.
-    pub fn prefix_samples_intact(&self) -> io::Result<bool> {
-        if self.offset == 0 {
-            return Ok(true);
-        }
-        let mut file = File::open(&self.path)?;
-        if file.metadata()?.len() < self.offset {
-            return Ok(false);
-        }
-        let mut buf = vec![0u8; self.head.len().max(self.tail.len())];
-        file.read_exact(&mut buf[..self.head.len()])?;
-        crate::perf::bytes_read(self.head.len());
-        if buf[..self.head.len()] != self.head[..] {
-            return Ok(false);
-        }
-        file.seek(SeekFrom::Start(self.offset - self.tail.len() as u64))?;
-        file.read_exact(&mut buf[..self.tail.len()])?;
-        crate::perf::bytes_read(self.tail.len());
-        Ok(buf[..self.tail.len()] == self.tail[..])
     }
 
     /// Bytes consumed from the file so far, including a held partial line.
@@ -251,8 +218,6 @@ impl JsonlCursor {
             self.incomplete_reported = false;
             self.rotations += 1;
             self.hash = ContentHash::new();
-            self.head.clear();
-            self.tail.clear();
         } else {
             self.stamp = current;
         }
@@ -296,16 +261,6 @@ impl JsonlCursor {
             }
             crate::perf::bytes_read(consumed);
             self.hash.update(&available[..consumed]);
-            let chunk = &available[..consumed];
-            if self.head.len() < SAMPLE {
-                let take = (SAMPLE - self.head.len()).min(chunk.len());
-                self.head.extend_from_slice(&chunk[..take]);
-            }
-            let keep = chunk.len().min(SAMPLE);
-            self.tail.extend_from_slice(&chunk[chunk.len() - keep..]);
-            if self.tail.len() > SAMPLE {
-                self.tail.drain(..self.tail.len() - SAMPLE);
-            }
             self.reader.consume(consumed);
             self.offset = self
                 .offset

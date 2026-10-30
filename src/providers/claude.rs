@@ -419,6 +419,22 @@ struct State {
     checked_pass: u64,
     /// Length and modified time at the last prefix check.
     stamp: Option<(u64, Option<SystemTime>)>,
+    /// Exact consumed-prefix verification in progress (files up to
+    /// [`PREFIX_VERIFY_MAX`]); advanced under the refresh byte budget.
+    verify: Option<PrefixVerify>,
+}
+
+struct PrefixVerify {
+    file: File,
+    hash: ContentHash,
+    left: u64,
+    meta: (u64, Option<SystemTime>),
+}
+
+enum Verdict {
+    Intact,
+    Changed,
+    Pending,
 }
 impl State {
     fn new(source: SourceFile, entries: usize, bytes: usize) -> Self {
@@ -491,31 +507,78 @@ impl State {
             counts_approximate: false,
             checked_pass: 0,
             stamp: None,
+            verify: None,
         }
     }
-    /// Whether the file still holds the bytes this cursor consumed. A same-file
-    /// rewrite that also grows the file looks like an append to the cursor, so the
-    /// consumed prefix is verified whenever the file changed since the last check.
-    fn prefix_intact(&self, path: &Path) -> bool {
+    /// Starts checking that the file still holds the bytes this cursor consumed. A
+    /// same-file rewrite that also grows the file looks like an append to the
+    /// cursor, so the consumed prefix is verified whenever the file changed.
+    /// Small prefixes are hashed exactly (resumable, see [`Self::verify_step`]);
+    /// larger ones use the sampled fingerprint.
+    fn begin_verify(&mut self, path: &Path, meta: (u64, Option<SystemTime>)) -> Verdict {
         let Some(cursor) = &self.cursor else {
-            return true;
+            return Verdict::Intact;
         };
         let end = cursor.position();
         if end == 0 {
-            return true;
+            self.stamp = Some(meta);
+            return Verdict::Intact;
         }
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        if meta.len() < end {
-            return false;
+        if meta.0 < end {
+            return Verdict::Changed;
         }
         if end > PREFIX_VERIFY_MAX {
-            return self
+            let ok = self
                 .fingerprint
                 .is_some_and(|(e, h)| e == end && fingerprint(path, end) == Some(h));
+            if ok {
+                self.stamp = Some(meta);
+                return Verdict::Intact;
+            }
+            return Verdict::Changed;
         }
-        cursor.prefix_samples_intact().unwrap_or(false)
+        let Ok(file) = File::open(path) else {
+            return Verdict::Changed;
+        };
+        self.verify = Some(PrefixVerify {
+            file,
+            hash: ContentHash::new(),
+            left: end,
+            meta,
+        });
+        Verdict::Pending
+    }
+    /// Reads at most `allowance` bytes of the pending verification; returns the
+    /// bytes read and the verdict.
+    fn verify_step(&mut self, allowance: usize) -> (usize, Verdict) {
+        let (Some(v), Some(cursor)) = (self.verify.as_mut(), self.cursor.as_ref()) else {
+            return (0, Verdict::Intact);
+        };
+        let mut read = 0usize;
+        let mut buf = [0u8; 8192];
+        while v.left > 0 && read < allowance {
+            let size = v.left.min(buf.len() as u64).min((allowance - read) as u64) as usize;
+            if v.file.read_exact(&mut buf[..size]).is_err() {
+                self.verify = None;
+                return (read, Verdict::Changed);
+            }
+            crate::perf::bytes_read(size);
+            v.hash.update(&buf[..size]);
+            v.left -= size as u64;
+            read += size;
+        }
+        if v.left > 0 {
+            return (read, Verdict::Pending);
+        }
+        let intact = v.hash.finish() == cursor.content_hash();
+        let meta = v.meta;
+        self.verify = None;
+        if intact {
+            self.stamp = Some(meta);
+            (read, Verdict::Intact)
+        } else {
+            (read, Verdict::Changed)
+        }
     }
     fn reset(&mut self, source: SourceFile, entries: usize, bytes: usize) {
         let emitted = self.emitted.take();
@@ -569,7 +632,18 @@ impl State {
                     self.summary.lifecycle = Lifecycle::Completed;
                 }
                 Some("tool_use") => self.open_turn(),
-                _ => {}
+                // Pending tool_use content is unfinished work even when the
+                // record carries no (or a null) stop reason, once a lifecycle is known.
+                _ => {
+                    let pending = msg["content"].as_array().is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|p| p.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    });
+                    if pending && self.summary.lifecycle != Lifecycle::Unknown {
+                        self.open_turn();
+                    }
+                }
             },
             "user" if v.get("isMeta").and_then(Value::as_bool) != Some(true) => {
                 let genuine = match &msg["content"] {
@@ -947,16 +1021,28 @@ impl ClaudeScanner {
                     );
                 }
             }
+            let mut verdict = Verdict::Intact;
             if state.checked_pass != pass.id {
                 state.checked_pass = pass.id;
+                state.verify = None;
                 let meta = std::fs::metadata(&source.path)
                     .ok()
                     .map(|m| (m.len(), m.modified().ok()));
-                if state.cursor.is_some()
-                    && meta.is_some()
-                    && meta != state.stamp
-                    && !state.prefix_intact(&source.path)
+                if let Some(meta) = meta
+                    && state.cursor.is_some()
+                    && Some(meta) != state.stamp
                 {
+                    verdict = state.begin_verify(&source.path, meta);
+                }
+            }
+            if state.verify.is_some() {
+                let (read, v) = state.verify_step(budget.max_bytes.saturating_sub(bytes).max(1));
+                bytes = bytes.saturating_add(read);
+                verdict = v;
+            }
+            match verdict {
+                Verdict::Pending => continue,
+                Verdict::Changed => {
                     // Consumed bytes changed in place: nothing parsed from them holds.
                     state.reset(
                         source.clone(),
@@ -967,8 +1053,11 @@ impl ClaudeScanner {
                         JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
                     state.invalidated = true;
                     state.checked_pass = pass.id;
+                    state.stamp = std::fs::metadata(&source.path)
+                        .ok()
+                        .map(|m| (m.len(), m.modified().ok()));
                 }
-                state.stamp = meta;
+                Verdict::Intact => {}
             }
             let Some(cursor) = state.cursor.as_mut() else {
                 state.summary.source_available = false;

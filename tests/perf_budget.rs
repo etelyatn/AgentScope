@@ -283,15 +283,19 @@ fn claude_unchanged_refresh_reads_nothing_and_append_reads_only_the_tail() {
     assert!(scan_claude(&mut scanner, BIG).is_empty());
     assert_eq!(perf::snapshot(), perf::Counters::default());
 
+    let prefix = fs::metadata(&paths[7]).unwrap().len();
     let added = append(&paths[7], &claude_record("s7", 999_999, "tail").to_string());
     perf::reset();
     assert_eq!(scan_claude(&mut scanner, BIG).len(), 1);
     let tail = perf::snapshot();
     assert_eq!(tail.records_parsed, 1);
-    // The new line plus the bounded prefix-integrity sample (3 x 512 bytes at most).
-    assert!(
-        (added..=added + 3 * 512).contains(&tail.bytes_read),
-        "read {} bytes for {added} appended",
+    // The new line plus an exact verification of the consumed prefix, which
+    // detects in-place rewrites that also grow the file. Unchanged files still
+    // read nothing (asserted above).
+    assert_eq!(
+        tail.bytes_read,
+        added + prefix,
+        "read {} bytes for {added} appended after a {prefix}-byte prefix",
         tail.bytes_read
     );
 }
