@@ -15,14 +15,15 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 use serde_json::Value;
 
-use super::{ProviderDelta, ProviderError};
+use super::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
 use crate::config::Config;
 use crate::domain::{
-    Lifecycle, Lineage, ModelDetail, ProcessAssociation, Provider, RefreshBudget, ScanProgress,
-    SessionKey, SessionLink, SessionSummary, SourceKey, Timestamp, Warning, WarningKey,
-    WarningKind,
+    Actor, BoundedText, DiagnosticEntry, Event, EventKind, Lifecycle, Lineage, LocatorKind,
+    ModelDetail, PageAnchor, PageDirection, PageRequest, ProcessAssociation, Provenance, Provider,
+    RefreshBudget, ScanProgress, SessionKey, SessionLink, SessionSummary, SourceKey, SourceLocator,
+    Timestamp, ToolInteraction, ToolStatus, TranscriptPage, Warning, WarningKey, WarningKind,
 };
-use crate::ingest::text::preview;
+use crate::ingest::text::{display_safe, preview};
 
 const TITLE_BYTES: usize = 1024;
 const TITLE_COLS: usize = 80;
@@ -57,7 +58,14 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     (
         "session_message",
-        &["id", "session_id", "time_created", "time_updated"],
+        &[
+            "id",
+            "session_id",
+            "type",
+            "data",
+            "time_created",
+            "time_updated",
+        ],
     ),
     ("project", &["id", "name"]),
     (
@@ -338,7 +346,11 @@ impl OpenCodeScanner {
         _now: Timestamp,
         budget: RefreshBudget,
     ) -> Result<ProviderDelta, ProviderError> {
-        let result = self.ensure_open().and_then(|()| self.step(budget));
+        let refresh_ms = self.config.refresh_busy_timeout_ms;
+        let result = self
+            .ensure_open()
+            .and_then(|()| self.set_busy_timeout(refresh_ms))
+            .and_then(|()| self.step(budget));
         if result.is_err() {
             self.connection = None;
             self.pass = None;
@@ -733,4 +745,787 @@ fn read_page(
         }
     }
     Ok((rows, true))
+}
+
+// ---------------------------------------------------------------------------
+// Transcript: `session_message` mapping, keyset paging, source records.
+// ---------------------------------------------------------------------------
+
+const MESSAGE_TABLE: &str = "session_message";
+const PREVIEW_CAP: usize = 2048;
+const DIAG_CAP: usize = 200;
+const TYPE_CHARS: usize = 64;
+
+/// One `session_message` row. `data` is `None` when the column is NULL or longer
+/// than the record cap (`data_len` then tells which); the oversized body is never
+/// read into memory.
+struct RawRow {
+    id: String,
+    created: i64,
+    updated: i64,
+    ty: String,
+    data: Option<String>,
+    data_len: Option<i64>,
+}
+
+/// The row's change marker. `time_updated` moves whenever the provider rewrites a
+/// row in place, so a locator minted for older content no longer matches.
+fn generation(row: &RawRow) -> u64 {
+    u64::try_from(row.updated).unwrap_or(0)
+}
+
+fn lossy(value: rusqlite::types::ValueRef<'_>) -> Option<String> {
+    match value {
+        rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+            Some(String::from_utf8_lossy(b).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Streams `session_message` rows of one session in `(time_created, id)` order,
+/// starting at (and including) the anchor's row when given. Keyset comparison on the
+/// `(session_id, time_created, id)` index; no `OFFSET`, no row accumulation: the
+/// callback sees one row at a time and returns `false` to stop.
+fn stream_rows(
+    conn: &Connection,
+    session: &str,
+    record_cap: usize,
+    direction: PageDirection,
+    from: Option<(i64, &str)>,
+    mut each: impl FnMut(RawRow) -> Result<bool, ProviderError>,
+) -> Result<(), ProviderError> {
+    let (cmp, order) = match direction {
+        PageDirection::Forward => (">=", "ASC"),
+        PageDirection::Backward => ("<=", "DESC"),
+    };
+    // Only static fragments are spliced into the statement; every value is bound.
+    let bound = if from.is_some() {
+        format!(" AND (time_created, id) {cmp} (?4, ?5)")
+    } else {
+        String::new()
+    };
+    let sql = format!(
+        "SELECT id, time_created, time_updated, substr(type, 1, {TYPE_CHARS}), \
+         CASE WHEN length(data) <= ?2 THEN data END, length(data) \
+         FROM {MESSAGE_TABLE} \
+         WHERE session_id = ?1 AND length(id) <= ?3{bound} \
+         ORDER BY time_created {order}, id {order}"
+    );
+    let cap = i64::try_from(record_cap).unwrap_or(i64::MAX);
+    let max_id = i64::try_from(ID_MAX).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(&sql).map_err(map_error)?;
+    let mut rows = match from {
+        Some((created, id)) => statement.query(params![session, cap, max_id, created, id]),
+        None => statement.query(params![session, cap, max_id]),
+    }
+    .map_err(map_error)?;
+    while let Some(row) = rows.next().map_err(map_error)? {
+        let raw = RawRow {
+            id: row.get(0).map_err(map_error)?,
+            created: row.get(1).map_err(map_error)?,
+            updated: row.get(2).map_err(map_error)?,
+            ty: row
+                .get_ref(3)
+                .map_err(map_error)
+                .map(lossy)?
+                .unwrap_or_default(),
+            data: row.get_ref(4).map_err(map_error).map(lossy)?,
+            data_len: row.get(5).map_err(map_error)?,
+        };
+        if !each(raw)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+enum Mapped {
+    Event(Box<Event>),
+    Diag(DiagnosticEntry),
+}
+
+/// Maps rows to events and diagnostics. `cap` bounds every preview.
+struct Mapper<'a> {
+    key: &'a SessionKey,
+    version: Option<&'a str>,
+    cap: usize,
+}
+
+/// Text of a JSON value: strings verbatim, anything else compact JSON.
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// Tool content is often `[{"type":"text","text":...}]`; show the text, not the JSON.
+fn content_text(value: &Value) -> Option<String> {
+    if let Value::Array(items) = value {
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i.get("text").and_then(Value::as_str))
+            .collect();
+        if !texts.is_empty() && texts.len() == items.len() {
+            return Some(texts.join("\n"));
+        }
+    }
+    value_text(value)
+}
+
+fn str_field<'v>(value: &'v Value, name: &str) -> Option<&'v str> {
+    value.get(name).and_then(Value::as_str)
+}
+
+impl Mapper<'_> {
+    fn locator(&self, row: &RawRow, part: usize) -> SourceLocator {
+        SourceLocator {
+            session: self.key.clone(),
+            generation: Some(generation(row)),
+            kind: LocatorKind::DbRow {
+                table: MESSAGE_TABLE.to_owned(),
+                row_id: row.id.clone(),
+                part_index: Some(part),
+            },
+        }
+    }
+
+    fn bounded(&self, text: &str, locator: &SourceLocator) -> BoundedText {
+        let mut bounded = preview(text, self.cap, self.cap);
+        bounded.locator = Some(locator.clone());
+        bounded
+    }
+
+    fn diag(&self, row: &RawRow, part: usize, label: &str) -> (usize, Mapped) {
+        (
+            part,
+            Mapped::Diag(DiagnosticEntry {
+                locator: self.locator(row, part),
+                label: label.to_owned(),
+                hidden: true,
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn event(
+        &self,
+        row: &RawRow,
+        part: usize,
+        record_type: String,
+        kind: EventKind,
+        actor: Actor,
+        text: Option<String>,
+        tool: Option<ToolInteraction>,
+    ) -> (usize, Mapped) {
+        let locator = self.locator(row, part);
+        let text = text
+            .filter(|t| !t.is_empty())
+            .map(|t| self.bounded(&t, &locator));
+        (
+            part,
+            Mapped::Event(Box::new(Event {
+                id: format!("{}#{part}", row.id),
+                session: self.key.clone(),
+                timestamp: Some(row.created),
+                source_order: part as u64,
+                kind,
+                actor,
+                text,
+                tool,
+                usage: None,
+                provenance: Provenance {
+                    provider: Provider::OpenCode,
+                    source: self.key.source.clone(),
+                    locator,
+                    record_type,
+                    provider_version: self.version.map(str::to_owned),
+                },
+            })),
+        )
+    }
+
+    /// Items of one row in part order. A row that displays nothing yields one
+    /// "source-only" diagnostic so it stays reachable in the source view.
+    fn map_row(&self, row: &RawRow, record_cap: usize) -> Vec<(usize, Mapped)> {
+        let Some(data) = &row.data else {
+            let label = if row.data_len.is_some_and(|n| n > record_cap as i64) {
+                "oversized record"
+            } else {
+                "source-only record (no data)"
+            };
+            return vec![self.diag(row, 0, label)];
+        };
+        let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(data) else {
+            return vec![self.diag(row, 0, "malformed record")];
+        };
+        let ty = row.ty.as_str();
+        let one = |kind, actor, text: Option<String>| {
+            self.event(row, 0, ty.to_owned(), kind, actor, text, None)
+        };
+        let mut items: Vec<(usize, Mapped)> = Vec::new();
+        match ty {
+            "user" => {
+                if let Some(text) = str_field(&value, "text").filter(|t| !t.is_empty()) {
+                    items.push(one(
+                        EventKind::UserPrompt,
+                        Actor::User,
+                        Some(text.to_owned()),
+                    ));
+                }
+                let mut part = 1;
+                for (label, field) in [("file", "files"), ("agent", "agents")] {
+                    for item in value
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let name = ["name", "filename", "path", "uri", "url"]
+                            .iter()
+                            .find_map(|k| str_field(item, k))
+                            .map(str::to_owned)
+                            .or_else(|| value_text(item))
+                            .unwrap_or_default();
+                        items.push(self.event(
+                            row,
+                            part,
+                            ty.to_owned(),
+                            EventKind::System,
+                            Actor::User,
+                            Some(format!("{label}: {name}")),
+                            None,
+                        ));
+                        part += 1;
+                    }
+                }
+            }
+            "system" | "synthetic" => {
+                if let Some(text) = str_field(&value, "text").filter(|t| !t.is_empty()) {
+                    items.push(one(EventKind::System, Actor::System, Some(text.to_owned())));
+                }
+            }
+            "compaction" => {
+                let text = ["summary", "text"]
+                    .iter()
+                    .find_map(|k| str_field(&value, k))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("Context compacted");
+                items.push(one(
+                    EventKind::Compaction,
+                    Actor::System,
+                    Some(text.to_owned()),
+                ));
+            }
+            "idle" => {
+                let text = match str_field(&value, "outcome").filter(|o| !o.is_empty()) {
+                    Some(outcome) => format!("Idle \u{2014} {outcome}"),
+                    None => "Idle".to_owned(),
+                };
+                items.push(one(EventKind::Lifecycle, Actor::System, Some(text)));
+            }
+            "assistant" => {
+                if let Some(parts) = value.get("content").and_then(Value::as_array) {
+                    for (part, item) in parts.iter().enumerate() {
+                        items.extend(self.assistant_part(row, part, item));
+                    }
+                }
+            }
+            _ => return vec![self.diag(row, 0, "unknown record type")],
+        }
+        if items.is_empty() {
+            items.push(self.diag(row, 0, "source-only record (nothing to display)"));
+        }
+        items
+    }
+
+    fn assistant_part(&self, row: &RawRow, part: usize, item: &Value) -> Option<(usize, Mapped)> {
+        let record_type = |inner: &str| format!("assistant/{inner}");
+        let text_of = |name: &str| str_field(item, name).filter(|t| !t.is_empty());
+        match str_field(item, "type") {
+            Some("text") => text_of("text").map(|t| {
+                self.event(
+                    row,
+                    part,
+                    record_type("text"),
+                    EventKind::AssistantMessage,
+                    Actor::Assistant,
+                    Some(t.to_owned()),
+                    None,
+                )
+            }),
+            Some("reasoning") => text_of("text").map(|t| {
+                self.event(
+                    row,
+                    part,
+                    record_type("reasoning"),
+                    EventKind::Reasoning,
+                    Actor::Assistant,
+                    Some(t.to_owned()),
+                    None,
+                )
+            }),
+            Some("tool") => Some(self.tool_part(row, part, item)),
+            Some(label @ ("patch" | "file" | "agent" | "subtask")) => {
+                let mut rest = item.clone();
+                if let Value::Object(map) = &mut rest {
+                    map.remove("type");
+                }
+                Some(self.event(
+                    row,
+                    part,
+                    record_type(label),
+                    EventKind::System,
+                    Actor::System,
+                    Some(format!("{label}: {rest}")),
+                    None,
+                ))
+            }
+            _ => Some(self.diag(row, part, "unknown part type")),
+        }
+    }
+
+    fn tool_part(&self, row: &RawRow, part: usize, item: &Value) -> (usize, Mapped) {
+        let locator = self.locator(row, part);
+        let null = Value::Null;
+        let state = item.get("state").unwrap_or(&null);
+        let status = match str_field(state, "status") {
+            Some("completed") => ToolStatus::Completed,
+            Some("error") => ToolStatus::Error,
+            _ => ToolStatus::Unknown,
+        };
+        let time = item.get("time").unwrap_or(&null);
+        let stamp = |name: &str| time.get(name).and_then(Value::as_i64);
+        let metadata = state.get("metadata").unwrap_or(&null);
+        let exit_code = ["exit", "exitCode", "exit_code"]
+            .iter()
+            .find_map(|k| metadata.get(*k).and_then(Value::as_i64))
+            .and_then(|n| i32::try_from(n).ok());
+        let name = str_field(item, "name")
+            .filter(|n| !n.is_empty())
+            .unwrap_or("tool");
+        let tool = ToolInteraction {
+            name: preview(name, self.cap, self.cap).preview,
+            call_id: str_field(item, "id").map(str::to_owned),
+            input: state
+                .get("input")
+                .and_then(value_text)
+                .map(|t| self.bounded(&t, &locator)),
+            output: state
+                .get("content")
+                .and_then(content_text)
+                .map(|t| self.bounded(&t, &locator)),
+            status,
+            exit_code,
+            started_at: stamp("created").or_else(|| stamp("ran")),
+            completed_at: stamp("completed"),
+            orphan: false,
+        };
+        self.event(
+            row,
+            part,
+            "assistant/tool".to_owned(),
+            EventKind::Tool,
+            Actor::Tool,
+            None,
+            Some(tool),
+        )
+    }
+}
+
+fn anchor_of(e: &Event, row_id: &str) -> PageAnchor {
+    PageAnchor {
+        timestamp: e.timestamp,
+        source_order: e.source_order,
+        stable_id: row_id.to_owned(),
+    }
+}
+
+/// Bytes an event contributes to the page budget: its bounded previews.
+fn event_cost(e: &Event) -> usize {
+    let len = |t: &Option<BoundedText>| t.as_ref().map_or(0, |b| b.preview.len());
+    len(&e.text)
+        + e.tool
+            .as_ref()
+            .map_or(0, |t| t.name.len() + len(&t.input) + len(&t.output))
+}
+
+fn event_truncated(e: &Event) -> bool {
+    let cut = |t: &Option<BoundedText>| t.as_ref().is_some_and(|b| b.truncated);
+    cut(&e.text)
+        || e.tool
+            .as_ref()
+            .is_some_and(|t| cut(&t.input) || cut(&t.output))
+}
+
+fn push_diag(into: &mut Vec<DiagnosticEntry>, entry: DiagnosticEntry, truncated: &mut bool) {
+    if into.len() < DIAG_CAP {
+        into.push(entry);
+    } else {
+        *truncated = true;
+    }
+}
+
+/// An anchor names `(time_created, row id, part index)` of a displayed event.
+fn anchor_parts(anchor: &PageAnchor) -> Result<(i64, usize), ProviderError> {
+    let created = anchor.timestamp.ok_or_else(|| {
+        ProviderError::Unsupported("OpenCode anchors carry the row's time_created".into())
+    })?;
+    let part = usize::try_from(anchor.source_order)
+        .map_err(|_| ProviderError::Unsupported("anchor part index out of range".into()))?;
+    Ok((created, part))
+}
+
+impl OpenCodeScanner {
+    fn set_busy_timeout(&self, millis: u64) -> Result<(), ProviderError> {
+        match &self.connection {
+            Some(conn) => conn
+                .busy_timeout(Duration::from_millis(millis))
+                .map_err(map_error),
+            None => Ok(()),
+        }
+    }
+
+    /// Opens (if needed) with the page timeout, runs `f`, and drops the connection
+    /// on any failure that is not a plain refusal so the next call reopens.
+    fn guarded<T>(
+        &mut self,
+        f: impl FnOnce(&Self, &Connection) -> Result<T, ProviderError>,
+    ) -> Result<T, ProviderError> {
+        let page_ms = self.config.page_busy_timeout_ms;
+        let result = self
+            .ensure_open()
+            .and_then(|()| self.set_busy_timeout(page_ms))
+            .and_then(|()| {
+                let conn = self.connection.as_ref().expect("opened");
+                f(self, conn)
+            });
+        if matches!(&result, Err(e) if !matches!(e, ProviderError::Unsupported(_))) {
+            self.connection = None;
+        }
+        result
+    }
+
+    /// Validates a session key and that the transcript generation is readable.
+    fn check_session(&self, conn: &Connection, key: &SessionKey) -> Result<(), ProviderError> {
+        let Some(tables) = Tables::for_schema(self.schema).filter(|_| self.schema == Schema::V2)
+        else {
+            return Err(ProviderError::Unsupported(
+                "OpenCode transcripts need the session_v2 generation".into(),
+            ));
+        };
+        let valid = key.provider == Provider::OpenCode
+            && matches!(&key.source, SourceKey::DbRow { table, id }
+                if table == tables.session && *id == key.provider_session_id);
+        if !valid {
+            return Err(ProviderError::Unsupported("not an OpenCode session".into()));
+        }
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM session_v2 WHERE id = ?1",
+                params![key.provider_session_id],
+                |r| r.get(0),
+            )
+            .map_err(map_error)?;
+        if exists == 0 {
+            return Err(ProviderError::Unavailable(
+                "unknown OpenCode session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn version_of(&self, key: &SessionKey) -> Option<&str> {
+        self.known
+            .get(&key.provider_session_id)
+            .and_then(|s| s.provider_version.as_deref())
+    }
+
+    fn page(
+        &self,
+        conn: &Connection,
+        key: &SessionKey,
+        anchor: Option<&PageAnchor>,
+        direction: PageDirection,
+        request: PageRequest,
+    ) -> Result<TranscriptPage, ProviderError> {
+        self.check_session(conn, key)?;
+        let at = anchor
+            .map(|a| anchor_parts(a).map(|(created, part)| (created, a.stable_id.as_str(), part)))
+            .transpose()?;
+        let record_cap = self.config.max_record_bytes;
+        let mapper = Mapper {
+            key,
+            version: self.version_of(key),
+            cap: (request.max_bytes / 4).clamp(1, PREVIEW_CAP),
+        };
+        let max_events = request.max_events.max(1);
+        let forward = direction == PageDirection::Forward;
+        let mut events: Vec<(Event, String)> = Vec::new();
+        let mut diags = Vec::new();
+        // Forward: diagnostics waiting for the next event. Backward: the page's own.
+        // A diagnostic belongs to the page of the next event after it (or the last
+        // page), so both directions partition diagnostics identically.
+        let mut pending = Vec::new();
+        let mut truncated = false;
+        let mut bytes = 0usize;
+        let mut has_more = false;
+        stream_rows(
+            conn,
+            &key.provider_session_id,
+            record_cap,
+            direction,
+            at.map(|(created, id, _)| (created, id)),
+            |row| {
+                let mut items = mapper.map_row(&row, record_cap);
+                if !forward {
+                    items.reverse();
+                }
+                for (part, mapped) in items {
+                    // The anchor's own row resumes after (forward) / before
+                    // (backward) the anchored part.
+                    if let Some((created, id, at_part)) = at
+                        && row.created == created
+                        && row.id == id
+                        && (if forward {
+                            part <= at_part
+                        } else {
+                            part >= at_part
+                        })
+                    {
+                        continue;
+                    }
+                    let keep_diag = forward || anchor.is_none() || !events.is_empty();
+                    match mapped {
+                        Mapped::Diag(d) => {
+                            if keep_diag {
+                                let sink = if forward { &mut pending } else { &mut diags };
+                                push_diag(sink, d, &mut truncated);
+                            }
+                        }
+                        Mapped::Event(event) => {
+                            let cost = event_cost(&event);
+                            if !events.is_empty()
+                                && (events.len() >= max_events || bytes + cost > request.max_bytes)
+                            {
+                                has_more = true;
+                                return Ok(false);
+                            }
+                            if forward {
+                                for d in pending.drain(..) {
+                                    push_diag(&mut diags, d, &mut truncated);
+                                }
+                            }
+                            bytes += cost;
+                            events.push((*event, row.id.clone()));
+                        }
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        if forward && !has_more {
+            for d in pending {
+                push_diag(&mut diags, d, &mut truncated);
+            }
+        }
+        if !forward {
+            events.reverse();
+            diags.reverse();
+        }
+        truncated |= events.iter().any(|(e, _)| event_truncated(e));
+        let next = if forward {
+            events.last()
+        } else {
+            events.first()
+        }
+        .map(|(e, id)| anchor_of(e, id));
+        Ok(TranscriptPage {
+            events: events.into_iter().map(|(e, _)| e).collect(),
+            diagnostics: diags,
+            next,
+            has_more,
+            truncated,
+        })
+    }
+
+    fn count_after(
+        &self,
+        conn: &Connection,
+        key: &SessionKey,
+        anchor: &PageAnchor,
+    ) -> Result<usize, ProviderError> {
+        self.check_session(conn, key)?;
+        let (created, at_part) = anchor_parts(anchor)?;
+        let record_cap = self.config.max_record_bytes;
+        let mapper = Mapper {
+            key,
+            version: None,
+            cap: 1,
+        };
+        let mut count = 0usize;
+        stream_rows(
+            conn,
+            &key.provider_session_id,
+            record_cap,
+            PageDirection::Forward,
+            Some((created, anchor.stable_id.as_str())),
+            |row| {
+                let same = row.created == created && row.id == anchor.stable_id;
+                count += mapper
+                    .map_row(&row, record_cap)
+                    .iter()
+                    .filter(|(part, mapped)| {
+                        matches!(mapped, Mapped::Event(_)) && !(same && *part <= at_part)
+                    })
+                    .count();
+                Ok(true)
+            },
+        )?;
+        Ok(count)
+    }
+
+    fn record(
+        &self,
+        conn: &Connection,
+        locator: &SourceLocator,
+    ) -> Result<SourceRecord, ProviderError> {
+        let LocatorKind::DbRow {
+            table,
+            row_id,
+            part_index,
+        } = &locator.kind
+        else {
+            return Err(ProviderError::Unsupported(
+                "not an OpenCode row locator".into(),
+            ));
+        };
+        if table != MESSAGE_TABLE {
+            return Err(ProviderError::Unsupported(
+                "locator names a table outside the OpenCode allowlist".into(),
+            ));
+        }
+        self.check_session(conn, &locator.session)?;
+        let session = &locator.session.provider_session_id;
+        let record_cap = self.config.max_record_bytes;
+        let cap = i64::try_from(record_cap).unwrap_or(i64::MAX);
+        let found = conn
+            .query_row(
+                "SELECT session_id, time_created, time_updated, substr(type, 1, ?3), \
+                 CASE WHEN length(data) <= ?2 THEN data END, length(data) \
+                 FROM session_message WHERE id = ?1 AND length(id) <= ?4",
+                params![
+                    row_id,
+                    cap,
+                    i64::try_from(TYPE_CHARS).unwrap_or(0),
+                    i64::try_from(ID_MAX).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    let ty = lossy(r.get_ref(3)?).unwrap_or_default();
+                    let data = lossy(r.get_ref(4)?);
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        RawRow {
+                            id: row_id.clone(),
+                            created: r.get(1)?,
+                            updated: r.get(2)?,
+                            ty,
+                            data,
+                            data_len: r.get(5)?,
+                        },
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(map_error(other)),
+            })?;
+        let Some((owner, row)) = found else {
+            return Err(ProviderError::Unavailable(
+                "source row no longer exists".into(),
+            ));
+        };
+        if owner != *session {
+            return Err(ProviderError::Unsupported(
+                "locator does not belong to this session".into(),
+            ));
+        }
+        if locator.generation != Some(generation(&row)) {
+            return Err(ProviderError::Unavailable(
+                "stale source locator: the row was updated".into(),
+            ));
+        }
+        let mapper = Mapper {
+            key: &locator.session,
+            version: None,
+            cap: 1,
+        };
+        if let Some(part) = part_index
+            && !mapper
+                .map_row(&row, record_cap)
+                .iter()
+                .any(|(p, _)| p == part)
+        {
+            return Err(ProviderError::Unavailable(
+                "locator names a part the record does not have".into(),
+            ));
+        }
+        let Some(raw) = row.data else {
+            let reason = if row.data_len.is_some() {
+                format!("record exceeds the {record_cap}-byte limit")
+            } else {
+                "record has no data".to_owned()
+            };
+            return Ok(SourceRecord {
+                raw: String::new(),
+                display: String::new(),
+                unavailable: Some(reason),
+            });
+        };
+        let display = display_safe(&raw);
+        Ok(SourceRecord {
+            raw,
+            display,
+            unavailable: None,
+        })
+    }
+}
+
+impl ProviderReader for OpenCodeScanner {
+    fn provider(&self) -> Provider {
+        Provider::OpenCode
+    }
+
+    fn refresh(
+        &mut self,
+        now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<ProviderDelta, ProviderError> {
+        self.scan_roster(now, budget)
+    }
+
+    fn transcript_page(
+        &mut self,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
+        request: PageRequest,
+    ) -> Result<TranscriptPage, ProviderError> {
+        self.guarded(|this, conn| this.page(conn, key, anchor.as_ref(), direction, request))
+    }
+
+    fn count_events_after(
+        &mut self,
+        key: &SessionKey,
+        anchor: &PageAnchor,
+    ) -> Result<usize, ProviderError> {
+        self.guarded(|this, conn| this.count_after(conn, key, anchor))
+    }
+
+    fn source_record(&mut self, locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
+        self.guarded(|this, conn| this.record(conn, locator))
+    }
 }

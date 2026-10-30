@@ -94,7 +94,7 @@ fn opens_read_only_with_authorizer_and_rejects_sensitive_tables() {
         "SELECT share_url FROM session_share",
         "SELECT share_url FROM session_v2",
         "SELECT * FROM session_v2",
-        "SELECT data FROM session_message",
+        "SELECT seq FROM session_message",
         "INSERT INTO project(id, name) VALUES ('x', 'y')",
         "UPDATE session_v2 SET title = 'x'",
         "DELETE FROM session_v2",
