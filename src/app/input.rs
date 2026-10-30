@@ -6,7 +6,9 @@
 
 use std::cell::Cell;
 
-use crate::domain::{ProcessAssociation, Provider, SessionSummary, StatusLabel, Timestamp};
+use crate::domain::{
+    ProcessAssociation, Provider, SessionKey, SessionSummary, StatusLabel, Timestamp,
+};
 use crate::processes::{self, ProcessInfo, ProcessSnapshot};
 
 use super::{App, FilterState, Focus, PROVIDERS, STATUS_ORDER, Screen, UsageAvailability};
@@ -36,8 +38,11 @@ struct Editing {
     buffer: String,
     /// Query to restore on `Esc`.
     backup: String,
-    /// Transcript selection when editing began; matches are searched from here.
-    origin: usize,
+    /// Event the transcript search began at (by identity: older pages may
+    /// prepend events while editing); matches are searched from here.
+    origin: Option<String>,
+    /// Roster selection when editing began, restored on `Esc`.
+    roster_key: Option<SessionKey>,
 }
 
 #[derive(Default)]
@@ -97,12 +102,18 @@ impl App {
         if self.input.editing.is_some() || self.input.panel != Panel::None {
             return false;
         }
-        let (scope, current, origin) = match (self.screen, &self.transcript) {
-            (Screen::Roster, _) => (SearchScope::Roster, self.filter.query.clone(), 0),
+        let (scope, current, origin, roster_key) = match (self.screen, &self.transcript) {
+            (Screen::Roster, _) => (
+                SearchScope::Roster,
+                self.filter.query.clone(),
+                None,
+                self.selected.clone(),
+            ),
             (Screen::Inspector, Some(t)) => (
                 SearchScope::Transcript,
                 t.search_query().to_owned(),
-                t.selected(),
+                t.selected_event().map(|e| e.id.clone()),
+                None,
             ),
             _ => return false,
         };
@@ -111,6 +122,7 @@ impl App {
             buffer: current.clone(),
             backup: current,
             origin,
+            roster_key,
         });
         self.focus = Focus::Search;
         true
@@ -156,12 +168,19 @@ impl App {
             return;
         };
         e.buffer = e.backup.clone();
-        let origin = e.origin;
+        let origin = e.origin.clone();
+        let key = e.roster_key.clone();
         self.apply_search();
         if let Some(t) = &mut self.transcript
             && self.screen == Screen::Inspector
+            && let Some(i) = origin.as_deref().and_then(|id| t.index_of(id))
         {
-            t.select_index(origin);
+            t.select_index(i);
+        }
+        if let Some(key) = key
+            && self.view.iter().any(|&i| self.sessions[i].key == key)
+        {
+            self.selected = Some(key);
         }
         self.input.editing = None;
         self.focus = Focus::Roster;
@@ -173,15 +192,19 @@ impl App {
         let Some(e) = &self.input.editing else {
             return;
         };
-        let (scope, buffer, origin) = (e.scope, e.buffer.clone(), e.origin);
+        let (scope, buffer) = (e.scope, e.buffer.clone());
+        let origin = e.origin.clone();
         match scope {
             SearchScope::Roster => self.set_query(&buffer),
             SearchScope::Transcript => {
                 if let Some(t) = &mut self.transcript {
                     t.set_search_query(&buffer);
                     // No match keeps the reader where the search began.
-                    let target = t.match_from(origin, true, true).unwrap_or(origin);
-                    t.select_index(target);
+                    let start = origin.as_deref().and_then(|id| t.index_of(id));
+                    if let Some(start) = start {
+                        let target = t.match_from(start, true, true).unwrap_or(start);
+                        t.select_index(target);
+                    }
                 }
                 self.pump_transcript();
             }
@@ -435,12 +458,23 @@ impl App {
     pub fn focus_next(&mut self) {
         match self.screen {
             Screen::Roster => {
-                self.open_inspector();
+                let retained = self
+                    .transcript
+                    .as_ref()
+                    .is_some_and(|t| Some(t.key()) == self.selected.as_ref());
+                if retained {
+                    self.screen = Screen::Inspector;
+                } else {
+                    self.open_inspector();
+                }
             }
             Screen::Inspector => {
                 self.open_details();
             }
-            Screen::Details => self.close_inspector(),
+            Screen::Details => {
+                // Focus moves; the transcript, overlays, and search stay.
+                self.screen = Screen::Roster;
+            }
             Screen::Source | Screen::Diagnostics => {}
         }
     }
@@ -448,7 +482,7 @@ impl App {
     /// `Shift+Tab`: the previous pane.
     pub fn focus_prev(&mut self) {
         match self.screen {
-            Screen::Inspector => self.close_inspector(),
+            Screen::Inspector => self.screen = Screen::Roster,
             Screen::Details => {
                 self.close_overlay();
             }

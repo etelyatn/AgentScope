@@ -285,6 +285,11 @@ impl Transcript {
         }
     }
 
+    /// Current window index of the event with `id`, if still loaded.
+    pub(super) fn index_of(&self, id: &str) -> Option<usize> {
+        self.events.iter().position(|e| e.id == id)
+    }
+
     pub(super) fn select_index(&mut self, index: usize) {
         if !self.events.is_empty() {
             self.selected = index.min(self.events.len() - 1);

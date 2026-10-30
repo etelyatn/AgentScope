@@ -568,3 +568,146 @@ fn tab_cycles_panes_and_ctrl_c_always_quits() {
         KeyAction::Quit
     );
 }
+
+fn backward_page_of(k: &SessionKey, range: std::ops::Range<u64>, has_more: bool) -> TranscriptPage {
+    let events: Vec<Event> = range
+        .clone()
+        .map(|i| event(k, i, EventKind::AssistantMessage, &format!("message {i}")))
+        .collect();
+    TranscriptPage {
+        next: Some(anchor(range.start)),
+        events,
+        diagnostics: vec![],
+        has_more,
+        truncated: false,
+    }
+}
+
+#[test]
+fn esc_restores_the_original_roster_selection_when_the_query_excluded_it() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    ch(&mut app, 'j');
+    assert_eq!(
+        app.selected_key(),
+        Some(key_of(Provider::Claude, "claude-1"))
+    );
+    ch(&mut app, '/');
+    type_text(&mut app, "sandbox");
+    assert_eq!(app.selected_key(), Some(key_of(Provider::OpenCode, "oc-9")));
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.visible_rows().len(), 3);
+    assert_eq!(
+        app.selected_key(),
+        Some(key_of(Provider::Claude, "claude-1")),
+        "Esc returns to the session selected before the search"
+    );
+}
+
+#[test]
+fn transcript_search_origin_survives_an_older_page_prepending() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    press(&mut app, KeyCode::Enter);
+    let k = key_of(Provider::Codex, "codex-1");
+    let requests = app.take_requests();
+    let Some(WorkerRequest::Select { request_id, .. }) = requests.first() else {
+        panic!("expected Select, got {requests:?}");
+    };
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::Transcript {
+            request_id: *request_id,
+            page: transcript_page(&k, &["only"]),
+        },
+    );
+    ch(&mut app, 'G');
+    let requests = app.take_requests();
+    let Some(WorkerRequest::LoadPage { request_id, .. }) = requests.last() else {
+        panic!("expected tail load, got {requests:?}");
+    };
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::Transcript {
+            request_id: *request_id,
+            page: backward_page_of(&k, 10..14, true),
+        },
+    );
+    // Start the search at e12 and type a query that jumps elsewhere.
+    ch(&mut app, 'j');
+    ch(&mut app, 'j');
+    let at = app
+        .transcript()
+        .unwrap()
+        .selected_event()
+        .unwrap()
+        .id
+        .clone();
+    ch(&mut app, '/');
+    type_text(&mut app, "message 13");
+    // An older page arrives while the input is open and prepends events.
+    let older = app
+        .take_requests()
+        .into_iter()
+        .find_map(|r| match r {
+            WorkerRequest::LoadPage {
+                request_id,
+                direction: PageDirection::Backward,
+                ..
+            } => Some(request_id),
+            _ => None,
+        })
+        .expect("older page requested near the window edge");
+    apply_worker_event(
+        &mut app,
+        &mut ctx,
+        WorkerEvent::Transcript {
+            request_id: older,
+            page: backward_page_of(&k, 6..10, true),
+        },
+    );
+    press(&mut app, KeyCode::Esc);
+    let t = app.transcript().unwrap();
+    assert_eq!(t.events().first().unwrap().id, "e6");
+    assert_eq!(
+        t.selected_event().unwrap().id,
+        at,
+        "same event after cancel"
+    );
+}
+
+#[test]
+fn tab_focus_cycling_retains_the_transcript_and_its_state() {
+    let mut app = new_app();
+    let mut ctx = ctx();
+    discover(&mut app, &mut ctx, 1);
+    open_with(&mut app, &mut ctx, &["alpha", "beta", "alpha two"]);
+    ch(&mut app, 'j');
+    press(&mut app, KeyCode::Enter);
+    ch(&mut app, '/');
+    type_text(&mut app, "alpha");
+    press(&mut app, KeyCode::Enter);
+    let selected = app.transcript().unwrap().selected();
+
+    press(&mut app, KeyCode::Tab); // details
+    press(&mut app, KeyCode::Tab); // roster
+    assert_eq!(app.screen, Screen::Roster);
+    assert!(app.transcript().is_some());
+    press(&mut app, KeyCode::Tab); // back to the same transcript
+    assert_eq!(app.screen, Screen::Inspector);
+    assert!(app.take_requests().is_empty(), "no reload on focus change");
+    press(&mut app, KeyCode::BackTab);
+    press(&mut app, KeyCode::Tab);
+    let t = app.transcript().unwrap();
+    assert_eq!(t.events().len(), 3);
+    assert_eq!(t.selected(), selected);
+    assert_eq!(t.search_query(), "alpha");
+    assert!(t.is_expanded(&t.events()[1]));
+    // Esc is the explicit close.
+    press(&mut app, KeyCode::Esc);
+    assert!(app.transcript().is_none());
+}
