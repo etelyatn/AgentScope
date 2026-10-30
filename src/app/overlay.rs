@@ -64,6 +64,7 @@ pub(super) struct Overlays {
     /// Record whose redaction is off; scoped to that locator, never persisted.
     reveal: Option<SourceLocator>,
     details_scroll: usize,
+    session_scroll: usize,
     diag_selected: usize,
     /// Largest scroll offset of the last rendered overlay body.
     extent: Cell<usize>,
@@ -95,6 +96,20 @@ impl App {
 
     pub fn details_scroll(&self) -> usize {
         self.overlays.details_scroll
+    }
+
+    pub fn session_scroll(&self) -> usize {
+        self.overlays.session_scroll
+    }
+
+    /// `i`: usage categories, pricing provenance and lineage of the open session.
+    pub fn open_session_info(&mut self) -> bool {
+        if self.screen != Screen::Inspector || self.transcript.is_none() {
+            return false;
+        }
+        self.overlays.session_scroll = 0;
+        self.screen = Screen::Session;
+        true
     }
 
     /// The selected diagnostics index, clamped to the current entries; the same
@@ -157,6 +172,7 @@ impl App {
         let apply = |v: &mut usize| *v = v.saturating_add_signed(delta).min(max);
         match self.screen {
             Screen::Details => apply(&mut self.overlays.details_scroll),
+            Screen::Session => apply(&mut self.overlays.session_scroll),
             Screen::Source => {
                 if let Some(s) = &mut self.overlays.source {
                     apply(&mut s.scroll);
@@ -271,7 +287,7 @@ impl App {
                     .unwrap_or(Screen::Inspector);
                 true
             }
-            Screen::Details | Screen::Diagnostics => {
+            Screen::Details | Screen::Diagnostics | Screen::Session => {
                 self.screen = Screen::Inspector;
                 true
             }

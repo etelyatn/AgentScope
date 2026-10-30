@@ -9,7 +9,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{App, PageKind, Transcript};
 use crate::domain::{
     AggregationClass, BoundedText, Event, EventKind, ProcessAssociation, SessionSummary, Timestamp,
-    ToolInteraction, ToolStatus, UsageSummary,
+    ToolInteraction, ToolStatus, UsageScope, UsageSummary,
 };
 use crate::ingest::text::display_safe;
 use crate::time::format_local;
@@ -72,7 +72,7 @@ pub fn render_inspector(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     let (footer_text, footer_style) = match app.search_input() {
         Some((_, text)) => (search_prompt(&display_safe(text)), palette.title()),
         None => (
-            "j/k move  Enter expand  / search  n/N match  d details  Esc back  ? help  q quit"
+            "j/k move  Enter expand  / search  n/N match  d details  i session  Esc back  ? help  q quit"
                 .to_string(),
             palette.dim(),
         ),
@@ -151,7 +151,7 @@ fn model_text(s: &SessionSummary) -> String {
         .map_or_else(|| "Unknown".into(), display_safe)
 }
 
-fn class_name(class: AggregationClass) -> &'static str {
+pub(super) fn class_name(class: AggregationClass) -> &'static str {
     match class {
         AggregationClass::Reported => "reported",
         AggregationClass::Derived => "derived",
@@ -162,7 +162,7 @@ fn class_name(class: AggregationClass) -> &'static str {
 }
 
 /// `73214` -> `73,214`.
-fn grouped(n: u64) -> String {
+pub(super) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -189,7 +189,7 @@ fn usage_text(s: &SessionSummary) -> String {
     )
 }
 
-fn cost_text(usage: Option<&UsageSummary>) -> String {
+pub(super) fn cost_text(usage: Option<&UsageSummary>) -> String {
     let Some(cost) = usage.map(|u| &u.cost) else {
         return "Unknown".into();
     };
@@ -447,6 +447,17 @@ pub(super) fn detail_lines(event: &Event) -> Vec<String> {
             out.push(format!("{REASONING_LABEL}; not hidden chain-of-thought"));
         }
         push_block(&mut out, "Text", event.text.as_ref());
+    }
+    if let Some(usage) = &event.usage {
+        out.push(format!(
+            "Usage ({}): {}",
+            match usage.scope {
+                UsageScope::Session => "session",
+                UsageScope::Turn => "turn",
+                UsageScope::Message => "message",
+            },
+            super::session::categories_text(&usage.categories)
+        ));
     }
     out
 }

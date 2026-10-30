@@ -88,6 +88,7 @@ pub enum Screen {
     Details,
     Source,
     Diagnostics,
+    Session,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

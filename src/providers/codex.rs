@@ -248,6 +248,12 @@ struct Parsed {
     /// Offsets of unpaired calls and orphan outputs, which render as tool rows.
     /// Every offset here was also counted in `hidden` when it was read.
     shown: BTreeSet<u64>,
+    /// `end` as of the last delta that emitted this session. A displayed row at an
+    /// earlier offset may be loaded by a consumer.
+    emitted_end: u64,
+    /// A row that was already emitted as displayed was retired or replaced since the
+    /// last check; the loaded page is stale. Consumed by the scan loop.
+    shown_changed: bool,
     /// Outputs with no call seen.
     orphans: u32,
     /// More calls were open than tracked, so later unmatched outputs are not orphans.
@@ -279,6 +285,20 @@ impl Parsed {
         }
     }
 
+    /// New genuine work after `task_complete` makes the session unfinished again;
+    /// `last_completion` keeps the earlier turn's timestamp.
+    fn retire_shown(&mut self, offset: u64) {
+        if self.shown.remove(&offset) && offset < self.emitted_end {
+            self.shown_changed = true;
+        }
+    }
+
+    fn reopen_turn(&mut self) {
+        if self.turn_open == Some(false) {
+            self.turn_open = Some(true);
+        }
+    }
+
     fn tool_completed(&mut self, item: &Value, ts: Option<Timestamp>) {
         self.display(ts);
         if !item_pending(item) {
@@ -292,10 +312,13 @@ impl Parsed {
         let payload = field(value, "payload");
         match classify(value) {
             Class::Message(p) => {
-                if field(p, "role").as_str() == Some("user") && self.prompt_title.is_none() {
+                if field(p, "role").as_str() == Some("user") {
                     let text = message_text(field(p, "content"));
                     if !is_injected(&text) {
-                        self.prompt_title = title_from(&text);
+                        if self.prompt_title.is_none() {
+                            self.prompt_title = title_from(&text);
+                        }
+                        self.reopen_turn();
                     }
                 }
                 self.display(ts);
@@ -378,13 +401,14 @@ impl Parsed {
     /// `item_completed` ID, which does not match in observed data.
     fn call(&mut self, offset: u64, p: &Value, ts: Option<Timestamp>) {
         self.hidden += 1;
+        self.reopen_turn();
         let Some(id) = text_field(p, "call_id") else {
             return;
         };
         if let Some(at) = self.calls.iter().position(|c| c.id == id)
             && let Some(previous) = self.calls.remove(at)
         {
-            self.shown.remove(&previous.offset);
+            self.retire_shown(previous.offset);
         }
         while self.calls.len() >= MAX_TRACKED && self.calls.front().is_some_and(|c| !c.open) {
             self.calls.pop_front();
@@ -412,7 +436,8 @@ impl Parsed {
             // `item_completed` claims it, so completions stay aligned with calls.
             if call.open {
                 call.open = false;
-                self.shown.remove(&call.offset);
+                let offset = call.offset;
+                self.retire_shown(offset);
             }
         } else if self.closed.remove(&id) {
             // The authoritative completion already replaced this call; stay source-only.
@@ -435,7 +460,7 @@ impl Parsed {
         if !call.open {
             return;
         }
-        self.shown.remove(&call.offset);
+        self.retire_shown(call.offset);
         if self.closed.len() >= MAX_CLOSED {
             self.pairing_overflow = true;
         } else {
@@ -855,7 +880,19 @@ impl CodexScanner {
             match record {
                 // A partial trailing line is held by the cursor until it completes.
                 Record::Incomplete { .. } => continue,
-                Record::Json { offset, ref value } => state.parsed.apply(offset, value),
+                Record::Skipping { .. } => {
+                    if meter.spent() {
+                        state.stamp();
+                        return Advance::Exhausted;
+                    }
+                    continue;
+                }
+                Record::Json { offset, ref value } => {
+                    state.parsed.apply(offset, value);
+                    if std::mem::take(&mut state.parsed.shown_changed) {
+                        state.invalidated = true;
+                    }
+                }
                 Record::Invalid { .. } => state.parsed.malformed += 1,
                 Record::TooLarge { .. } => state.parsed.oversized += 1,
             }
@@ -922,6 +959,7 @@ impl CodexScanner {
                     retired.push(old);
                 }
                 state.dirty = false;
+                state.parsed.emitted_end = state.parsed.end;
             }
         }
         (summaries, retired, invalidated)

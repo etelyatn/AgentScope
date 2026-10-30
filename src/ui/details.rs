@@ -28,17 +28,17 @@ const REDACTED_NOTICE: &str =
 const REVEALED_NOTICE: &str =
     "WARNING: redaction is OFF; secrets may be visible. x restores redaction.";
 
-struct Frame3 {
+pub(super) struct Frame3 {
     title: Rect,
-    body: Rect,
+    pub(super) body: Rect,
     status: Rect,
     footer: Rect,
-    width: usize,
+    pub(super) width: usize,
     palette: Palette,
 }
 
 /// Shared chrome. Returns `None` after drawing the too-small message.
-fn chrome(frame: &mut Frame, ctx: &RosterContext) -> Option<Frame3> {
+pub(super) fn chrome(frame: &mut Frame, ctx: &RosterContext) -> Option<Frame3> {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         let msg = format!(
@@ -70,7 +70,7 @@ fn chrome(frame: &mut Frame, ctx: &RosterContext) -> Option<Frame3> {
     })
 }
 
-fn put(frame: &mut Frame, f: &Frame3, title: &str, status: &str, footer: &str) {
+pub(super) fn put(frame: &mut Frame, f: &Frame3, title: &str, status: &str, footer: &str) {
     frame.render_widget(
         Paragraph::new(Line::styled(fit(title, f.width), f.palette.title())),
         f.title,
@@ -87,7 +87,7 @@ fn put(frame: &mut Frame, f: &Frame3, title: &str, status: &str, footer: &str) {
 
 /// Wrap `text` to `width` columns, one row per `\n`-separated line at least.
 /// Stops at [`MAX_ROWS`] and reports whether it did.
-fn wrap_into(rows: &mut Vec<String>, text: &str, width: usize) -> bool {
+pub(super) fn wrap_into(rows: &mut Vec<String>, text: &str, width: usize) -> bool {
     let width = width.max(1);
     for line in text.split('\n') {
         let mut row = String::new();
@@ -113,7 +113,7 @@ fn wrap_into(rows: &mut Vec<String>, text: &str, width: usize) -> bool {
 }
 
 /// Draw the visible slice of `rows` and report the scroll extent to `app`.
-fn draw_rows(frame: &mut Frame, app: &App, rows: &[String], scroll: usize, body: Rect) {
+pub(super) fn draw_rows(frame: &mut Frame, app: &App, rows: &[String], scroll: usize, body: Rect) {
     let height = body.height as usize;
     let max_scroll = rows.len().saturating_sub(height);
     app.set_overlay_extent(max_scroll);

@@ -1013,3 +1013,145 @@ fn opencode_shaped_activity_counts_surface_arrivals_before_the_baseline() {
     assert_eq!(app.new_event_count(), 3, "not 0 and not 1");
     assert!(draw(&app, 110, 30).contains("3 new"));
 }
+
+fn populated_usage() -> UsageSummary {
+    UsageSummary {
+        model: Some("claude-sonnet-test".into()),
+        categories: TokenCategories {
+            input: Some(1_200),
+            cached_input: None,
+            cache_write: Some(300),
+            cache_write_5m: Some(200),
+            cache_write_1h: Some(100),
+            cache_read: Some(40_000),
+            output: Some(5_555),
+            reasoning: Some(77),
+            total: Some(47_055),
+        },
+        total: Some(47_055),
+        class: AggregationClass::Reported,
+        cost: CostEstimate {
+            usd: Some(1.25),
+            class: AggregationClass::Estimated,
+            as_of: Some("2026-10-01".into()),
+            note: Some("server-tool fees excluded".into()),
+        },
+    }
+}
+
+fn open_empty(app: &mut App) {
+    open(app, page(vec![msg(0)], None, false));
+}
+
+#[test]
+fn session_info_shows_categories_dated_pricing_and_fee_exclusion_note() {
+    let mut s = summary(1);
+    s.usage = Some(populated_usage());
+    let mut app = app_with(s);
+    open_empty(&mut app);
+    assert!(
+        !draw(&app, 120, 30).contains("Cache read"),
+        "hidden until opened"
+    );
+    assert!(app.open_session_info());
+    assert_eq!(app.screen, agentscope::app::Screen::Session);
+    let screen = draw(&app, 140, 30);
+    for needle in [
+        "Input: 1,200",
+        "Cached input: —",
+        "Cache write: 300",
+        "Cache write 5m: 200",
+        "Cache write 1h: 100",
+        "Cache read: 40,000",
+        "Output: 5,555",
+        "Reasoning: 77",
+        "Total: 47,055",
+        "Pricing as of: 2026-10-01",
+        "Cost note: server-tool fees excluded",
+        "Priced model: claude-sonnet-test",
+        "web_search 3",
+    ] {
+        assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
+    }
+    // Esc returns to the inspector.
+    assert!(app.close_overlay());
+    assert_eq!(app.screen, agentscope::app::Screen::Inspector);
+}
+
+#[test]
+fn session_info_is_reachable_by_key_and_listed_in_the_inspector_footer() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = app_with(summary(1));
+    open_empty(&mut app);
+    assert!(draw(&app, 120, 30).contains("i session"));
+    agentscope::ui::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.screen, agentscope::app::Screen::Session);
+    agentscope::ui::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.screen, agentscope::app::Screen::Inspector);
+}
+
+#[test]
+fn session_info_renders_resolved_ambiguous_and_unresolved_lineage() {
+    let parent = SessionKey {
+        provider: Provider::Codex,
+        provider_session_id: "parent-7".into(),
+        source: SourceKey::File("parent-7.jsonl".into()),
+    };
+    let cases = [
+        (
+            Some(SessionLink::Resolved(parent)),
+            None,
+            true,
+            [
+                "Parent: resolved — Codex parent-7",
+                "Fork: none",
+                "Sidechain: yes",
+            ],
+        ),
+        (
+            Some(SessionLink::Ambiguous),
+            Some(SessionLink::Unresolved("fork-9".into())),
+            false,
+            [
+                "Parent: ambiguous",
+                "Fork: unresolved — id fork-9",
+                "Sidechain: no",
+            ],
+        ),
+    ];
+    for (parent, fork, sidechain, expected) in cases {
+        let mut s = summary(1);
+        s.lineage = Lineage {
+            parent,
+            fork,
+            sidechain,
+        };
+        let mut app = app_with(s);
+        open_empty(&mut app);
+        assert!(app.open_session_info());
+        let screen = draw(&app, 120, 30);
+        for needle in expected {
+            assert!(screen.contains(needle), "missing {needle:?}:\n{screen}");
+        }
+    }
+}
+
+#[test]
+fn event_details_show_per_event_usage_categories() {
+    let mut e = event(0, EventKind::AssistantMessage, "answer");
+    e.usage = Some(UsageObservation {
+        model: None,
+        scope: UsageScope::Message,
+        categories: populated_usage().categories,
+        provenance: provenance(),
+    });
+    let mut app = app_with(summary(1));
+    open(&mut app, page(vec![e], None, false));
+    assert!(app.open_details());
+    let screen = draw(&app, 160, 30);
+    assert!(screen.contains("Usage (message):"), "{screen}");
+    assert!(screen.contains("cache read 40,000"), "{screen}");
+}

@@ -482,7 +482,7 @@ impl App {
                 // Focus moves; the transcript, overlays, and search stay.
                 self.screen = Screen::Roster;
             }
-            Screen::Source | Screen::Diagnostics => {}
+            Screen::Source | Screen::Diagnostics | Screen::Session => {}
         }
     }
 
@@ -494,6 +494,9 @@ impl App {
                 self.close_overlay();
             }
             Screen::Roster | Screen::Source | Screen::Diagnostics => {}
+            Screen::Session => {
+                self.close_overlay();
+            }
         }
     }
 }

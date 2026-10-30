@@ -115,6 +115,7 @@ fn help_lines(screen: Screen) -> Vec<String> {
             out.push(key("v", "Source record (redacted)"));
             out.push(key("x", "Toggle redaction for the selection"));
             out.push(key("D", "Diagnostics: hidden and unknown records"));
+            out.push(key("i", "Session info: usage categories, pricing, lineage"));
             out.push(key("p", "Process candidates"));
             out.push(key("r", "Retry a failed load / refresh now"));
             out.push(key("Esc, Shift+Tab", "Back to the roster"));
@@ -125,6 +126,11 @@ fn help_lines(screen: Screen) -> Vec<String> {
             out.push(key("v", "Source record (redacted)"));
             out.push(key("x", "Toggle redaction for the selection"));
             out.push(key("D", "Diagnostics"));
+            out.push(key("Esc, Shift+Tab", "Back to the inspector"));
+        }
+        Screen::Session => {
+            out.push("# Session info".into());
+            out.push(key("j/k, PgUp/PgDn", "Scroll"));
             out.push(key("Esc, Shift+Tab", "Back to the inspector"));
         }
         Screen::Source => {

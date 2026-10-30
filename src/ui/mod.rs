@@ -7,6 +7,7 @@ mod details;
 mod inspector;
 mod panels;
 mod roster;
+mod session;
 pub mod widgets;
 
 use std::io::{self, Stdout};
@@ -37,6 +38,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &App, ctx: &RosterContext) {
         Screen::Details => details::render_details(frame, app, ctx),
         Screen::Source => details::render_source(frame, app, ctx),
         Screen::Diagnostics => details::render_diagnostics(frame, app, ctx),
+        Screen::Session => session::render_session(frame, app, ctx),
     }
     if app.panel() != Panel::None {
         panels::render_panel(frame, app, ctx);
@@ -259,7 +261,7 @@ fn page_move(app: &mut App, delta: isize) {
         return app.panel_move(delta);
     }
     match app.screen {
-        Screen::Details | Screen::Source => app.overlay_scroll(delta),
+        Screen::Details | Screen::Source | Screen::Session => app.overlay_scroll(delta),
         Screen::Diagnostics => app.diagnostics_move(delta),
         Screen::Inspector => app.inspector_move(delta),
         Screen::Roster => app.move_selection(delta),
@@ -268,7 +270,9 @@ fn page_move(app: &mut App, delta: isize) {
 
 fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
     match app.screen {
-        Screen::Details | Screen::Source => return handle_scroll_overlay_key(app, code),
+        Screen::Details | Screen::Source | Screen::Session => {
+            return handle_scroll_overlay_key(app, code);
+        }
         Screen::Diagnostics => return handle_diagnostics_key(app, code),
         _ => {}
     }
@@ -294,6 +298,9 @@ fn handle_inspector_key(app: &mut App, code: KeyCode) -> KeyAction {
         }
         KeyCode::Char('D') => {
             app.open_diagnostics();
+        }
+        KeyCode::Char('i') => {
+            app.open_session_info();
         }
         KeyCode::Char('x') => app.toggle_redaction(),
         KeyCode::Esc | KeyCode::Backspace => app.close_inspector(),

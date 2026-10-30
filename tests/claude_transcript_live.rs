@@ -352,7 +352,14 @@ fn enormous_oversized_record_is_indexed_across_bounded_steps() {
     let (_dir, path, mut scanner, key) = setup(&[assistant("a", json!("visible"))]);
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     writeln!(file, "{}", "x".repeat(10 * 1024 * 1024)).unwrap();
-    scanner.refresh(NOW, BUDGET).unwrap();
+    // The roster drains the oversized line under the refresh budget, so it takes
+    // several refreshes; the transcript index then builds in its own bounded steps.
+    let mut refreshes = 0;
+    while !scanner.refresh(NOW, BUDGET).unwrap().scan.done {
+        refreshes += 1;
+        assert!(refreshes < 1000, "scan never finished");
+    }
+    assert!(refreshes >= 2, "oversized drain must span refreshes");
     let mut retries = 0;
     loop {
         match scanner.transcript_page(&key, None, PageDirection::Forward, PAGE) {
@@ -435,4 +442,210 @@ fn large_uuid_many_blocks_hits_metadata_limit() {
         scanner.transcript_page(&key, None, PageDirection::Forward, PAGE),
         Err(agentscope::providers::ProviderError::Unsupported(_))
     ));
+}
+
+fn status_label(s: &agentscope::domain::SessionSummary) -> agentscope::domain::StatusLabel {
+    let thresholds = agentscope::domain::Thresholds {
+        quiet: std::time::Duration::from_secs(300),
+        stall: std::time::Duration::from_secs(900),
+    };
+    agentscope::status::synthesize(s, NOW, &thresholds).label
+}
+
+fn stamped(kind: &str, uuid: &str, ts: &str, stop: Option<&str>, content: Value) -> Value {
+    json!({"type":kind,"uuid":uuid,"sessionId":"s","timestamp":ts,
+        "message":{"id":uuid,"role":kind,"stop_reason":stop,"content":content}})
+}
+
+fn append(path: &std::path::Path, records: &[Value]) {
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    for r in records {
+        writeln!(f, "{r}").unwrap();
+    }
+    f.flush().unwrap();
+}
+
+#[test]
+fn stop_reason_drives_completion_unfinished_work_and_reopening() {
+    use agentscope::domain::{Lifecycle, StatusLabel};
+    let (_dir, path, mut s, _key) = setup(&[
+        stamped("user", "u1", "2026-10-29T10:00:00Z", None, json!("do it")),
+        stamped(
+            "assistant",
+            "a1",
+            "2026-10-29T10:00:01Z",
+            Some("tool_use"),
+            json!([{"type":"tool_use","id":"t1","name":"Read","input":{}}]),
+        ),
+    ]);
+    append(
+        &path,
+        &[
+            stamped(
+                "user",
+                "u2",
+                "2026-10-29T10:00:02Z",
+                None,
+                json!([{"type":"tool_result","tool_use_id":"t1","content":"ok"}]),
+            ),
+            stamped(
+                "assistant",
+                "a2",
+                "2026-10-29T10:00:03Z",
+                Some("end_turn"),
+                json!([{"type":"text","text":"all done"}]),
+            ),
+        ],
+    );
+    let done = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert_eq!(done.lifecycle, Lifecycle::Completed);
+    assert!(!done.unfinished_work);
+    let completed_at = done.last_completion.expect("end_turn is a completion");
+    assert_eq!(status_label(&done), StatusLabel::Complete);
+
+    // Later user work reopens it and keeps the earlier completion time.
+    append(
+        &path,
+        &[stamped(
+            "user",
+            "u3",
+            "2026-10-29T11:00:00Z",
+            None,
+            json!("one more thing"),
+        )],
+    );
+    let reopened = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert!(reopened.unfinished_work);
+    assert_eq!(reopened.lifecycle, Lifecycle::Ongoing);
+    assert_eq!(reopened.last_completion, Some(completed_at));
+    assert_ne!(status_label(&reopened), StatusLabel::Complete);
+
+    // A tool_use stop keeps it open; injected-only user text does not reopen.
+    append(
+        &path,
+        &[stamped(
+            "assistant",
+            "a3",
+            "2026-10-29T11:00:01Z",
+            Some("end_turn"),
+            json!("fine"),
+        )],
+    );
+    let closed = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert!(!closed.unfinished_work);
+    append(
+        &path,
+        &[stamped(
+            "user",
+            "u4",
+            "2026-10-29T11:00:02Z",
+            None,
+            json!("<system-reminder>ignore</system-reminder>"),
+        )],
+    );
+    let still = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert!(!still.unfinished_work, "injected text is not user work");
+    append(
+        &path,
+        &[stamped(
+            "assistant",
+            "a4",
+            "2026-10-29T11:00:03Z",
+            Some("tool_use"),
+            json!([{"type":"tool_use","id":"t2","name":"Bash","input":{}}]),
+        )],
+    );
+    let pending = s.refresh(NOW, BUDGET).unwrap().sessions.remove(0);
+    assert!(pending.unfinished_work);
+    assert_eq!(pending.lifecycle, Lifecycle::Ongoing);
+}
+
+#[test]
+fn result_appended_for_a_displayed_pending_call_invalidates_the_session() {
+    let (_dir, path, mut s, key) = setup(&[assistant(
+        "a",
+        json!([{"type":"tool_use","id":"c","name":"Read","input":{}}]),
+    )]);
+    let page = |s: &mut ClaudeScanner| {
+        s.transcript_page(
+            &key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                ..PAGE
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        page(&mut s).events[0].tool.as_ref().unwrap().status,
+        agentscope::domain::ToolStatus::Pending
+    );
+    // An unrelated append leaves the displayed row alone.
+    append(&path, &[assistant("b", json!("note"))]);
+    assert!(s.refresh(NOW, BUDGET).unwrap().invalidated.is_empty());
+
+    append(
+        &path,
+        &[
+            json!({"type":"user","uuid":"r","message":{"content":[{"type":"tool_result","tool_use_id":"c","content":"done"}]}}),
+        ],
+    );
+    let delta = s.refresh(NOW, BUDGET).unwrap();
+    assert_eq!(delta.invalidated, vec![key.clone()]);
+    let after = page(&mut s);
+    assert_eq!(
+        after.events[0].tool.as_ref().unwrap().status,
+        agentscope::domain::ToolStatus::Completed
+    );
+}
+
+#[test]
+fn growing_in_place_rewrite_resets_state_and_invalidates() {
+    use std::io::Seek;
+    let (_dir, path, mut s, key) = setup(&[
+        assistant("a", json!("old content one")),
+        assistant("b", json!("old content two")),
+    ]);
+    // Same file, same identity: overwrite the consumed bytes and grow past them.
+    let new: String = ["new first", "new second", "new third", "new fourth"]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("{}\n", assistant(&format!("n{i}"), json!(t))))
+        .collect();
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(std::io::SeekFrom::Start(0)).unwrap();
+    f.write_all(new.as_bytes()).unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let delta = s.refresh(NOW, BUDGET).unwrap();
+    assert!(
+        delta.invalidated.contains(&key),
+        "rewrite must invalidate: {:?}",
+        delta.invalidated
+    );
+    let summary = &delta.sessions[0];
+    assert_eq!(summary.displayed_event_count, 4);
+    let page = s
+        .transcript_page(
+            &key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                ..PAGE
+            },
+        )
+        .unwrap();
+    let texts: Vec<_> = page
+        .events
+        .iter()
+        .map(|e| e.text.as_ref().unwrap().preview.clone())
+        .collect();
+    assert_eq!(
+        texts,
+        ["new first", "new second", "new third", "new fourth"]
+    );
 }

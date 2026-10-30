@@ -50,11 +50,23 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// Raw and display forms of a persisted source record, or why it is unavailable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Debug` is deliberately content-free: records may hold prompts, tool output
+/// or credentials, so only lengths and availability are printed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceRecord {
     pub raw: String,
     pub display: String,
     pub unavailable: Option<String>,
+}
+
+impl fmt::Debug for SourceRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceRecord")
+            .field("raw_len", &self.raw.len())
+            .field("display_len", &self.display.len())
+            .field("unavailable", &self.unavailable.is_some())
+            .finish()
+    }
 }
 
 pub trait ProviderReader: Send {

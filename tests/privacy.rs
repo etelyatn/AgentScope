@@ -336,3 +336,21 @@ fn page_direction_is_irrelevant_to_masking() {
         }
     }
 }
+
+#[test]
+fn source_record_debug_is_content_free() {
+    use agentscope::providers::SourceRecord;
+    let record = SourceRecord {
+        raw: format!("{{\"prompt\":\"{SENTINEL}\"}}"),
+        display: format!("tool output {INLINE_SECRET}"),
+        unavailable: Some("SECRET-CREDENTIAL".to_string()),
+    };
+    assert_clean_debug("source record", &record);
+    let event = WorkerEvent::Source {
+        request_id: 7,
+        record,
+    };
+    assert_clean_debug("worker source event", &event);
+    let text = format!("{event:?}");
+    assert!(text.contains("raw_len"), "lengths still shown: {text}");
+}

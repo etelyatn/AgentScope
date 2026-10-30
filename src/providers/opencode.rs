@@ -2336,3 +2336,72 @@ impl ProviderReader for OpenCodeScanner {
         self.guarded(|this, conn| this.record(conn, locator))
     }
 }
+
+/// OpenCode reader that stays registered when the database cannot be opened yet
+/// (locked, still being created, sidecar unavailable). Each refresh and request
+/// retries opening, so a transient failure at startup is not permanent.
+pub struct RetryingOpenCode {
+    config: Config,
+    scanner: Option<OpenCodeScanner>,
+}
+
+impl RetryingOpenCode {
+    /// Tries to open once; the error, if any, is returned so the caller can note it.
+    pub fn open(config: &Config) -> (Self, Option<ProviderError>) {
+        let (scanner, error) = match OpenCodeScanner::new(config) {
+            Ok(scanner) => (Some(scanner), None),
+            Err(error) => (None, Some(error)),
+        };
+        (
+            Self {
+                config: config.clone(),
+                scanner,
+            },
+            error,
+        )
+    }
+
+    fn scanner(&mut self) -> Result<&mut OpenCodeScanner, ProviderError> {
+        if self.scanner.is_none() {
+            self.scanner = Some(OpenCodeScanner::new(&self.config)?);
+        }
+        Ok(self.scanner.as_mut().expect("opened"))
+    }
+}
+
+impl ProviderReader for RetryingOpenCode {
+    fn provider(&self) -> Provider {
+        Provider::OpenCode
+    }
+
+    fn refresh(
+        &mut self,
+        now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<ProviderDelta, ProviderError> {
+        self.scanner()?.refresh(now, budget)
+    }
+
+    fn transcript_page(
+        &mut self,
+        key: &SessionKey,
+        anchor: Option<PageAnchor>,
+        direction: PageDirection,
+        request: PageRequest,
+    ) -> Result<TranscriptPage, ProviderError> {
+        self.scanner()?
+            .transcript_page(key, anchor, direction, request)
+    }
+
+    fn count_events_after(
+        &mut self,
+        key: &SessionKey,
+        anchor: &PageAnchor,
+    ) -> Result<usize, ProviderError> {
+        self.scanner()?.count_events_after(key, anchor)
+    }
+
+    fn source_record(&mut self, locator: &SourceLocator) -> Result<SourceRecord, ProviderError> {
+        self.scanner()?.source_record(locator)
+    }
+}

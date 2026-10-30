@@ -189,3 +189,52 @@ fn larger_replacement_is_detected_even_if_creation_time_is_preserved() {
     );
     assert_eq!(cursor.rotation_count(), 1);
 }
+
+#[test]
+fn oversized_line_is_drained_in_resumable_chunks() {
+    let (_dir, path) = temp();
+    // Far larger than the reader's chunk size and the record cap.
+    let mut bytes = vec![b'x'; 1024 * 1024];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"{\"after\":1}\n");
+    append(&path, &bytes);
+    let mut cursor = JsonlCursor::open(path.clone(), 1024).unwrap();
+    let mut skips = 0usize;
+    let mut last = cursor.position();
+    let outcome = loop {
+        let record = cursor.next_record().unwrap().unwrap();
+        match record {
+            Record::Skipping { offset } => {
+                assert_eq!(offset, 0);
+                let now = cursor.position();
+                assert!(now > last, "every call makes progress");
+                // Each call is bounded: it never swallows the whole line.
+                assert!(now - last <= 64 * 1024, "chunk of {} bytes", now - last);
+                last = now;
+                skips += 1;
+            }
+            other => break other,
+        }
+    };
+    assert!(skips > 10, "drained in {skips} steps");
+    assert!(matches!(outcome, Record::TooLarge { offset: 0 }));
+    assert!(matches!(
+        cursor.next_record().unwrap(),
+        Some(Record::Json { ref value, .. }) if value["after"] == 1
+    ));
+}
+
+#[test]
+fn oversized_line_without_terminator_reports_incomplete_after_draining() {
+    let (_dir, path) = temp();
+    append(&path, &vec![b'y'; 200 * 1024]);
+    let mut cursor = JsonlCursor::open(path.clone(), 1024).unwrap();
+    loop {
+        match cursor.next_record().unwrap().unwrap() {
+            Record::Skipping { .. } => {}
+            Record::Incomplete { offset: 0 } => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(cursor.next_record().unwrap().is_none());
+}

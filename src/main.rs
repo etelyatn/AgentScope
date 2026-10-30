@@ -6,7 +6,7 @@ use agentscope::ingest::text::display_safe;
 use agentscope::providers::ProviderReader;
 use agentscope::providers::claude::ClaudeScanner;
 use agentscope::providers::codex::CodexScanner;
-use agentscope::providers::opencode::OpenCodeScanner;
+use agentscope::providers::opencode::RetryingOpenCode;
 use agentscope::ui::{self, RosterContext};
 use agentscope::worker::WorkerHandle;
 use std::ffi::OsString;
@@ -187,10 +187,16 @@ fn build_readers(config: &Config) -> (Vec<Box<dyn ProviderReader>>, Vec<String>)
         "Claude",
         ClaudeScanner::new(config).map(|r| Box::new(r) as Box<dyn ProviderReader>),
     );
-    add(
-        "OpenCode",
-        OpenCodeScanner::new(config).map(|r| Box::new(r) as Box<dyn ProviderReader>),
-    );
+    // Stays registered when the first open fails; refreshes retry.
+    let (opencode, opened) = RetryingOpenCode::open(config);
+    match opened {
+        None => readers.push(Box::new(opencode)),
+        Some(error) if config.providers.opencode.db.is_some() => {
+            notes.push(format!("OpenCode unavailable: {error}; retrying"));
+            readers.push(Box::new(opencode));
+        }
+        Some(error) => notes.push(format!("OpenCode unavailable: {error}")),
+    }
     (readers, notes)
 }
 
@@ -237,6 +243,7 @@ fn inspect(path: PathBuf) -> io::Result<()> {
             }
             Record::Invalid { offset } => writeln!(stderr, "Invalid JSON record at byte {offset}")?,
             Record::TooLarge { offset } => writeln!(stderr, "Oversized record at byte {offset}")?,
+            Record::Skipping { .. } => {}
             Record::Incomplete { offset } => {
                 writeln!(stderr, "Incomplete record at byte {offset}")?
             }

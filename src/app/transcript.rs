@@ -704,7 +704,14 @@ impl Transcript {
         self.older = continuation;
         self.newer = newer;
         if self.newer.is_none() {
-            self.newest_refreshed();
+            if self.mark.is_some() && self.selected + 1 < self.events.len() {
+                // A background reload must not consume arrivals the reader has not
+                // reached: keep the unread boundary and recount against it.
+                self.count_pending = None;
+                self.probed = None;
+            } else {
+                self.newest_refreshed();
+            }
         }
         self.drop_front();
         self.drop_back();

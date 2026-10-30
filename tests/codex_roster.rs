@@ -1001,3 +1001,153 @@ fn cursorless_rewrite_reports_invalidated_but_append_does_not() {
         "rewrite without a cursor must invalidate: {invalidated:?}"
     );
 }
+
+fn append_lines(path: &std::path::Path, lines: &[String]) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    for line in lines {
+        writeln!(f, "{line}").unwrap();
+    }
+}
+
+fn status_label(s: &SessionSummary) -> agentscope::domain::StatusLabel {
+    let thresholds = agentscope::domain::Thresholds {
+        quiet: std::time::Duration::from_secs(300),
+        stall: std::time::Duration::from_secs(900),
+    };
+    agentscope::status::synthesize(s, NOW, &thresholds).label
+}
+
+#[test]
+fn user_prompt_or_pending_call_after_task_complete_reopens_the_turn() {
+    use agentscope::domain::StatusLabel;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let target = dated(&root, "rollout-reopen.jsonl");
+    write_lines(
+        &target,
+        &[
+            session_meta("2026-10-29T10:00:00Z", "reopen", "/p"),
+            task_started("2026-10-29T10:00:01Z", Some(1000)),
+            user("2026-10-29T10:00:02Z", "first"),
+            assistant("2026-10-29T10:00:03Z", "done"),
+            task_complete("2026-10-29T10:00:04Z"),
+        ],
+    );
+    let mut s = scanner(&root);
+    let done = scan_until_done(&mut s, BIG);
+    let first = only(&done).clone();
+    assert_eq!(first.lifecycle, Lifecycle::Completed);
+    assert!(!first.unfinished_work);
+    assert_eq!(status_label(&first), StatusLabel::Complete);
+    let completed_at = first.last_completion.expect("completion recorded");
+
+    // A later genuine user prompt reopens the turn but keeps the old completion time.
+    append_lines(&target, &[user("2026-10-29T10:05:00Z", "follow up")]);
+    let reopened = scan_until_done(&mut s, BIG);
+    let reopened = only(&reopened);
+    assert!(reopened.unfinished_work);
+    assert_eq!(reopened.lifecycle, Lifecycle::Ongoing);
+    assert_eq!(reopened.last_completion, Some(completed_at));
+    assert_ne!(status_label(reopened), StatusLabel::Complete);
+
+    // Injected context is not a genuine prompt.
+    append_lines(&target, &[task_complete("2026-10-29T10:05:30Z")]);
+    scan_until_done(&mut s, BIG);
+    append_lines(
+        &target,
+        &[user(
+            "2026-10-29T10:06:00Z",
+            "<environment_context>cwd</environment_context>",
+        )],
+    );
+    let injected = scan_until_done(&mut s, BIG);
+    assert!(injected.sessions.values().all(|x| !x.unfinished_work));
+
+    // A new pending call reopens it as well.
+    append_lines(
+        &target,
+        &[function_call("2026-10-29T10:07:00Z", "c1", "shell", "{}")],
+    );
+    let pending = scan_until_done(&mut s, BIG);
+    let pending = only(&pending);
+    assert!(pending.unfinished_work);
+    assert_eq!(pending.lifecycle, Lifecycle::Ongoing);
+    assert_ne!(status_label(pending), StatusLabel::Complete);
+}
+
+#[test]
+fn output_appended_for_a_displayed_pending_call_invalidates_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let target = dated(&root, "rollout-pending.jsonl");
+    write_lines(
+        &target,
+        &[
+            session_meta("2026-10-29T10:00:00Z", "pend", "/p"),
+            task_started("2026-10-29T10:00:01Z", None),
+            function_call("2026-10-29T10:00:02Z", "c1", "shell", "{}"),
+        ],
+    );
+    let mut s = scanner(&root);
+    let first = scan_until_done(&mut s, BIG);
+    let before = only(&first).displayed_event_count;
+    // Unrelated append: nothing displayed changes.
+    append_lines(&target, &[assistant("2026-10-29T10:00:03Z", "working")]);
+    let quiet = s.scan_roster(NOW, BIG).unwrap();
+    assert!(quiet.invalidated.is_empty(), "{:?}", quiet.invalidated);
+
+    append_lines(
+        &target,
+        &[function_output("2026-10-29T10:00:04Z", "c1", "ok")],
+    );
+    let delta = s.scan_roster(NOW, BIG).unwrap();
+    assert!(
+        delta
+            .invalidated
+            .iter()
+            .any(|k| k.provider_session_id == "pend"),
+        "retiring a displayed pending row must invalidate: {:?}",
+        delta.invalidated
+    );
+    assert!(delta.sessions[0].displayed_event_count < before + 1);
+}
+
+#[test]
+fn oversized_line_is_consumed_under_the_refresh_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let target = dated(&root, "rollout-huge.jsonl");
+    write_lines(
+        &target,
+        &[session_meta("2026-10-29T10:00:00Z", "huge", "/p")],
+    );
+    append_lines(&target, &["z".repeat(4 * 1024 * 1024)]);
+    append_lines(&target, &[user("2026-10-29T10:00:05Z", "after")]);
+    let small = RefreshBudget {
+        max_records: 100_000,
+        max_bytes: 256 * 1024,
+        max_millis: 60_000,
+    };
+    let mut s = scanner(&root);
+    let mut steps = 0;
+    let mut final_summary = None;
+    loop {
+        let delta = s.scan_roster(NOW, small).expect("scan");
+        steps += 1;
+        if let Some(sum) = delta.sessions.into_iter().next() {
+            final_summary = Some(sum);
+        }
+        if delta.scan.done {
+            break;
+        }
+        assert!(steps < 10_000);
+    }
+    assert!(steps >= 8, "4 MiB at 256 KiB per step took {steps} steps");
+    let sum = final_summary.expect("session emitted");
+    assert!(warning(&sum, "#oversized").is_some());
+    assert_eq!(
+        sum.displayed_event_count, 1,
+        "the record after the huge line is read"
+    );
+}

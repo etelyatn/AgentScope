@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use chrono::DateTime;
 use serde_json::Value;
@@ -415,6 +415,10 @@ struct State {
     metadata_max_entries: usize,
     metadata_max_bytes: usize,
     counts_approximate: bool,
+    /// Scan pass whose start-of-visit prefix check already ran for this source.
+    checked_pass: u64,
+    /// Length and modified time at the last prefix check.
+    stamp: Option<(u64, Option<SystemTime>)>,
 }
 impl State {
     fn new(source: SourceFile, entries: usize, bytes: usize) -> Self {
@@ -485,7 +489,33 @@ impl State {
             metadata_max_entries: entries,
             metadata_max_bytes: bytes,
             counts_approximate: false,
+            checked_pass: 0,
+            stamp: None,
         }
+    }
+    /// Whether the file still holds the bytes this cursor consumed. A same-file
+    /// rewrite that also grows the file looks like an append to the cursor, so the
+    /// consumed prefix is verified whenever the file changed since the last check.
+    fn prefix_intact(&self, path: &Path) -> bool {
+        let Some(cursor) = &self.cursor else {
+            return true;
+        };
+        let end = cursor.position();
+        if end == 0 {
+            return true;
+        }
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if meta.len() < end {
+            return false;
+        }
+        if end > PREFIX_VERIFY_MAX {
+            return self
+                .fingerprint
+                .is_some_and(|(e, h)| e == end && fingerprint(path, end) == Some(h));
+        }
+        cursor.prefix_samples_intact().unwrap_or(false)
     }
     fn reset(&mut self, source: SourceFile, entries: usize, bytes: usize) {
         let emitted = self.emitted.take();
@@ -519,6 +549,57 @@ impl State {
         }
         self.dirty = true;
     }
+    /// Turn lifecycle from persisted evidence: an `end_turn` stop completes the turn,
+    /// a `tool_use` stop or later genuine user/tool work leaves it open. Sidechains
+    /// belong to subagents and never move the parent's lifecycle.
+    fn track_turn(&mut self, kind: &str, v: &Value) {
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let msg = &v["message"];
+        match kind {
+            "assistant" => match msg.get("stop_reason").and_then(Value::as_str) {
+                Some("end_turn") => {
+                    self.summary.last_completion = v
+                        .get("timestamp")
+                        .and_then(timestamp)
+                        .or(self.summary.last_persisted_at)
+                        .or(self.summary.last_completion);
+                    self.summary.unfinished_work = false;
+                    self.summary.lifecycle = Lifecycle::Completed;
+                }
+                Some("tool_use") => self.open_turn(),
+                _ => {}
+            },
+            "user" if v.get("isMeta").and_then(Value::as_bool) != Some(true) => {
+                let genuine = match &msg["content"] {
+                    Value::String(s) => !injected(s),
+                    Value::Array(parts) => {
+                        parts
+                            .iter()
+                            .any(|p| match p.get("type").and_then(Value::as_str) {
+                                Some("tool_result") => true,
+                                Some("text") => p
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|t| !injected(t)),
+                                _ => false,
+                            })
+                    }
+                    _ => false,
+                };
+                // Without earlier turn evidence a prompt alone proves nothing.
+                if genuine && self.summary.lifecycle != Lifecycle::Unknown {
+                    self.open_turn();
+                }
+            }
+            _ => {}
+        }
+    }
+    fn open_turn(&mut self) {
+        self.summary.unfinished_work = true;
+        self.summary.lifecycle = Lifecycle::Ongoing;
+    }
     fn ingest(&mut self, offset: u64, v: &Value, prices: &crate::config::PriceSchedule) {
         if let Some(id) = string(v, "sessionId") {
             self.summary.key.provider_session_id = id;
@@ -549,6 +630,7 @@ impl State {
                 Some(self.summary.last_persisted_at.map_or(t, |old| old.max(t)));
         }
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        self.track_turn(kind, v);
         if kind == "ai-title" {
             self.generated = v
                 .get("aiTitle")
@@ -715,13 +797,23 @@ impl State {
             }
             let old_tool_count = self.tool_count;
             if rebuild_tools {
+                self.invalidated = true;
                 self.calls.clear();
                 let mut rows: Vec<_> = self.tool_rows.values().collect();
                 rows.sort_unstable_by_key(|row| (row.offset, row.index));
                 self.tool_count = rows.into_iter().map(|row| row.apply(&mut self.calls)).sum();
             } else {
                 for key in &new_tools {
-                    self.tool_count += self.tool_rows[key].apply(&mut self.calls);
+                    let row = &self.tool_rows[key];
+                    // A result that retires an already-displayed pending call changes
+                    // that row in place, so a loaded page is stale.
+                    if !row.call
+                        && self.emitted.is_some()
+                        && row.id.as_ref().is_some_and(|id| self.calls.contains(id))
+                    {
+                        self.invalidated = true;
+                    }
+                    self.tool_count += row.apply(&mut self.calls);
                 }
             }
             self.summary.displayed_event_count =
@@ -783,6 +875,7 @@ impl State {
     }
 }
 struct Pass {
+    id: u64,
     sources: Vec<SourceFile>,
     next: usize,
 }
@@ -792,6 +885,7 @@ pub struct ClaudeScanner {
     states: HashMap<PathBuf, State>,
     pass: Option<Pass>,
     index: Option<TranscriptIndex>,
+    pass_counter: u64,
 }
 impl ClaudeScanner {
     /// Map persisted records without paging or loading source files.
@@ -804,6 +898,7 @@ impl ClaudeScanner {
             states: HashMap::new(),
             pass: None,
             index: None,
+            pass_counter: 0,
         })
     }
     pub fn scan_roster(
@@ -817,7 +912,9 @@ impl ClaudeScanner {
             None => {
                 let d = discover_claude(&self.config)?;
                 warnings = d.warnings;
+                self.pass_counter += 1;
                 Pass {
+                    id: self.pass_counter,
                     sources: d.sources,
                     next: 0,
                 }
@@ -849,6 +946,29 @@ impl ClaudeScanner {
                         self.config.dedup_ledger_bytes,
                     );
                 }
+            }
+            if state.checked_pass != pass.id {
+                state.checked_pass = pass.id;
+                let meta = std::fs::metadata(&source.path)
+                    .ok()
+                    .map(|m| (m.len(), m.modified().ok()));
+                if state.cursor.is_some()
+                    && meta.is_some()
+                    && meta != state.stamp
+                    && !state.prefix_intact(&source.path)
+                {
+                    // Consumed bytes changed in place: nothing parsed from them holds.
+                    state.reset(
+                        source.clone(),
+                        self.config.dedup_ledger_entries,
+                        self.config.dedup_ledger_bytes,
+                    );
+                    state.cursor =
+                        JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
+                    state.invalidated = true;
+                    state.checked_pass = pass.id;
+                }
+                state.stamp = meta;
             }
             let Some(cursor) = state.cursor.as_mut() else {
                 state.summary.source_available = false;
@@ -901,6 +1021,10 @@ impl ClaudeScanner {
                 Ok(Some(Record::Incomplete { .. })) => {
                     state.summary.source_available = true;
                     pass.next += 1;
+                }
+                Ok(Some(Record::Skipping { .. })) => {
+                    // Oversized line still draining; bytes were charged above.
+                    state.summary.source_available = true;
                 }
                 Ok(Some(Record::Invalid { .. })) => {
                     state.summary.source_available = true;
@@ -1621,6 +1745,7 @@ fn ensure_index<'a>(
                         hidden: true,
                     })
                 }
+                Some(Record::Skipping { .. }) => continue,
                 Some(Record::Incomplete { .. }) | None => break,
             }
             index.base_diags = index.diagnostics.len();
