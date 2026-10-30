@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Local implementation worktrees
+/.worktrees/
+
 # Private machine-specific development workspace
 /.local/
 
