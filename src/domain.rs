@@ -90,6 +90,8 @@ impl fmt::Debug for BoundedText {
 pub struct SourceLocator {
     pub session: SessionKey,
     pub kind: LocatorKind,
+    /// Opaque identity of the scanned source generation.
+    pub generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

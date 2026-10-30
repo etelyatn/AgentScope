@@ -1367,6 +1367,7 @@ fn tool_parts(item: &Value) -> ToolParts {
 struct Mapper<'a> {
     key: &'a SessionKey,
     path: &'a Path,
+    generation: u64,
     version: Option<&'a str>,
     shown: &'a BTreeSet<u64>,
     cap: usize,
@@ -1381,6 +1382,7 @@ impl Mapper<'_> {
     fn locator(&self, offset: u64) -> SourceLocator {
         SourceLocator {
             session: self.key.clone(),
+            generation: Some(self.generation),
             kind: LocatorKind::FileOffset {
                 path: self.path.to_path_buf(),
                 offset,
@@ -2051,6 +2053,7 @@ impl ProviderReader for CodexScanner {
         let mapper = Mapper {
             key,
             path: &state.source.path,
+            generation: state.parsed.generation,
             version: state.parsed.version.as_deref(),
             shown: &state.parsed.shown,
             cap: request.max_bytes.clamp(1, PREVIEW_CAP),
@@ -2099,6 +2102,9 @@ impl ProviderReader for CodexScanner {
             ));
         };
         let state = find(&self.states, &locator.session)?;
+        if locator.generation != Some(state.parsed.generation) {
+            return Err(ProviderError::Unavailable("stale source locator".into()));
+        }
         if *path != state.source.path {
             return Err(ProviderError::Unsupported(
                 "locator does not belong to this session source".into(),

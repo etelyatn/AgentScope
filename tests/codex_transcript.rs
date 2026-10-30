@@ -317,6 +317,7 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
     let bad = [
         SourceLocator {
             session: good.session.clone(),
+            generation: good.generation,
             kind: LocatorKind::FileOffset {
                 path: other_path,
                 offset: *offset,
@@ -328,6 +329,7 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
                 ..good.session.clone()
             },
             kind: good.kind.clone(),
+            generation: good.generation,
         },
         SourceLocator {
             session: SessionKey {
@@ -335,9 +337,11 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
                 ..good.session.clone()
             },
             kind: good.kind.clone(),
+            generation: good.generation,
         },
         SourceLocator {
             session: good.session.clone(),
+            generation: good.generation,
             kind: LocatorKind::FileOffset {
                 path: path.clone(),
                 offset: offset + 3, // mid-record
@@ -345,6 +349,7 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
         },
         SourceLocator {
             session: good.session.clone(),
+            generation: good.generation,
             kind: LocatorKind::FileOffset {
                 path: path.clone(),
                 offset: 10_000_000,
@@ -352,6 +357,7 @@ fn suppressed_custom_calls_are_source_only_and_addressable() {
         },
         SourceLocator {
             session: good.session.clone(),
+            generation: good.generation,
             kind: LocatorKind::DbRow {
                 table: "t".into(),
                 row_id: "1".into(),
@@ -568,6 +574,8 @@ fn partial_append_rotation_and_oversized_records_are_safe() {
     scan(&mut f.scanner);
     let page = first(&mut f, &s.key);
     assert_eq!(page.events.len(), 3);
+    let old_locator = page.events[0].provenance.locator.clone();
+    assert!(f.scanner.source_record(&old_locator).is_ok());
     let old_anchor = anchor_of(&page.events[2]);
 
     // Rotation: a shorter replacement restarts the transcript; stale anchors yield nothing.
@@ -582,6 +590,12 @@ fn partial_append_rotation_and_oversized_records_are_safe() {
     assert!(summaries.iter().any(|x| x.key == s.key));
     let page = first(&mut f, &s.key);
     assert_eq!(page.events.len(), 1);
+    assert!(f.scanner.source_record(&old_locator).is_err());
+    assert!(
+        f.scanner
+            .source_record(&page.events[0].provenance.locator)
+            .is_ok()
+    );
     assert_eq!(page.events[0].text.as_ref().unwrap().preview, "fresh");
     let stale = f
         .scanner

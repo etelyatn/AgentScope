@@ -64,6 +64,7 @@ fn reader_is_send_and_object_safe() {
 
 fn dummy_locator() -> SourceLocator {
     SourceLocator {
+        generation: None,
         session: SessionKey {
             provider: Provider::Codex,
             provider_session_id: "s".into(),

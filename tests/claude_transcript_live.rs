@@ -192,3 +192,107 @@ fn suppressed_and_unknown_records_appear_in_diagnostics() {
         assert!(s.source_record(&d.locator).is_ok());
     }
 }
+
+#[test]
+fn index_builds_in_bounded_resumable_steps() {
+    let records: Vec<_> = (0..2200)
+        .map(|n| assistant(&format!("{n}"), json!("x")))
+        .collect();
+    let (_dir, _, mut scanner, key) = setup(&records);
+    loop {
+        if scanner.refresh(NOW, BUDGET).unwrap().scan.done {
+            break;
+        }
+    }
+    let mut retries = 0;
+    let page = loop {
+        match scanner.transcript_page(&key, None, PageDirection::Forward, PAGE) {
+            Ok(page) => break page,
+            Err(agentscope::providers::ProviderError::Unavailable(message))
+                if message.contains("index is building") =>
+            {
+                retries += 1
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    assert!(retries > 0, "index construction must be resumable");
+    assert_eq!(page.events.len(), 1);
+    assert!(page.has_more);
+}
+
+#[test]
+fn stale_locator_is_rejected_after_rotation_and_refresh() {
+    let (_dir, path, mut scanner, key) =
+        setup(&[assistant("old", json!("old content long enough"))]);
+    let old = scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .unwrap()
+        .events[0]
+        .provenance
+        .locator
+        .clone();
+    std::fs::write(path, format!("{}\n", assistant("new", json!("new")))).unwrap();
+    scanner.refresh(NOW, BUDGET).unwrap();
+    assert!(scanner.source_record(&old).is_err());
+    let new = scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .unwrap()
+        .events[0]
+        .provenance
+        .locator
+        .clone();
+    assert!(scanner.source_record(&new).unwrap().raw.contains("new"));
+}
+
+#[test]
+fn nested_hidden_and_joined_result_have_openable_diagnostics() {
+    let (_dir, _, mut scanner, key) = setup(&[
+        assistant(
+            "a",
+            json!([{"type":"tool_use","id":"c","name":"Read","input":{}}]),
+        ),
+        json!({"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"text","text":"done"},{"type":"unknown_nested","secret":"synthetic"}]}]}}),
+    ]);
+    let page = scanner
+        .transcript_page(&key, None, PageDirection::Forward, PAGE)
+        .unwrap();
+    assert!(
+        page.diagnostics
+            .iter()
+            .any(|d| d.label.contains("source-only"))
+    );
+    assert!(page.diagnostics.iter().any(|d| d.label.contains("hidden")));
+    for diag in page.diagnostics {
+        assert!(
+            scanner
+                .source_record(&diag.locator)
+                .unwrap()
+                .raw
+                .contains("tool_result")
+        );
+    }
+}
+
+#[test]
+fn revisions_and_shared_message_usage_are_consistent_across_pages() {
+    let a = assistant("a", json!("old"));
+    let mut b = assistant("b", json!("other"));
+    b["message"]["id"] = json!("a");
+    let replacement = assistant("a", json!("replacement"));
+    let (_dir, _, mut scanner, key) = setup(&[a, b, replacement]);
+    let page = scanner
+        .transcript_page(
+            &key,
+            None,
+            PageDirection::Forward,
+            PageRequest {
+                max_events: 10,
+                ..PAGE
+            },
+        )
+        .unwrap();
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(page.events.iter().filter(|e| e.usage.is_some()).count(), 1);
+    assert_eq!(page.events[1].text.as_ref().unwrap().preview, "replacement");
+}

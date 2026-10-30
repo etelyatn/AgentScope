@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use chrono::DateTime;
@@ -18,6 +19,7 @@ use crate::ingest::jsonl::{ContentHash, JsonlCursor, Record};
 use crate::ingest::text::{display_safe, preview};
 use crate::providers::{ProviderDelta, ProviderError, ProviderReader, SourceRecord};
 use crate::usage::ClaudeLedger;
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn safe(s: &str) -> BoundedText {
     preview(s, 2048, 2048)
@@ -87,6 +89,7 @@ fn locator(key: &SessionKey, offset: u64) -> SourceLocator {
     };
     SourceLocator {
         session: key.clone(),
+        generation: None,
         kind: LocatorKind::FileOffset { path, offset },
     }
 }
@@ -390,6 +393,8 @@ fn block_key(uuid: Option<&str>, offset: u64, index: usize) -> BlockKey {
 
 struct State {
     cursor: Option<JsonlCursor>,
+    generation: u64,
+    fingerprint: Option<(u64, u64)>,
     summary: SessionSummary,
     prompt: Option<String>,
     generated: Option<String>,
@@ -455,6 +460,8 @@ impl State {
         };
         Self {
             cursor: None,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            fingerprint: None,
             summary,
             prompt: None,
             generated: None,
@@ -558,7 +565,10 @@ impl State {
             let prov = Provenance {
                 provider: Provider::Claude,
                 source: self.summary.key.source.clone(),
-                locator: locator(&self.summary.key, offset),
+                locator: SourceLocator {
+                    generation: Some(self.generation),
+                    ..locator(&self.summary.key, offset)
+                },
                 record_type: kind.into(),
                 provider_version: self.summary.provider_version.clone(),
             };
@@ -775,6 +785,7 @@ pub struct ClaudeScanner {
     config: Config,
     states: HashMap<PathBuf, State>,
     pass: Option<Pass>,
+    index: Option<TranscriptIndex>,
 }
 impl ClaudeScanner {
     /// Map persisted records without paging or loading source files.
@@ -786,6 +797,7 @@ impl ClaudeScanner {
             config: config.clone(),
             states: HashMap::new(),
             pass: None,
+            index: None,
         })
     }
     pub fn scan_roster(
@@ -961,6 +973,20 @@ impl ClaudeScanner {
         if !done {
             self.pass = Some(pass);
         }
+        for state in self.states.values_mut() {
+            if let (Some(cursor), SourceKey::File(path)) =
+                (&state.cursor, &state.summary.key.source)
+            {
+                let end = cursor.position();
+                if end > PREFIX_VERIFY_MAX
+                    && state
+                        .fingerprint
+                        .is_none_or(|(previous, _)| previous != end)
+                {
+                    state.fingerprint = fingerprint(path, end).map(|hash| (end, hash));
+                }
+            }
+        }
         let sessions = self
             .states
             .values_mut()
@@ -987,6 +1013,27 @@ impl ClaudeScanner {
     }
 }
 
+const PREFIX_VERIFY_MAX: u64 = 4 * 1024 * 1024;
+
+// As with the Codex adapter, large consumed prefixes use bounded sampling.
+// Rewrites outside the samples can evade this check.
+fn fingerprint(path: &Path, end: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() < end {
+        return None;
+    }
+    let mut hash = ContentHash::new();
+    hash.update(&end.to_le_bytes());
+    let len = end.min(512) as usize;
+    let mut bytes = [0u8; 512];
+    for start in [0, (end / 2).min(end - len as u64), end - len as u64] {
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut bytes[..len]).ok()?;
+        hash.update(&bytes[..len]);
+    }
+    Some(hash.finish())
+}
+
 // Read only the generation consumed by the roster. Never retain transcript bodies
 // between requests, and reject offsets if the scanned prefix has changed.
 fn checked_source<'a>(
@@ -1011,19 +1058,25 @@ fn checked_source<'a>(
         .as_ref()
         .ok_or_else(|| ProviderError::Unavailable("source unavailable".into()))?;
     let end = cursor.position();
-    let mut file =
-        File::open(path).map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-    let mut hash = ContentHash::new();
-    let mut left = end;
-    let mut buf = [0u8; 8192];
-    while left > 0 {
-        let size = left.min(buf.len() as u64) as usize;
-        file.read_exact(&mut buf[..size])
-            .map_err(|_| ProviderError::Unavailable("source changed since refresh".into()))?;
-        hash.update(&buf[..size]);
-        left -= size as u64;
-    }
-    if hash.finish() != cursor.content_hash() {
+    let intact = if end > PREFIX_VERIFY_MAX {
+        state.fingerprint == fingerprint(path, end).map(|hash| (end, hash))
+            && state.fingerprint.is_some()
+    } else {
+        let mut file = File::open(path)
+            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+        let mut hash = ContentHash::new();
+        let mut left = end;
+        let mut buf = [0u8; 8192];
+        while left > 0 {
+            let size = left.min(buf.len() as u64) as usize;
+            file.read_exact(&mut buf[..size])
+                .map_err(|_| ProviderError::Unavailable("source changed since refresh".into()))?;
+            hash.update(&buf[..size]);
+            left -= size as u64;
+        }
+        hash.finish() == cursor.content_hash()
+    };
+    if !intact {
         return Err(ProviderError::Unavailable(
             "source changed since refresh".into(),
         ));
@@ -1087,77 +1140,380 @@ fn fit_event(event: &mut Event, budget: usize) -> bool {
     cut
 }
 
-type OrderedDiagnostic = (Option<Timestamp>, u64, DiagnosticEntry);
+const INDEX_STEP: usize = 512;
+const INDEX_BYTES_PER_STEP: u64 = 4 * 1024 * 1024;
+const INDEX_CAP: usize = 2_000_000;
+const INDEX_METADATA_CAP: usize = 64 * 1024 * 1024;
 
-fn load_transcript(
-    path: &Path,
+#[derive(Clone)]
+enum BlockKind {
+    Row,
+    Call(String),
+    Result(String),
+    Hidden,
+}
+
+struct IndexedBlock {
+    anchor: PageAnchor,
+    uuid: Option<String>,
+    block: usize,
+    kind: BlockKind,
+    live: bool,
+    result: Option<u64>,
+}
+
+struct IndexedDiagnostic {
+    timestamp: Option<Timestamp>,
+    offset: u64,
+    label: &'static str,
+    hidden: bool,
+}
+
+struct TranscriptIndex {
+    path: PathBuf,
+    generation: u64,
+    cursor: JsonlCursor,
     end: u64,
-    max: usize,
-    key: &SessionKey,
-) -> Result<(Vec<Event>, Vec<OrderedDiagnostic>), ProviderError> {
-    let mut cursor = JsonlCursor::open(path.to_owned(), max)
-        .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-    let mut records = Vec::new();
-    let mut diagnostics = Vec::new();
-    while cursor.position() < end {
-        if records.len() + diagnostics.len() >= 100_000 {
-            return Err(ProviderError::Unsupported(
-                "session transcript exceeds the 100000-record limit".into(),
-            ));
+    blocks: Vec<IndexedBlock>,
+    diagnostics: Vec<IndexedDiagnostic>,
+    rows: Vec<usize>,
+    usage_ids: HashMap<u64, Option<String>>,
+    usage_rows: HashSet<usize>,
+    metadata_bytes: usize,
+    over: bool,
+}
+
+impl TranscriptIndex {
+    fn add_record(&mut self, offset: u64, value: &Value) {
+        let timestamp = value.get("timestamp").and_then(timestamp);
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let uuid = value.get("uuid").and_then(Value::as_str);
+        if kind == "system" {
+            self.push_block(timestamp, offset, uuid, 0, BlockKind::Row);
+            self.blocks.last_mut().expect("system block added").uuid = None;
+            return;
         }
-        let record = cursor
-            .next_record()
-            .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
-        if cursor.position() > end {
-            break;
+        if kind != "user" && kind != "assistant" {
+            self.diagnostics.push(IndexedDiagnostic {
+                timestamp,
+                offset,
+                label: "hidden or unknown record",
+                hidden: true,
+            });
+            return;
         }
-        match record {
-            Some(Record::Json { offset, value }) => {
-                let kind = value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let parts = value.pointer("/message/content").and_then(Value::as_array);
-                let hidden_part = parts.is_some_and(|parts| {
-                    parts.iter().any(|p| {
-                        let t = p.get("type").and_then(Value::as_str).unwrap_or("");
-                        !matches!(
-                            t,
-                            "text" | "image" | "thinking" | "tool_use" | "tool_result"
-                        )
-                    })
-                });
-                if !matches!(kind, "user" | "assistant" | "system") || hidden_part {
-                    diagnostics.push((
-                        value.get("timestamp").and_then(timestamp),
-                        offset,
-                        DiagnosticEntry {
-                            locator: locator(key, offset),
-                            label: safe(kind).preview,
+        if kind == "assistant"
+            && value
+                .pointer("/message/usage")
+                .is_some_and(Value::is_object)
+        {
+            let id = value
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            self.metadata_bytes = self
+                .metadata_bytes
+                .saturating_add(id.as_ref().map_or(0, String::len) + 48);
+            self.usage_ids.insert(offset, id);
+        }
+        let content = &value["message"]["content"];
+        let string_part;
+        let parts = match content {
+            Value::Array(parts) => parts.as_slice(),
+            Value::String(s) => {
+                string_part = serde_json::json!({"type":"text","text":s});
+                std::slice::from_ref(&string_part)
+            }
+            _ => &[],
+        };
+        for (block, part) in parts.iter().enumerate() {
+            let typ = part.get("type").and_then(Value::as_str).unwrap_or("");
+            let item = match (kind, typ) {
+                (_, "text" | "image") | ("assistant", "thinking") => BlockKind::Row,
+                ("assistant", "tool_use") => BlockKind::Call(
+                    part.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                ),
+                ("user", "tool_result") => {
+                    if content_text(&part["content"]).1 != 0 {
+                        self.diagnostics.push(IndexedDiagnostic {
+                            timestamp,
+                            offset,
+                            label: "hidden nested tool content",
                             hidden: true,
-                        },
-                    ));
+                        });
+                    }
+                    BlockKind::Result(
+                        part.get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    )
                 }
-                records.push((offset, value));
-            }
-            Some(Record::Invalid { offset }) | Some(Record::TooLarge { offset }) => {
-                diagnostics.push((
-                    None,
-                    offset,
-                    DiagnosticEntry {
-                        locator: locator(key, offset),
-                        label: "unavailable record".into(),
+                _ => {
+                    self.diagnostics.push(IndexedDiagnostic {
+                        timestamp,
+                        offset,
+                        label: "hidden content block",
                         hidden: true,
-                    },
-                ));
-            }
-            Some(Record::Incomplete { .. }) | None => break,
+                    });
+                    BlockKind::Hidden
+                }
+            };
+            self.push_block(timestamp, offset, uuid, block, item);
         }
     }
-    let mut events = map_transcript(key, &records).events;
-    events.sort_by_key(event_anchor);
-    diagnostics.sort_by_key(|(ts, offset, _)| (*ts, *offset));
-    Ok((events, diagnostics))
+
+    fn push_block(
+        &mut self,
+        timestamp: Option<Timestamp>,
+        offset: u64,
+        uuid: Option<&str>,
+        block: usize,
+        kind: BlockKind,
+    ) {
+        let stable_id = format!("{}:{offset}:{block}", uuid.unwrap_or("record"));
+        let extra = stable_id.len()
+            + uuid.map_or(0, str::len)
+            + match &kind {
+                BlockKind::Call(id) | BlockKind::Result(id) => id.len(),
+                _ => 0,
+            };
+        self.metadata_bytes = self
+            .metadata_bytes
+            .saturating_add(extra + std::mem::size_of::<IndexedBlock>());
+        self.blocks.push(IndexedBlock {
+            anchor: PageAnchor {
+                timestamp,
+                source_order: offset,
+                stable_id,
+            },
+            uuid: uuid.map(str::to_owned),
+            block,
+            kind,
+            live: true,
+            result: None,
+        });
+    }
+
+    fn finish(&mut self) {
+        let mut revisions = HashMap::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if let Some(uuid) = &block.uuid {
+                revisions.insert((uuid.clone(), block.block), i);
+            }
+        }
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            block.live = block
+                .uuid
+                .as_ref()
+                .is_none_or(|uuid| revisions.get(&(uuid.clone(), block.block)) == Some(&i));
+            block.result = None;
+        }
+        let mut calls = HashMap::new();
+        let mut pairs = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if !block.live {
+                continue;
+            }
+            match &block.kind {
+                BlockKind::Call(id) if !id.is_empty() => {
+                    calls.insert(id.clone(), i);
+                }
+                BlockKind::Result(id) if !id.is_empty() => {
+                    if let Some(call) = calls.remove(id) {
+                        pairs.push((call, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.diagnostics
+            .retain(|d| d.label != "source-only tool result");
+        for (call, result) in pairs {
+            let offset = self.blocks[result].anchor.source_order;
+            self.blocks[call].result = Some(offset);
+            self.blocks[result].live = false;
+            self.diagnostics.push(IndexedDiagnostic {
+                timestamp: self.blocks[result].anchor.timestamp,
+                offset,
+                label: "source-only tool result",
+                hidden: false,
+            });
+        }
+        self.usage_rows.clear();
+        let mut seen_ids = HashSet::new();
+        let mut seen_records = HashSet::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if !block.live
+                || matches!(block.kind, BlockKind::Hidden)
+                || !seen_records.insert(block.anchor.source_order)
+            {
+                continue;
+            }
+            if let Some(id) = self.usage_ids.get(&block.anchor.source_order)
+                && id.as_ref().is_none_or(|id| seen_ids.insert(id))
+            {
+                self.usage_rows.insert(i);
+            }
+        }
+        self.rows = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.live && !matches!(b.kind, BlockKind::Hidden))
+            .map(|(i, _)| i)
+            .collect();
+        self.rows
+            .sort_unstable_by(|a, b| self.blocks[*a].anchor.cmp(&self.blocks[*b].anchor));
+        self.diagnostics
+            .sort_unstable_by_key(|d| (d.timestamp, d.offset));
+    }
+}
+
+fn ensure_index<'a>(
+    slot: &'a mut Option<TranscriptIndex>,
+    path: &Path,
+    generation: u64,
+    end: u64,
+    max: usize,
+) -> Result<&'a TranscriptIndex, ProviderError> {
+    if slot
+        .as_ref()
+        .is_none_or(|index| index.path != path || index.generation != generation || index.end > end)
+    {
+        *slot = Some(TranscriptIndex {
+            path: path.to_owned(),
+            generation,
+            cursor: JsonlCursor::open(path.to_owned(), max)
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?,
+            end: 0,
+            blocks: Vec::new(),
+            diagnostics: Vec::new(),
+            rows: Vec::new(),
+            usage_ids: HashMap::new(),
+            usage_rows: HashSet::new(),
+            metadata_bytes: 0,
+            over: false,
+        });
+    }
+    let index = slot.as_mut().expect("index initialized");
+    let over = || {
+        ProviderError::Unsupported("Claude transcript exceeds index entry or metadata limit".into())
+    };
+    if index.over {
+        return Err(over());
+    }
+    if index.end < end {
+        let start = index.cursor.position();
+        let mut count = 0;
+        while index.cursor.position() < end
+            && count < INDEX_STEP
+            && index.cursor.position().saturating_sub(start) < INDEX_BYTES_PER_STEP
+        {
+            let record = index
+                .cursor
+                .next_record()
+                .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+            if index.cursor.rotation_count() != 0 {
+                return Err(ProviderError::Unavailable(
+                    "source changed while indexing".into(),
+                ));
+            }
+            if index.cursor.position() > end {
+                return Err(ProviderError::Unavailable(
+                    "source changed while indexing".into(),
+                ));
+            }
+            match record {
+                Some(Record::Json { offset, value }) => index.add_record(offset, &value),
+                Some(Record::Invalid { offset }) | Some(Record::TooLarge { offset }) => {
+                    index.diagnostics.push(IndexedDiagnostic {
+                        timestamp: None,
+                        offset,
+                        label: "unavailable record",
+                        hidden: true,
+                    })
+                }
+                Some(Record::Incomplete { .. }) | None => break,
+            }
+            count += 1;
+            if index.blocks.len().saturating_add(index.diagnostics.len()) > INDEX_CAP
+                || index.metadata_bytes > INDEX_METADATA_CAP
+            {
+                index.blocks.clear();
+                index.diagnostics.clear();
+                index.rows.clear();
+                index.usage_ids.clear();
+                index.usage_rows.clear();
+                index.over = true;
+                return Err(over());
+            }
+        }
+        index.end = index.cursor.position();
+        if index.end < end {
+            return Err(ProviderError::Unavailable(format!(
+                "transcript index is building ({} of {end} bytes); retry",
+                index.end
+            )));
+        }
+        index.finish();
+    }
+    Ok(index)
+}
+
+fn read_indexed_value(
+    path: &Path,
+    offset: u64,
+    end: u64,
+    max: usize,
+) -> Result<Value, ProviderError> {
+    let mut file =
+        File::open(path).map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+    let mut bytes = Vec::new();
+    BufReader::new(file)
+        .take((end - offset).min(max as u64 + 2))
+        .read_until(b'\n', &mut bytes)
+        .map_err(|_| ProviderError::Unavailable("source unavailable".into()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| ProviderError::Unavailable("indexed source changed".into()))
+}
+
+fn indexed_event(
+    index: &TranscriptIndex,
+    row: usize,
+    key: &SessionKey,
+    end: u64,
+    max: usize,
+) -> Result<Event, ProviderError> {
+    let block = &index.blocks[index.rows[row]];
+    let offset = block.anchor.source_order;
+    let value = read_indexed_value(&index.path, offset, end, max)?;
+    let result = block
+        .result
+        .map(|at| read_indexed_value(&index.path, at, end, max).map(|value| (at, value)))
+        .transpose()?;
+    let mut records = vec![(offset, value)];
+    if let Some(result) = result {
+        records.push(result);
+    }
+    let mut event = map_transcript(key, &records)
+        .events
+        .into_iter()
+        .find(|event| event.id == block.anchor.stable_id)
+        .ok_or_else(|| ProviderError::Unavailable("indexed event changed".into()))?;
+    event.provenance.locator.generation = Some(index.generation);
+    event.usage = if index.usage_rows.contains(&index.rows[row]) {
+        usage(&records[0].1["message"], &event.provenance)
+    } else {
+        None
+    };
+    Ok(event)
 }
 
 impl ProviderReader for ClaudeScanner {
@@ -1181,9 +1537,19 @@ impl ProviderReader for ClaudeScanner {
         request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
         let (path, end) = checked_source(&self.states, key)?;
-        let (events, diagnostics) = load_transcript(path, end, self.config.max_record_bytes, key)?;
+        let generation = self.states[path].generation;
+        let index = ensure_index(
+            &mut self.index,
+            path,
+            generation,
+            end,
+            self.config.max_record_bytes,
+        )?;
         let position = match anchor.as_ref() {
-            Some(anchor) => match events.binary_search_by_key(anchor, event_anchor) {
+            Some(anchor) => match index
+                .rows
+                .binary_search_by(|row| index.blocks[*row].anchor.cmp(anchor))
+            {
                 Ok(pos) => Some(pos),
                 Err(_) => {
                     return Ok(TranscriptPage {
@@ -1199,17 +1565,17 @@ impl ProviderReader for ClaudeScanner {
         };
         let forward = direction == PageDirection::Forward;
         let indices: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(position.map_or(0, |p| p + 1)..events.len())
+            Box::new(position.map_or(0, |p| p + 1)..index.rows.len())
         } else {
-            Box::new((0..position.unwrap_or(events.len())).rev())
+            Box::new((0..position.unwrap_or(index.rows.len())).rev())
         };
         let mut page = Vec::new();
         let mut size = 0usize;
         let mut truncated = false;
         let mut has_more = false;
         let mut selected = Vec::new();
-        for index in indices {
-            let mut event = events[index].clone();
+        for row in indices {
+            let mut event = indexed_event(index, row, key, end, self.config.max_record_bytes)?;
             let cut = fit_event(&mut event, request.max_bytes);
             let cost = event_size(&event);
             if !page.is_empty()
@@ -1227,7 +1593,7 @@ impl ProviderReader for ClaudeScanner {
                         || t.output.as_ref().is_some_and(|v| v.truncated)
                 });
             page.push(event);
-            selected.push(index);
+            selected.push(row);
         }
         if !forward {
             page.reverse();
@@ -1236,17 +1602,35 @@ impl ProviderReader for ClaudeScanner {
         let next = if forward { page.last() } else { page.first() }.map(event_anchor);
         // Assign diagnostics to the next event in total order, or the last event.
         let mut page_diags = Vec::new();
-        for (ts, offset, diagnostic) in diagnostics {
-            let target = events
-                .partition_point(|event| (event.timestamp, event.source_order) < (ts, offset))
-                .min(events.len().saturating_sub(1));
-            if (events.is_empty() && anchor.is_none()) || selected.contains(&target) {
-                if page_diags.len() < 200 {
-                    page_diags.push(diagnostic);
-                } else {
-                    truncated = true;
-                }
+        if !selected.is_empty() || (index.rows.is_empty() && anchor.is_none()) {
+            let first = selected.first().copied().unwrap_or(0);
+            let last = selected.last().copied().unwrap_or(0);
+            let start = if first == 0 {
+                0
+            } else {
+                let previous = &index.blocks[index.rows[first - 1]].anchor;
+                index.diagnostics.partition_point(|d| {
+                    (d.timestamp, d.offset) <= (previous.timestamp, previous.source_order)
+                })
+            };
+            let stop = if index.rows.is_empty() || last + 1 == index.rows.len() {
+                index.diagnostics.len()
+            } else {
+                let last_anchor = &index.blocks[index.rows[last]].anchor;
+                index.diagnostics.partition_point(|d| {
+                    (d.timestamp, d.offset) <= (last_anchor.timestamp, last_anchor.source_order)
+                })
+            };
+            for d in &index.diagnostics[start..stop.min(start.saturating_add(200))] {
+                let mut loc = locator(key, d.offset);
+                loc.generation = Some(generation);
+                page_diags.push(DiagnosticEntry {
+                    locator: loc,
+                    label: d.label.into(),
+                    hidden: d.hidden,
+                });
             }
+            truncated |= stop.saturating_sub(start) > 200;
         }
         Ok(TranscriptPage {
             events: page,
@@ -1263,8 +1647,18 @@ impl ProviderReader for ClaudeScanner {
         anchor: &PageAnchor,
     ) -> Result<usize, ProviderError> {
         let (path, end) = checked_source(&self.states, key)?;
-        let (events, _) = load_transcript(path, end, self.config.max_record_bytes, key)?;
-        Ok(events.len() - events.partition_point(|e| event_anchor(e) <= *anchor))
+        let generation = self.states[path].generation;
+        let index = ensure_index(
+            &mut self.index,
+            path,
+            generation,
+            end,
+            self.config.max_record_bytes,
+        )?;
+        Ok(index.rows.len()
+            - index
+                .rows
+                .partition_point(|row| index.blocks[*row].anchor <= *anchor))
     }
 
     fn source_record(&mut self, source: &SourceLocator) -> Result<SourceRecord, ProviderError> {
@@ -1274,6 +1668,9 @@ impl ProviderReader for ClaudeScanner {
             ));
         };
         let (expected, end) = checked_source(&self.states, &source.session)?;
+        if self.states[expected].generation != source.generation.unwrap_or(0) {
+            return Err(ProviderError::Unavailable("stale source locator".into()));
+        }
         if path != expected {
             return Err(ProviderError::Unsupported(
                 "locator does not belong to session".into(),
