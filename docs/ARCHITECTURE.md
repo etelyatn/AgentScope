@@ -48,7 +48,7 @@ These are design concepts, not instructions to create a large interface hierarch
 ## 4. Read-only and format safety
 
 - **JSONL:** stream complete records; buffer incomplete final lines; detect append/truncate/rotation; bound allocations; unknown or malformed records must not crash the application.
-- **SQLite:** open with explicit read-only flags, short bounded queries, and WAL-aware handling. Do not use `immutable=1` to read a live writable database.
+- **SQLite:** open with explicit read-only flags, short bounded queries, and WAL-aware handling. Do not use `immutable=1` to read a live writable database. SQLite may create/update its transient `-shm`/`-wal` sidecars; see [ADR-0002](decisions/0002-opencode-readonly-wal-sidecars.md). Never manually repair, delete, chmod, or copy provider files.
 - **Data sourcing:** discover known provider data roots and allow explicit overrides; never read auth files or broad arbitrary directories simply to discover sessions.
 - **Rendering:** neutralize ANSI/control sequences and mask common secret patterns by default. No implicit log upload or raw prompt diagnostics.
 - **Isolation:** a corrupt or unsupported session must not prevent healthy providers and sessions from being inspected.
@@ -72,5 +72,6 @@ For orchestrator integration, correlation between Hermes tasks and provider sess
 ## 8. Decision records
 
 - [ADR-0001: Passive, read-only observation](decisions/0001-passive-read-only-observation.md)
+- [ADR-0002: Read-only OpenCode access and WAL sidecars](decisions/0002-opencode-readonly-wal-sidecars.md)
 
 Architecture implementation status and source compatibility are expected to evolve as tests against real provider versions become available.
