@@ -1137,13 +1137,19 @@ impl Mapper<'_> {
 
 /// Anchor whose derived `Ord` (timestamp, source_order, stable_id) equals the SQL
 /// order `(time_created, id, part)`: `source_order` is a constant 0 and `stable_id`
-/// is the exact row id, a NUL, and the zero-padded part index. NUL sorts below every
-/// other byte, so an id that prefixes another still orders first, as in SQL.
+/// is the lowercase hex of the row id's bytes (byte order is preserved, any id is
+/// representable), `#`, and the zero-padded part index. `#` sorts below every hex
+/// digit, so an id that prefixes another still orders first, as in SQL.
 fn anchor_of(e: &Event, row_id: &str) -> PageAnchor {
+    let mut stable_id = String::with_capacity(row_id.len() * 2 + 11);
+    for byte in row_id.bytes() {
+        stable_id.push_str(&format!("{byte:02x}"));
+    }
+    stable_id.push_str(&format!("#{:010}", e.source_order));
     PageAnchor {
         timestamp: e.timestamp,
         source_order: 0,
-        stable_id: format!("{row_id}\0{:010}", e.source_order),
+        stable_id,
     }
 }
 
@@ -1173,13 +1179,18 @@ fn push_diag(into: &mut Vec<DiagnosticEntry>, entry: DiagnosticEntry, truncated:
 }
 
 /// Splits an anchor into `(time_created, row id, part index)`.
-fn anchor_parts(anchor: &PageAnchor) -> Result<(i64, &str, usize), ProviderError> {
+fn anchor_parts(anchor: &PageAnchor) -> Result<(i64, String, usize), ProviderError> {
     let bad = || ProviderError::Unsupported("not an OpenCode anchor".into());
     let created = anchor.timestamp.ok_or_else(bad)?;
-    let (id, part) = anchor.stable_id.rsplit_once('\0').ok_or_else(bad)?;
-    if anchor.source_order != 0 || part.len() != 10 {
+    let (hex, part) = anchor.stable_id.rsplit_once('#').ok_or_else(bad)?;
+    if anchor.source_order != 0 || part.len() != 10 || hex.len() % 2 != 0 || !hex.is_ascii() {
         return Err(bad());
     }
+    let bytes = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| bad())?;
+    let id = String::from_utf8(bytes).map_err(|_| bad())?;
     Ok((created, id, part.parse().map_err(|_| bad())?))
 }
 
@@ -1257,7 +1268,7 @@ impl OpenCodeScanner {
         request: PageRequest,
     ) -> Result<TranscriptPage, ProviderError> {
         self.check_session(conn, key)?;
-        let at = anchor.map(|a| anchor_parts(a)).transpose()?;
+        let at = anchor.map(anchor_parts).transpose()?;
         let record_cap = self.config.max_record_bytes;
         let mapper = Mapper {
             key,
@@ -1280,7 +1291,7 @@ impl OpenCodeScanner {
             &key.provider_session_id,
             record_cap,
             direction,
-            at.map(|(created, id, _)| (created, id)),
+            at.as_ref().map(|(created, id, _)| (*created, id.as_str())),
             |row| {
                 let mut items = mapper.map_row(&row, record_cap);
                 if !forward {
@@ -1289,13 +1300,13 @@ impl OpenCodeScanner {
                 for (part, mapped) in items {
                     // The anchor's own row resumes after (forward) / before
                     // (backward) the anchored part.
-                    if let Some((created, id, at_part)) = at
-                        && row.created == created
-                        && row.id == id
+                    if let Some((created, id, at_part)) = &at
+                        && row.created == *created
+                        && row.id == *id
                         && (if forward {
-                            part <= at_part
+                            part <= *at_part
                         } else {
-                            part >= at_part
+                            part >= *at_part
                         })
                     {
                         continue;
@@ -1374,7 +1385,7 @@ impl OpenCodeScanner {
             &key.provider_session_id,
             record_cap,
             PageDirection::Forward,
-            Some((created, at_id)),
+            Some((created, at_id.as_str())),
             |row| {
                 let same = row.created == created && row.id == at_id;
                 count += mapper

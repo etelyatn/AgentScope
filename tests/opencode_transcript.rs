@@ -357,7 +357,7 @@ fn forward_and_backward_pages_are_equivalent_at_equal_timestamps() {
             anchor.source_order,
             anchor.stable_id.as_str()
         ),
-        (Some(500), 0, "b\u{0}0000000000")
+        (Some(500), 0, "62#0000000000")
     );
     assert!(p.has_more);
     let back = page(
@@ -689,6 +689,8 @@ fn anchors_are_strictly_monotonic_in_ord_across_equal_timestamps() {
         ("a\u{1}", 1),
         ("b", 11),
         ("a\u{0}x", 1),
+        ("a\u{0}", 2),
+        ("a\u{0}\u{0}", 1),
     ] {
         let content: Vec<_> = (0..parts)
             .map(|i| json!({"type": "text", "text": format!("{id}{i}")}))
