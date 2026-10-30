@@ -60,15 +60,23 @@ struct Chunk {
     diagnostics: Vec<DiagnosticEntry>,
 }
 
-/// A reload in progress: backward pages from the newest known end, staged and
-/// not shown until the current selection (and the old window start) is reached.
+/// A reload in progress, staged and not shown until the current selection (and
+/// the old window start) has been re-read.
+///
+/// With newer pages beyond the window it first reads one page forward from the
+/// window end: anchors are exclusive, so that page plus a backward read from its
+/// last event re-reads the old last event too. Otherwise it reads backward from
+/// the tail.
 struct Reload {
-    /// Staged window in display order; starts as the retained newest event when
-    /// the window does not end at the tail.
+    /// Staged window in display order.
     staged: Vec<Event>,
     chunks: Vec<Chunk>,
-    /// Anchor to continue backward from (`None` = the tail).
+    /// Anchor for the next request: forward from the window end while
+    /// `probing_end`, else backward (`None` = the tail).
     anchor: Option<PageAnchor>,
+    probing_end: bool,
+    /// Continuation for events newer than the staged window.
+    newer: Option<PageAnchor>,
     /// Id of the old window's first event; re-reading it refreshes the boundary.
     boundary: Option<String>,
 }
@@ -94,6 +102,10 @@ pub struct Transcript {
     mark: Option<(PageAnchor, usize)>,
     /// In-flight count request and the offset it is relative to.
     count_pending: Option<(u64, usize)>,
+    /// The first count after opening away from the tail fixes the baseline.
+    baseline_pending: bool,
+    /// A reload could not reach the reading position within the window cap.
+    reload_capped: bool,
     /// Summary at the last probe; a different summary triggers a new count.
     probed: Option<SessionSummary>,
     /// True once any page has been applied.
@@ -116,6 +128,8 @@ impl Transcript {
             new_events: 0,
             mark: None,
             count_pending: None,
+            baseline_pending: false,
+            reload_capped: false,
             probed,
             loaded: false,
         }
@@ -171,6 +185,11 @@ impl Transcript {
         self.failed
     }
 
+    /// A reload could not reach the reading position within the window cap.
+    pub fn reload_capped(&self) -> bool {
+        self.reload_capped
+    }
+
     /// Events persisted after the newest loaded event.
     pub fn new_events(&self) -> usize {
         self.new_events
@@ -184,6 +203,7 @@ impl Transcript {
     fn begin(&mut self, request_id: u64, kind: PageKind) {
         self.pending = Some(Pending { request_id, kind });
         self.failed = None;
+        self.reload_capped = false;
         if kind != PageKind::Reload {
             self.reload = None;
         }
@@ -221,26 +241,31 @@ impl Transcript {
         if !self.loaded {
             return None;
         }
-        let (staged, chunks) = match (&self.newer, self.events.last()) {
-            (Some(a), Some(last)) => (
-                vec![last.clone()],
-                vec![Chunk {
-                    len: 1,
-                    edge: Edge::Last(a.clone()),
-                    diagnostics: Vec::new(),
-                }],
-            ),
-            _ => (Vec::new(), Vec::new()),
+        let probing_end = self.newer.is_some() && !self.events.is_empty();
+        let anchor = if probing_end {
+            self.newer.clone()
+        } else {
+            None
         };
-        let anchor = self.newer.clone();
         self.reload = Some(Reload {
-            staged,
-            chunks,
+            staged: Vec::new(),
+            chunks: Vec::new(),
             anchor: anchor.clone(),
+            probing_end,
+            newer: None,
             boundary: self.events.first().map(|e| e.id.clone()),
         });
         self.begin(request_id, PageKind::Reload);
-        Some(self.backward_request(request_id, anchor))
+        if probing_end {
+            Some(WorkerRequest::LoadPage {
+                request_id,
+                key: self.key.clone(),
+                anchor,
+                direction: PageDirection::Forward,
+            })
+        } else {
+            Some(self.backward_request(request_id, None))
+        }
     }
 
     /// Retry the load that failed for good. `None` when nothing failed or a
@@ -253,6 +278,9 @@ impl Transcript {
         match kind {
             PageKind::Initial => Some(self.select_request(request_id)),
             PageKind::Tail => Some(self.tail_request(request_id)),
+            // The reading position was out of reach: the user's retry is an
+            // explicit jump to the newest page.
+            PageKind::Reload if self.reload_capped => Some(self.tail_request(request_id)),
             PageKind::Reload => self.reload_request(request_id),
             PageKind::Older => {
                 self.failed = None;
@@ -324,10 +352,11 @@ impl Transcript {
         request_id: u64,
         summary: &SessionSummary,
     ) -> Option<WorkerRequest> {
+        let baseline = self.baseline_pending;
         if !self.loaded
             || self.reload.is_some()
             || self.count_pending.is_some()
-            || self.probed.as_ref() == Some(summary)
+            || (!baseline && self.probed.as_ref() == Some(summary))
         {
             return None;
         }
@@ -352,7 +381,17 @@ impl Transcript {
         match self.count_pending {
             Some((id, offset)) if id == request_id => {
                 self.count_pending = None;
-                self.new_events = count.saturating_sub(offset);
+                if self.baseline_pending {
+                    // Everything after the window end at open time is history,
+                    // not an arrival.
+                    self.baseline_pending = false;
+                    if let Some(mark) = &mut self.mark {
+                        mark.1 = count;
+                    }
+                    self.new_events = 0;
+                } else {
+                    self.new_events = count.saturating_sub(offset);
+                }
                 true
             }
             _ => false,
@@ -392,6 +431,7 @@ impl Transcript {
     fn newest_refreshed(&mut self) {
         self.new_events = 0;
         self.count_pending = None;
+        self.baseline_pending = false;
         let total = self.events.len();
         let mut start = 0;
         let mut mark = None;
@@ -435,6 +475,13 @@ impl Transcript {
                 self.selected = 0;
                 if self.newer.is_none() {
                     self.newest_refreshed();
+                } else {
+                    // Opened away from the tail: the newest observed event is the
+                    // window end; a baseline count (below) discounts later history.
+                    self.new_events = 0;
+                    self.count_pending = None;
+                    self.mark = self.newer.clone().map(|a| (a, 0));
+                    self.baseline_pending = self.mark.is_some();
                 }
             }
             PageKind::Tail => {
@@ -473,6 +520,25 @@ impl Transcript {
         let Some(mut reload) = self.reload.take() else {
             return;
         };
+        if reload.probing_end {
+            reload.probing_end = false;
+            match (page.events.is_empty(), page.next.clone()) {
+                (false, Some(next)) => {
+                    reload.chunks = vec![Chunk {
+                        len: page.events.len(),
+                        edge: Edge::Last(next.clone()),
+                        diagnostics: page.diagnostics,
+                    }];
+                    reload.staged = page.events;
+                    reload.newer = continuation;
+                    reload.anchor = Some(next);
+                }
+                // The old last event is now the newest: read from the tail.
+                _ => reload.anchor = None,
+            }
+            self.reload = Some(reload);
+            return;
+        }
         let known: HashSet<&str> = reload.staged.iter().map(|e| e.id.as_str()).collect();
         page.events.retain(|e| !known.contains(e.id.as_str()));
         reload.chunks.insert(
@@ -500,7 +566,11 @@ impl Transcript {
             return;
         }
         if continuation.is_some() && !found_selection {
-            // The selection is beyond reach within the window cap: keep what is shown.
+            // The reading position is beyond the window cap. Keep the old window
+            // on screen, and make that visible and actionable: `r` jumps to the
+            // newest page.
+            self.failed = Some(PageKind::Reload);
+            self.reload_capped = true;
             return;
         }
         self.selected = current
@@ -509,6 +579,7 @@ impl Transcript {
         self.events = reload.staged;
         self.chunks = reload.chunks;
         self.older = continuation;
+        self.newer = reload.newer;
         if self.newer.is_none() {
             self.newest_refreshed();
         }

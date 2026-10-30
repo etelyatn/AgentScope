@@ -233,7 +233,11 @@ fn status_line(app: &App, transcript: &Transcript) -> String {
         None => {}
     }
     if transcript.failed().is_some() {
-        parts.push("Load failed — r retries".into());
+        parts.push(if transcript.reload_capped() {
+            "Reading position is beyond the loaded-event limit — r jumps to newest".into()
+        } else {
+            "Load failed — r retries".into()
+        });
     }
     let new = app.new_event_count();
     if new > 0 {

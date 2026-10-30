@@ -191,8 +191,19 @@ fn open(app: &mut App, first: TranscriptPage) -> u64 {
     id
 }
 
+/// Page requests only: the baseline count requested after opening away from the
+/// tail is not a page load.
+fn page_requests(requests: &[WorkerRequest]) -> Vec<WorkerRequest> {
+    requests
+        .iter()
+        .filter(|r| !matches!(r, WorkerRequest::CountAfter { .. }))
+        .cloned()
+        .collect()
+}
+
 fn load_page(requests: &[WorkerRequest]) -> (u64, Option<PageAnchor>, PageDirection) {
-    match requests {
+    let requests = page_requests(requests);
+    match requests.as_slice() {
         [
             WorkerRequest::LoadPage {
                 request_id,
@@ -330,7 +341,7 @@ fn loads_forward_and_backward_pages_without_duplicates() {
     assert!(app.apply_transcript(id, forward_page(3..10, false)));
     let expected: Vec<String> = (0..10).map(|i| format!("e{i}")).collect();
     assert_eq!(ids(&app), expected);
-    assert!(app.take_requests().is_empty());
+    assert!(page_requests(&app.take_requests()).is_empty());
     assert!(!app.transcript().unwrap().has_newer());
 
     // `G` always reloads the tail, Backward from none, even when the window
@@ -434,7 +445,7 @@ fn new_events_are_counted_without_scrolling_or_loading() {
     assert_eq!(app.new_event_count(), 3);
     assert_eq!(app.transcript().unwrap().selected(), 1, "no auto-scroll");
     assert_eq!(ids(&app).len(), 3, "no auto-load");
-    assert!(app.take_requests().is_empty());
+    assert!(page_requests(&app.take_requests()).is_empty());
     let out = draw(&app, 110, 30);
     assert!(out.contains("3 new"), "{out}");
 
@@ -518,7 +529,7 @@ fn invalidation_rereads_the_boundary_and_chases_the_current_selection() {
     let (id, _, _) = load_page(&app.take_requests());
     assert!(app.apply_transcript(id, backward_page(100..160, true)));
     app.inspector_move(-29); // e130
-    assert!(app.take_requests().is_empty());
+    assert!(page_requests(&app.take_requests()).is_empty());
     assert_eq!(
         app.transcript().unwrap().selected_event().unwrap().id,
         "e130"
@@ -559,26 +570,123 @@ fn invalidation_while_reading_history_rereads_from_the_window_end() {
     let mut app = app_with(summary(200));
     open(&mut app, forward_page(0..60, true));
     app.inspector_move(30);
-    assert!(app.take_requests().is_empty());
+    assert!(page_requests(&app.take_requests()).is_empty());
     app.invalidate_transcript(&key());
+    // One page forward from the window end: anchors are exclusive, so its last
+    // event anchors a backward read that re-reads the old last event.
     let (rid, from, direction) = load_page(&app.take_requests());
     assert_eq!(
         (from, direction),
-        (Some(anchor(59)), PageDirection::Backward)
+        (Some(anchor(59)), PageDirection::Forward)
     );
-    assert!(app.apply_transcript(rid, backward_page(30..59, true)));
-    let (rid, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(rid, forward_page(60..70, true)));
+    let (rid, from, direction) = load_page(&app.take_requests());
+    assert_eq!(
+        (from, direction),
+        (Some(anchor(69)), PageDirection::Backward)
+    );
+    let mut middle = backward_page(30..69, true);
+    middle.events[29].text = Some(text("LAST-CHANGED")); // e59, the old window end
+    assert!(app.apply_transcript(rid, middle));
+    let (rid, from, _) = load_page(&app.take_requests());
+    assert_eq!(from, Some(anchor(30)));
     let mut first = backward_page(0..30, false);
     first.events[0].text = Some(text("FIRST-CHANGED"));
     assert!(app.apply_transcript(rid, first));
     let t = app.transcript().unwrap();
     assert_eq!(t.selected_event().unwrap().id, "e30");
-    assert_eq!(ids(&app).len(), 60);
+    assert_eq!(ids(&app).len(), 70);
     assert!(t.has_newer() && !t.has_older());
+    let preview = |i: usize| t.events()[i].text.as_ref().unwrap().preview.clone();
+    assert_eq!(preview(0), "FIRST-CHANGED");
+    assert_eq!(preview(59), "LAST-CHANGED");
+}
+
+#[test]
+fn history_reload_with_no_newer_events_falls_back_to_the_tail() {
+    let mut app = app_with(summary(60));
+    open(&mut app, forward_page(0..20, true));
+    app.invalidate_transcript(&key());
+    let (rid, from, direction) = load_page(&app.take_requests());
     assert_eq!(
-        t.events()[0].text.as_ref().unwrap().preview,
-        "FIRST-CHANGED"
+        (from, direction),
+        (Some(anchor(19)), PageDirection::Forward)
     );
+    // The old last event is now the newest event.
+    assert!(app.apply_transcript(rid, page(vec![], None, false)));
+    let (rid, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert!(app.apply_transcript(rid, backward_page(0..20, false)));
+    assert_eq!(ids(&app).len(), 20);
+    assert!(!app.transcript().unwrap().has_newer());
+}
+
+#[test]
+fn arrivals_are_counted_when_opened_at_oldest_history() {
+    let mut app = app_with(summary(100));
+    open(&mut app, forward_page(0..20, true));
+    // The initial page does not reach the tail: a baseline count from the
+    // window end discounts the history that was already there.
+    let requests = app.take_requests();
+    let [
+        WorkerRequest::CountAfter {
+            request_id,
+            anchor: a,
+            ..
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected a baseline CountAfter, got {requests:?}");
+    };
+    assert_eq!(a, &anchor(19));
+    assert!(app.apply_events_after(*request_id, 80));
+    assert_eq!(app.new_event_count(), 0);
+
+    app.apply_roster(vec![summary(103)], vec![]);
+    let requests = app.take_requests();
+    let [WorkerRequest::CountAfter { request_id, .. }] = requests.as_slice() else {
+        panic!("expected CountAfter, got {requests:?}");
+    };
+    assert!(app.apply_events_after(*request_id, 83));
+    assert_eq!(app.new_event_count(), 3);
+    assert!(draw(&app, 110, 30).contains("3 new"));
+    assert_eq!(app.transcript().unwrap().selected(), 0, "no auto-scroll");
+}
+
+#[test]
+fn a_reload_beyond_the_window_cap_is_visible_and_retry_jumps_to_the_tail() {
+    let cap = MAX_LOADED_EVENTS as u64;
+    let mut app = app_with(summary(40_000));
+    open(&mut app, forward_page(0..1, false));
+    app.inspector_last();
+    let (id, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(id, backward_page(10_000..10_000 + cap, true)));
+    app.inspector_move(isize::MIN); // e10000, the reading position
+    let (older, _, _) = load_page(&app.take_requests());
+    app.transcript_load_failed(older); // keep the window as it is
+    app.invalidate_transcript(&key());
+    let (rid, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    // 10,000 events arrived: the position is now 30,000 events from the tail.
+    assert!(app.apply_transcript(rid, backward_page(30_000..40_000, true)));
+    let (rid, _, _) = load_page(&app.take_requests());
+    assert!(app.apply_transcript(rid, backward_page(20_000..30_000, true)));
+
+    let t = app.transcript().unwrap();
+    assert!(t.failed().is_some() && t.reload_capped());
+    assert!(t.loading().is_none());
+    assert_eq!(t.selected_event().unwrap().id, "e10000", "position kept");
+    assert_eq!(t.events().len(), MAX_LOADED_EVENTS);
+    let out = draw(&app, 110, 30);
+    assert!(out.contains("loaded-event limit"), "{out}");
+
+    app.retry_transcript();
+    let (tail, from, direction) = load_page(&app.take_requests());
+    assert_eq!((from, direction), (None, PageDirection::Backward));
+    assert!(app.apply_transcript(tail, backward_page(30_000..40_000, true)));
+    let t = app.transcript().unwrap();
+    assert!(t.failed().is_none() && !t.reload_capped());
+    assert_eq!(t.selected_event().unwrap().id, "e39999");
 }
 
 fn tail_at_60() -> App {
@@ -643,7 +751,7 @@ fn r_retries_a_failed_older_or_newer_load() {
     assert!(app.transcript().unwrap().failed().is_some());
     app.inspector_move(1);
     assert!(
-        app.take_requests().is_empty(),
+        page_requests(&app.take_requests()).is_empty(),
         "failed edge load is not auto-retried"
     );
 

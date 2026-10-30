@@ -362,6 +362,7 @@ impl App {
             .is_some_and(|t| t.apply_page(request_id, page));
         if applied {
             self.pump_transcript();
+            self.probe_transcript();
         }
         applied
     }
