@@ -959,7 +959,8 @@ struct RawRow {
     data_len: Option<i64>,
     /// Legacy part rows only: the owning message's `role` (empty when unknown).
     role: Option<String>,
-    /// The id exceeds `ID_MAX`; `id` is empty and the row cannot be keyed.
+    /// The id exceeds `ID_MAX`; `id` is only its first `ID_MAX + 1` chars and the row
+    /// cannot be keyed.
     oversized: bool,
 }
 
@@ -990,7 +991,7 @@ struct Scan<'a> {
     parts: bool,
     /// v2 only: restrict to `assistant` rows.
     assistant_only: bool,
-    /// Message rows whose id is too long to key are returned (empty id,
+    /// Message rows whose id is too long to key are returned (id cut to a prefix,
     /// `oversized`) instead of filtered out, so callers can see they were omitted.
     flag_oversized: bool,
 }
@@ -1040,7 +1041,7 @@ fn stream_rows(
         };
         let (id_col, id_filter, oversized) = if scan.flag_oversized {
             (
-                "CASE WHEN length(id) <= ?3 THEN id ELSE '' END",
+                "CASE WHEN length(id) <= ?3 THEN id ELSE substr(id, 1, ?3 + 1) END",
                 "",
                 "length(id) > ?3",
             )
@@ -1355,6 +1356,9 @@ fn advance(
             return Ok(None);
         }
         job.stage = Stage::Derive;
+        if job.derivation.is_some() && allow.exhausted() {
+            return Ok(None);
+        }
     }
 
     if let Some(mut derivation) = job.derivation.take() {
@@ -1390,6 +1394,10 @@ fn advance(
                 if r.oversized {
                     // An id too long to key exactly cannot be counted once.
                     omitted |= kind.is_none_or(|k| k == "assistant");
+                    // Continue past it without keeping the full id: every id sharing
+                    // this prefix is itself oversized, so sorting after the prefix plus
+                    // the highest code point skips only rows that are omitted anyway.
+                    cursor = Some((r.created, format!("{}{}", r.id, '\u{10FFFF}')));
                 } else {
                     cursor = Some((r.created, r.id.clone()));
                     if kind == Some("assistant") {

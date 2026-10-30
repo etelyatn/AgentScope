@@ -682,3 +682,57 @@ fn skipped_oversized_message_ids_make_derived_usage_partial() {
     assert_eq!(usage.total, None, "an incomplete sum is not a total");
     assert_eq!(usage.cost.usd, None);
 }
+
+#[test]
+fn oversized_ids_never_stall_derivation_at_one_record_per_step() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    let big = |tag: char| tag.to_string().repeat(5000);
+    let one = |input: u64| assistant(Some("stop"), tokens(input, 0, 0, 0, 0), None);
+    msg(&conn, "s", "a1", "assistant", 5, one(1));
+    msg(&conn, "s", &big('m'), "assistant", 6, one(1000));
+    msg(&conn, "s", &big('n'), "assistant", 7, one(1000));
+    // Same millisecond as an oversized row, sorting after its id prefix.
+    msg(&conn, "s", "z1", "assistant", 7, one(10));
+    msg(&conn, "s", &(big('m') + "x"), "assistant", 7, one(1000));
+    msg(&conn, "s", "a2", "assistant", 20, one(100));
+    let mut scanner = scanner_for(&db);
+    let (steps, out) = scan_with(&mut scanner, budget(1, 100_000_000, 60_000));
+    assert!(
+        steps <= 20,
+        "one row per step, never rereading: {steps} steps"
+    );
+    let usage = out["s"].usage.as_ref().expect("usage");
+    assert_eq!(usage.class, AggregationClass::Partial);
+    assert_eq!(usage.categories.input, Some(111), "only keyable rows count");
+    assert_eq!(usage.total, None);
+}
+
+#[test]
+fn lifecycle_completing_on_the_last_allowed_row_defers_derivation() {
+    let (_d, db, conn) = fixture();
+    insert_session(&conn, &Session::new("s", 1, 100));
+    msg(
+        &conn,
+        "s",
+        "a1",
+        "assistant",
+        5,
+        assistant(Some("stop"), tokens(2, 3, 0, 0, 0), None),
+    );
+    for tight in [budget(1, 100_000_000, 60_000), budget(100, 1, 60_000)] {
+        let mut scanner = scanner_for(&db);
+        // Lifecycle finishes on the only allowed row; derivation must wait.
+        let first = scanner.scan_roster(NOW, tight).expect("scan");
+        assert!(first.sessions.is_empty() && !first.scan.done);
+        let (steps, out) = scan_with(&mut scanner, tight);
+        assert!(
+            steps >= 2,
+            "lifecycle and derivation are separate steps: {steps}"
+        );
+        assert_eq!(out["s"].lifecycle, Lifecycle::Completed);
+        let usage = out["s"].usage.as_ref().expect("usage");
+        assert_eq!(usage.class, AggregationClass::Derived);
+        assert_eq!(usage.total, Some(5));
+    }
+}
