@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};

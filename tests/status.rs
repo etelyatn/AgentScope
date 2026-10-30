@@ -54,6 +54,7 @@ fn summary(
         displayed_event_count: 0,
         hidden_records: 0,
         source_available,
+        archived: false,
         context_window: None,
         server_tools: None,
         lifecycle: Lifecycle::Unknown,

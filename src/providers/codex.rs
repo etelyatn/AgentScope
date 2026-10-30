@@ -1023,6 +1023,7 @@ impl CodexScanner {
             displayed_event_count: p.displayed + p.shown.len(),
             hidden_records: p.hidden.saturating_sub(p.shown.len()),
             source_available: state.available,
+            archived: false,
             context_window: p.context_window,
             server_tools: None,
             lifecycle: match p.turn_open {

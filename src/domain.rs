@@ -291,6 +291,8 @@ pub struct SessionSummary {
     pub displayed_event_count: usize,
     pub hidden_records: usize,
     pub source_available: bool,
+    /// Provider-reported archived state (OpenCode `time_archived`); never inferred.
+    pub archived: bool,
     pub context_window: Option<u64>,
     pub server_tools: Option<ServerToolCounts>,
     pub lifecycle: Lifecycle,
