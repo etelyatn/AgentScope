@@ -202,7 +202,7 @@ fn roster_matches_transcript_after_block_revisions() {
             json!([{"type":"unknown"},{"type":"text","text":"new"}]),
         ),
     ];
-    let (_dir, _path, mut scanner) = setup(&records, 100, 1000);
+    let (_dir, _path, mut scanner) = setup(&records, 100, 10000);
     let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
     let indexed = records
         .into_iter()
@@ -286,5 +286,77 @@ fn roster_revision_of_paired_tool_call_matches_transcript() {
         ClaudeScanner::map_transcript(&summary.key, &indexed)
             .events
             .len()
+    );
+}
+
+#[test]
+fn revision_metadata_overflow_warns_and_counts_approximately() {
+    for (entries, bytes) in [(1, 10000), (100, 1)] {
+        let records = [
+            record("a", "m", json!([{"type":"text","text":"old"}])),
+            record("a", "m", json!([{"type":"text","text":"new"}])),
+            record(
+                "b",
+                "m",
+                json!([{"type":"tool_use","id":"call","name":"Read","input":{}}]),
+            ),
+        ];
+        let (_dir, path, mut scanner) = setup(&records, entries, bytes);
+        let summary = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+        assert_eq!(summary.displayed_event_count, 3);
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("approximate"))
+        );
+        assert_eq!(summary.usage.unwrap().total, Some(3));
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{}", record("a", "m", json!("later duplicate"))).unwrap();
+        let later = scanner.scan_roster(NOW, BIG).unwrap().sessions.remove(0);
+        assert_eq!(later.displayed_event_count, 4);
+        assert_eq!(
+            later
+                .warnings
+                .iter()
+                .filter(|w| w.message.contains("approximate"))
+                .count(),
+            1
+        );
+        assert_eq!(later.usage.unwrap().total, Some(3));
+    }
+}
+
+#[test]
+fn parent_user_after_sidechain_only_refresh_clears_side_usage() {
+    let mut side = record("side", "child", json!("child"));
+    side["isSidechain"] = json!(true);
+    let (_dir, path, mut scanner) = setup(&[side], 100, 10000);
+    assert_eq!(
+        scanner
+            .scan_roster(NOW, BIG)
+            .unwrap()
+            .sessions
+            .remove(0)
+            .usage
+            .unwrap()
+            .total,
+        Some(3)
+    );
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"user","uuid":"p","message":{"content":"hello"}})
+    )
+    .unwrap();
+    assert!(
+        scanner
+            .scan_roster(NOW, BIG)
+            .unwrap()
+            .sessions
+            .remove(0)
+            .usage
+            .is_none()
     );
 }

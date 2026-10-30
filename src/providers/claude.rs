@@ -401,6 +401,11 @@ struct State {
     side_ledger: Option<ClaudeLedger>,
     parent_seen: bool,
     block_counts: HashMap<(String, usize), (usize, usize)>,
+    metadata_entries: usize,
+    metadata_bytes: usize,
+    metadata_max_entries: usize,
+    metadata_max_bytes: usize,
+    counts_approximate: bool,
 }
 impl State {
     fn new(source: SourceFile, entries: usize, bytes: usize) -> Self {
@@ -461,6 +466,11 @@ impl State {
             side_ledger: Some(ClaudeLedger::new(entries, bytes)),
             parent_seen: false,
             block_counts: HashMap::new(),
+            metadata_entries: 0,
+            metadata_bytes: 0,
+            metadata_max_entries: entries,
+            metadata_max_bytes: bytes,
+            counts_approximate: false,
         }
     }
     fn reset(&mut self, source: SourceFile, entries: usize, bytes: usize) {
@@ -535,6 +545,10 @@ impl State {
         let msg = &v["message"];
         let sidechain = v.get("isSidechain").and_then(Value::as_bool) == Some(true);
         if !sidechain && (kind == "user" || kind == "assistant") {
+            if !self.parent_seen {
+                self.summary.usage = None;
+                self.summary.server_tools = None;
+            }
             self.parent_seen = true;
             self.side_ledger = None;
         }
@@ -574,7 +588,7 @@ impl State {
                 );
             }
         }
-        if self.parent_seen {
+        if self.parent_seen && kind == "assistant" && !sidechain {
             self.summary.usage = self.ledger.summary(prices);
             self.summary.server_tools = self.ledger.server_tools();
         }
@@ -612,67 +626,108 @@ impl State {
         } else {
             0
         };
-        let mut rebuild_tools = false;
-        let mut new_tools = Vec::new();
-        for index in 0..block_count {
-            let key = block_key(uuid, offset, index);
-            let old_tool = self.tool_rows.remove(&key);
-            let revised =
-                uuid.is_some_and(|u| self.block_counts.contains_key(&(u.to_owned(), index)));
-            let part = parts.and_then(|p| p.get(index));
-            let row = part.and_then(|part| {
-                let typ = part.get("type").and_then(Value::as_str);
-                let (call, id) = match (kind, typ) {
-                    ("assistant", Some("tool_use")) => (true, string(part, "id")),
-                    ("user", Some("tool_result")) => (false, string(part, "tool_use_id")),
-                    _ => return None,
-                };
-                Some(ToolRow {
-                    offset,
-                    index,
-                    call,
-                    id,
-                })
-            });
-            if old_tool.is_some() || (revised && row.is_some()) {
-                rebuild_tools = true;
-            }
-            if let Some(row) = row {
-                new_tools.push(key.clone());
-                self.tool_rows.insert(key, row);
-            }
-        }
-        let old_tool_count = self.tool_count;
-        if rebuild_tools {
-            self.calls.clear();
-            let mut rows: Vec<_> = self.tool_rows.values().collect();
-            rows.sort_unstable_by_key(|row| (row.offset, row.index));
-            self.tool_count = rows.into_iter().map(|row| row.apply(&mut self.calls)).sum();
-        } else {
-            for key in &new_tools {
-                self.tool_count += self.tool_rows[key].apply(&mut self.calls);
-            }
-        }
-        self.summary.displayed_event_count =
-            self.summary.displayed_event_count - old_tool_count + self.tool_count;
-        if let Some(uuid) = uuid {
-            for index in 0..block_count {
-                let hidden = parts.and_then(|p| p.get(index)).map_or(0, |part| {
-                    match part.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "text" | "image" => 0,
-                        "thinking" | "tool_use" if kind == "assistant" => 0,
-                        "tool_result" if kind == "user" => content_text(&part["content"]).1,
-                        _ => 1,
-                    }
+        if !self.counts_approximate {
+            // Charge every observation, including revisions, conservatively.
+            // This bounds retained identity metadata and revision rebuild work.
+            let uuid_bytes = uuid.map_or(0, str::len).saturating_mul(3);
+            let required = (0..block_count).fold(0usize, |total, index| {
+                let id_bytes = parts.and_then(|p| p.get(index)).map_or(0, |part| {
+                    ["id", "tool_use_id"]
+                        .into_iter()
+                        .filter_map(|name| part.get(name).and_then(Value::as_str))
+                        .map(str::len)
+                        .max()
+                        .unwrap_or(0)
                 });
-                if let Some((displayed, old_hidden)) = self
-                    .block_counts
-                    .insert((uuid.to_owned(), index), (0, hidden))
-                {
-                    self.summary.displayed_event_count =
-                        self.summary.displayed_event_count.saturating_sub(displayed);
-                    self.summary.hidden_records =
-                        self.summary.hidden_records.saturating_sub(old_hidden);
+                total.saturating_add(
+                    256usize
+                        .saturating_add(uuid_bytes)
+                        .saturating_add(id_bytes.saturating_mul(2)),
+                )
+            });
+            if block_count
+                > self
+                    .metadata_max_entries
+                    .saturating_sub(self.metadata_entries)
+                || required > self.metadata_max_bytes.saturating_sub(self.metadata_bytes)
+            {
+                self.counts_approximate = true;
+                self.block_counts = HashMap::new();
+                self.tool_rows = HashMap::new();
+                self.calls = HashSet::new();
+                self.warning(
+                    "approximate-count",
+                    WarningKind::Unsupported,
+                    "event and hidden counts approximate: revision metadata limit exceeded",
+                );
+            } else {
+                self.metadata_entries += block_count;
+                self.metadata_bytes += required;
+            }
+        }
+        if !self.counts_approximate {
+            let mut rebuild_tools = false;
+            let mut new_tools = Vec::new();
+            for index in 0..block_count {
+                let key = block_key(uuid, offset, index);
+                let old_tool = self.tool_rows.remove(&key);
+                let revised =
+                    uuid.is_some_and(|u| self.block_counts.contains_key(&(u.to_owned(), index)));
+                let part = parts.and_then(|p| p.get(index));
+                let row = part.and_then(|part| {
+                    let typ = part.get("type").and_then(Value::as_str);
+                    let (call, id) = match (kind, typ) {
+                        ("assistant", Some("tool_use")) => (true, string(part, "id")),
+                        ("user", Some("tool_result")) => (false, string(part, "tool_use_id")),
+                        _ => return None,
+                    };
+                    Some(ToolRow {
+                        offset,
+                        index,
+                        call,
+                        id,
+                    })
+                });
+                if old_tool.is_some() || (revised && row.is_some()) {
+                    rebuild_tools = true;
+                }
+                if let Some(row) = row {
+                    new_tools.push(key.clone());
+                    self.tool_rows.insert(key, row);
+                }
+            }
+            let old_tool_count = self.tool_count;
+            if rebuild_tools {
+                self.calls.clear();
+                let mut rows: Vec<_> = self.tool_rows.values().collect();
+                rows.sort_unstable_by_key(|row| (row.offset, row.index));
+                self.tool_count = rows.into_iter().map(|row| row.apply(&mut self.calls)).sum();
+            } else {
+                for key in &new_tools {
+                    self.tool_count += self.tool_rows[key].apply(&mut self.calls);
+                }
+            }
+            self.summary.displayed_event_count =
+                self.summary.displayed_event_count - old_tool_count + self.tool_count;
+            if let Some(uuid) = uuid {
+                for index in 0..block_count {
+                    let hidden = parts.and_then(|p| p.get(index)).map_or(0, |part| {
+                        match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                            "text" | "image" => 0,
+                            "thinking" | "tool_use" if kind == "assistant" => 0,
+                            "tool_result" if kind == "user" => content_text(&part["content"]).1,
+                            _ => 1,
+                        }
+                    });
+                    if let Some((displayed, old_hidden)) = self
+                        .block_counts
+                        .insert((uuid.to_owned(), index), (0, hidden))
+                    {
+                        self.summary.displayed_event_count =
+                            self.summary.displayed_event_count.saturating_sub(displayed);
+                        self.summary.hidden_records =
+                            self.summary.hidden_records.saturating_sub(old_hidden);
+                    }
                 }
             }
         }
@@ -683,7 +738,7 @@ impl State {
                 self.summary.last_event_at =
                     Some(self.summary.last_event_at.map_or(t, |old| old.max(t)));
             }
-            if e.tool.is_some() {
+            if e.tool.is_some() && !self.counts_approximate {
                 continue;
             }
             if let Some(uuid) = uuid
