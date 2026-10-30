@@ -1,6 +1,7 @@
 //! Provider adapter contract. Adapters implement [`ProviderReader`]; the worker
 //! drives them. No provider-specific parsing lives here.
 
+pub mod claude;
 pub mod codex;
 
 use std::fmt;

@@ -1,6 +1,7 @@
 //! Synthetic fixture builders shared by integration tests.
 #![allow(dead_code)]
 
+pub mod claude;
 pub mod codex;
 
 use std::fs::{self, File};

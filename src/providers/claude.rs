@@ -1,0 +1,599 @@
+//! Claude project discovery, roster scanning and persisted content mapping.
+//! Usage aggregation and transcript paging are intentionally separate work.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use chrono::DateTime;
+use serde_json::Value;
+
+use crate::config::Config;
+use crate::discovery::SourceFile;
+pub use crate::discovery::discover_claude;
+use crate::domain::*;
+use crate::ingest::jsonl::{JsonlCursor, Record};
+use crate::ingest::text::preview;
+use crate::providers::{ProviderDelta, ProviderError};
+
+fn safe(s: &str) -> BoundedText {
+    preview(s, 2048, 2048)
+}
+fn title(s: &str) -> Option<String> {
+    let clean = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let result = preview(&clean, 1024, 80).preview;
+    (!result.trim().is_empty()).then_some(result)
+}
+fn injected(s: &str) -> bool {
+    let s = s.trim_start().to_ascii_lowercase();
+    [
+        "<environment_context",
+        "<user_instructions",
+        "<instructions",
+        "<system-reminder",
+        "<command-name",
+        "<local-command",
+        "<user_shell_command",
+        "# agents.md",
+    ]
+    .iter()
+    .any(|p| s.starts_with(p))
+}
+fn timestamp(v: &Value) -> Option<Timestamp> {
+    DateTime::parse_from_rfc3339(v.as_str()?)
+        .ok()
+        .map(|v| v.timestamp_millis())
+}
+fn string(v: &Value, key: &str) -> Option<String> {
+    v.get(key)?
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+}
+fn usage(message: &Value, provenance: &Provenance) -> Option<UsageObservation> {
+    let u = message.get("usage")?.as_object()?;
+    let get = |name: &str| u.get(name).and_then(Value::as_u64);
+    let split = u.get("cache_creation");
+    Some(UsageObservation {
+        model: string(message, "model").map(|v| safe(&v).preview),
+        scope: UsageScope::Message,
+        categories: TokenCategories {
+            input: get("input_tokens"),
+            cache_write: get("cache_creation_input_tokens"),
+            cache_read: get("cache_read_input_tokens"),
+            output: get("output_tokens"),
+            cache_write_5m: split
+                .and_then(|v| v.get("ephemeral_5m_input_tokens"))
+                .and_then(Value::as_u64),
+            cache_write_1h: split
+                .and_then(|v| v.get("ephemeral_1h_input_tokens"))
+                .and_then(Value::as_u64),
+            reasoning: u
+                .get("output_tokens_details")
+                .and_then(|v| v.get("thinking_tokens"))
+                .and_then(Value::as_u64),
+            ..Default::default()
+        },
+        provenance: provenance.clone(),
+    })
+}
+fn locator(key: &SessionKey, offset: u64) -> SourceLocator {
+    let path = match &key.source {
+        SourceKey::File(path) => path.clone(),
+        _ => PathBuf::new(),
+    };
+    SourceLocator {
+        session: key.clone(),
+        kind: LocatorKind::FileOffset { path, offset },
+    }
+}
+fn content_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|p| match p.get("type").and_then(Value::as_str) {
+                Some("text") => p.get("text").and_then(Value::as_str),
+                Some("image") => Some("[image]"),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Mapping result, with auxiliary records counted rather than displayed.
+pub struct ClaudeTranscript {
+    pub events: Vec<Event>,
+    pub hidden_records: usize,
+}
+
+/// Map records with their original JSONL byte offsets.
+pub fn map_transcript(key: &SessionKey, records: &[(u64, Value)]) -> ClaudeTranscript {
+    let indexed: Vec<_> = records
+        .iter()
+        .map(|(offset, value)| (*offset, value))
+        .collect();
+    map_indexed(key, &indexed)
+}
+
+fn map_indexed(key: &SessionKey, records: &[(u64, &Value)]) -> ClaudeTranscript {
+    let mut events: Vec<Event> = Vec::new();
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    let mut hidden = 0;
+    for (offset, record) in records {
+        let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
+        let loc = locator(key, *offset);
+        let prov = Provenance {
+            provider: Provider::Claude,
+            source: key.source.clone(),
+            locator: loc.clone(),
+            record_type: kind.into(),
+            provider_version: string(record, "version").map(|v| safe(&v).preview),
+        };
+        let ts = record.get("timestamp").and_then(timestamp);
+        let message = &record["message"];
+        let assistant_record = kind == "assistant";
+        let emit = |events: &mut Vec<Event>,
+                    index: usize,
+                    kind: EventKind,
+                    actor: Actor,
+                    body: Option<BoundedText>,
+                    tool: Option<ToolInteraction>| {
+            events.push(Event {
+                id: format!(
+                    "{}:{}:{}",
+                    record
+                        .get("uuid")
+                        .and_then(Value::as_str)
+                        .unwrap_or("record"),
+                    offset,
+                    index
+                ),
+                session: key.clone(),
+                timestamp: ts,
+                source_order: *offset,
+                kind,
+                actor,
+                text: body,
+                tool,
+                usage: if assistant_record {
+                    usage(message, &prov)
+                } else {
+                    None
+                },
+                provenance: prov.clone(),
+            });
+        };
+        if kind == "system" {
+            let body = record
+                .get("content")
+                .and_then(Value::as_str)
+                .or_else(|| record.get("subtype").and_then(Value::as_str))
+                .unwrap_or("system");
+            emit(
+                &mut events,
+                0,
+                EventKind::System,
+                Actor::System,
+                Some(safe(body)),
+                None,
+            );
+            continue;
+        }
+        if kind != "user" && kind != "assistant" {
+            hidden += 1;
+            continue;
+        }
+        let content = &message["content"];
+        let text_part;
+        let parts: &[Value] = match content {
+            Value::Array(parts) => parts,
+            Value::String(s) => {
+                text_part = serde_json::json!({"type":"text","text":s});
+                std::slice::from_ref(&text_part)
+            }
+            _ => &[],
+        };
+        for (index, part) in parts.iter().enumerate() {
+            let typ = part.get("type").and_then(Value::as_str).unwrap_or("");
+            match typ {
+                "text" => {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                    emit(
+                        &mut events,
+                        index,
+                        if kind == "user" {
+                            EventKind::UserPrompt
+                        } else {
+                            EventKind::AssistantMessage
+                        },
+                        if kind == "user" {
+                            Actor::User
+                        } else {
+                            Actor::Assistant
+                        },
+                        Some(safe(text)),
+                        None,
+                    );
+                }
+                "thinking" if kind == "assistant" => emit(
+                    &mut events,
+                    index,
+                    EventKind::Reasoning,
+                    Actor::Assistant,
+                    Some(safe(
+                        part.get("thinking").and_then(Value::as_str).unwrap_or(""),
+                    )),
+                    None,
+                ),
+                "image" => emit(
+                    &mut events,
+                    index,
+                    if kind == "user" {
+                        EventKind::UserPrompt
+                    } else {
+                        EventKind::AssistantMessage
+                    },
+                    if kind == "user" {
+                        Actor::User
+                    } else {
+                        Actor::Assistant
+                    },
+                    Some(safe("[image]")),
+                    None,
+                ),
+                "tool_use" if kind == "assistant" => {
+                    let id = string(part, "id");
+                    let tool = ToolInteraction {
+                        name: safe(part.get("name").and_then(Value::as_str).unwrap_or("tool"))
+                            .preview,
+                        call_id: id.clone(),
+                        input: part.get("input").map(|v| safe(&v.to_string())),
+                        output: None,
+                        status: ToolStatus::Pending,
+                        exit_code: None,
+                        started_at: ts,
+                        completed_at: None,
+                        orphan: false,
+                    };
+                    if let Some(id) = id {
+                        calls.insert(id, events.len());
+                    }
+                    emit(
+                        &mut events,
+                        index,
+                        EventKind::Tool,
+                        Actor::Tool,
+                        None,
+                        Some(tool),
+                    );
+                }
+                "tool_result" if kind == "user" => {
+                    let id = string(part, "tool_use_id");
+                    let output = safe(&content_text(&part["content"]));
+                    let status = if part.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        ToolStatus::Error
+                    } else {
+                        ToolStatus::Completed
+                    };
+                    if let Some(call) = id.as_ref().and_then(|id| calls.remove(id)) {
+                        let tool = events[call].tool.as_mut().expect("tool call");
+                        tool.output = Some(output);
+                        tool.status = status;
+                        tool.completed_at = ts;
+                    } else {
+                        let tool = ToolInteraction {
+                            name: "Orphan tool result".into(),
+                            call_id: id,
+                            input: None,
+                            output: Some(output),
+                            status,
+                            exit_code: None,
+                            started_at: None,
+                            completed_at: ts,
+                            orphan: true,
+                        };
+                        emit(
+                            &mut events,
+                            index,
+                            EventKind::Tool,
+                            Actor::Tool,
+                            None,
+                            Some(tool),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ClaudeTranscript {
+        events,
+        hidden_records: hidden,
+    }
+}
+
+struct State {
+    cursor: Option<JsonlCursor>,
+    summary: SessionSummary,
+    prompt: Option<String>,
+    generated: Option<String>,
+    calls: HashSet<String>,
+    dirty: bool,
+}
+impl State {
+    fn new(source: SourceFile) -> Self {
+        let id = source
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let key = SessionKey {
+            provider: Provider::Claude,
+            provider_session_id: id.clone(),
+            source: SourceKey::File(source.path.clone()),
+        };
+        let summary = SessionSummary {
+            key,
+            title: id,
+            title_derived: false,
+            project: source
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|s| safe(&s.to_string_lossy()).preview),
+            cwd: None,
+            models: vec![],
+            provider_version: None,
+            created_at: None,
+            last_event_at: None,
+            last_persisted_at: None,
+            last_completion: None,
+            unfinished_work: false,
+            displayed_event_count: 0,
+            hidden_records: 0,
+            source_available: false,
+            context_window: None,
+            server_tools: None,
+            lifecycle: Lifecycle::Unknown,
+            process: ProcessAssociation::NotChecked,
+            usage: None,
+            lineage: Lineage {
+                parent: None,
+                fork: None,
+                sidechain: false,
+            },
+            warnings: vec![],
+        };
+        Self {
+            cursor: None,
+            summary,
+            prompt: None,
+            generated: None,
+            calls: HashSet::new(),
+            dirty: true,
+        }
+    }
+    fn ingest(&mut self, offset: u64, v: &Value) {
+        if let Some(id) = string(v, "sessionId") {
+            self.summary.key.provider_session_id = id;
+        }
+        if let Some(cwd) = string(v, "cwd") {
+            let p = PathBuf::from(cwd);
+            self.summary.project = p.file_name().map(|n| safe(&n.to_string_lossy()).preview);
+            self.summary.cwd = Some(p);
+        }
+        if let Some(version) = string(v, "version") {
+            self.summary.provider_version = Some(safe(&version).preview);
+        }
+        self.summary.lineage.sidechain |=
+            v.get("isSidechain").and_then(Value::as_bool) == Some(true);
+        if let Some(t) = v.get("timestamp").and_then(timestamp) {
+            self.summary.created_at = Some(self.summary.created_at.map_or(t, |old| old.min(t)));
+            self.summary.last_persisted_at =
+                Some(self.summary.last_persisted_at.map_or(t, |old| old.max(t)));
+        }
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "ai-title" {
+            self.generated = v
+                .get("aiTitle")
+                .and_then(Value::as_str)
+                .and_then(title)
+                .or(self.generated.take());
+        }
+        let msg = &v["message"];
+        if kind == "assistant"
+            && let Some(model) = string(msg, "model").map(|s| safe(&s).preview)
+            && !self.summary.models.contains(&model)
+        {
+            self.summary.models.push(model);
+        }
+        if kind == "user"
+            && self.prompt.is_none()
+            && v.get("isMeta").and_then(Value::as_bool) != Some(true)
+        {
+            let content = &msg["content"];
+            let texts: Vec<&str> = match content {
+                Value::String(s) => vec![s],
+                Value::Array(a) => a
+                    .iter()
+                    .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect(),
+                _ => vec![],
+            };
+            self.prompt = texts.into_iter().filter(|s| !injected(s)).find_map(title);
+        }
+        let mapped = map_indexed(&self.summary.key, &[(offset, v)]);
+        self.summary.hidden_records += mapped.hidden_records;
+        for e in mapped.events {
+            if let Some(t) = e.timestamp {
+                self.summary.last_event_at =
+                    Some(self.summary.last_event_at.map_or(t, |old| old.max(t)));
+            }
+            if let Some(tool) = e.tool {
+                if tool.orphan
+                    && tool
+                        .call_id
+                        .as_ref()
+                        .is_some_and(|id| self.calls.remove(id))
+                {
+                    continue;
+                }
+                if !tool.orphan
+                    && tool.status == ToolStatus::Pending
+                    && let Some(id) = tool.call_id
+                    && self.calls.len() < 256
+                {
+                    self.calls.insert(id);
+                }
+            }
+            self.summary.displayed_event_count += 1;
+        }
+        let (name, derived) = if let Some(t) = &self.generated {
+            (t.clone(), false)
+        } else if let Some(t) = &self.prompt {
+            (t.clone(), true)
+        } else {
+            (safe(&self.summary.key.provider_session_id).preview, false)
+        };
+        self.summary.title = name;
+        self.summary.title_derived = derived;
+        self.dirty = true;
+    }
+}
+struct Pass {
+    sources: Vec<SourceFile>,
+    next: usize,
+}
+/// Incremental roster scanner; it does not retain transcript bodies or aggregate usage.
+pub struct ClaudeScanner {
+    config: Config,
+    states: HashMap<PathBuf, State>,
+    pass: Option<Pass>,
+}
+impl ClaudeScanner {
+    /// Map persisted records without paging or loading source files.
+    pub fn map_transcript(key: &SessionKey, records: &[(u64, Value)]) -> ClaudeTranscript {
+        map_transcript(key, records)
+    }
+    pub fn new(config: &Config) -> Result<Self, ProviderError> {
+        Ok(Self {
+            config: config.clone(),
+            states: HashMap::new(),
+            pass: None,
+        })
+    }
+    pub fn scan_roster(
+        &mut self,
+        _now: Timestamp,
+        budget: RefreshBudget,
+    ) -> Result<ProviderDelta, ProviderError> {
+        let mut warnings = Vec::new();
+        let mut pass = match self.pass.take() {
+            Some(p) => p,
+            None => {
+                let d = discover_claude(&self.config)?;
+                warnings = d.warnings;
+                Pass {
+                    sources: d.sources,
+                    next: 0,
+                }
+            }
+        };
+        let start = Instant::now();
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        while pass.next < pass.sources.len()
+            && count < budget.max_records
+            && bytes < budget.max_bytes
+            && start.elapsed().as_millis() < u128::from(budget.max_millis)
+        {
+            let source = pass.sources[pass.next].clone();
+            let state = self
+                .states
+                .entry(source.path.clone())
+                .or_insert_with(|| State::new(source.clone()));
+            if state.cursor.is_none() {
+                state.cursor =
+                    JsonlCursor::open(source.path.clone(), self.config.max_record_bytes).ok();
+            }
+            let Some(cursor) = state.cursor.as_mut() else {
+                state.summary.source_available = false;
+                state.dirty = true;
+                pass.next += 1;
+                continue;
+            };
+            let before = cursor.position();
+            let result = cursor.next_record();
+            let after = cursor.position();
+            bytes = bytes.saturating_add(
+                usize::try_from(after.saturating_sub(before)).unwrap_or(usize::MAX),
+            );
+            match result {
+                Ok(Some(Record::Json { offset, value })) => {
+                    state.summary.source_available = true;
+                    state.ingest(offset, &value);
+                    count += 1;
+                }
+                Ok(Some(Record::Incomplete { .. })) | Ok(None) => {
+                    state.summary.source_available = true;
+                    pass.next += 1;
+                }
+                Ok(Some(_)) => {
+                    state.summary.source_available = true;
+                    state.summary.hidden_records += 1;
+                    state.dirty = true;
+                    count += 1;
+                }
+                Err(_) => {
+                    state.summary.source_available = false;
+                    state.cursor = None;
+                    state.dirty = true;
+                    pass.next += 1;
+                }
+            }
+        }
+        let done = pass.next == pass.sources.len();
+        let mut removed = Vec::new();
+        if done {
+            let live: HashSet<_> = pass.sources.iter().map(|s| &s.path).collect();
+            self.states.retain(|p, s| {
+                let keep = live.contains(p);
+                if !keep {
+                    removed.push(s.summary.key.clone());
+                }
+                keep
+            });
+        }
+        let scan = ScanProgress {
+            provider: Provider::Claude,
+            scanned: pass.next,
+            total: Some(pass.sources.len()),
+            done,
+        };
+        if !done {
+            self.pass = Some(pass);
+        }
+        let sessions = self
+            .states
+            .values_mut()
+            .filter_map(|s| {
+                if s.dirty {
+                    s.dirty = false;
+                    Some(s.summary.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(ProviderDelta {
+            sessions,
+            removed,
+            warnings,
+            scan,
+        })
+    }
+}

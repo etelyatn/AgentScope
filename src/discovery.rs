@@ -28,10 +28,16 @@ pub struct Discovery {
     pub warnings: Vec<Warning>,
 }
 
-fn warning(source: String, kind: WarningKind, message: String, count: u32) -> Warning {
+fn warning(
+    provider: Provider,
+    source: String,
+    kind: WarningKind,
+    message: String,
+    count: u32,
+) -> Warning {
     Warning {
         key: WarningKey {
-            provider: Provider::Codex,
+            provider,
             source,
             kind,
         },
@@ -44,11 +50,18 @@ fn is_rollout(name: &str) -> bool {
     name.len() > "rollout-.jsonl".len() && name.starts_with("rollout-") && name.ends_with(".jsonl")
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<SourceFile>, warnings: &mut Vec<Warning>) {
+fn walk(
+    dir: &Path,
+    depth: usize,
+    provider: Provider,
+    out: &mut Vec<SourceFile>,
+    warnings: &mut Vec<Warning>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
             warnings.push(warning(
+                provider,
                 dir.display().to_string(),
                 WarningKind::Io,
                 format!("directory unreadable ({:?})", error.kind()),
@@ -65,9 +78,17 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<SourceFile>, warnings: &mut Vec<
         let path = entry.path();
         if kind.is_dir() {
             if depth < MAX_DEPTH {
-                walk(&path, depth + 1, out, warnings);
+                walk(&path, depth + 1, provider, out, warnings);
             }
-        } else if kind.is_file() && is_rollout(&entry.file_name().to_string_lossy()) {
+        } else if kind.is_file()
+            && match provider {
+                Provider::Codex => is_rollout(&entry.file_name().to_string_lossy()),
+                Provider::Claude => {
+                    depth > 0 && entry.file_name().to_string_lossy().ends_with(".jsonl")
+                }
+                Provider::OpenCode => false,
+            }
+        {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
@@ -86,6 +107,7 @@ pub fn discover_codex(config: &Config) -> Result<Discovery, ProviderError> {
     let mut warnings = Vec::new();
     let Some(root) = config.providers.codex.root.as_deref() else {
         warnings.push(warning(
+            Provider::Codex,
             "codex".into(),
             WarningKind::Unavailable,
             "no Codex sessions root could be determined".into(),
@@ -99,6 +121,7 @@ pub fn discover_codex(config: &Config) -> Result<Discovery, ProviderError> {
     // An explicitly configured root may itself be a link; links beneath it are never followed.
     if !fs::metadata(root).is_ok_and(|m| m.is_dir()) {
         warnings.push(warning(
+            Provider::Codex,
             root.display().to_string(),
             WarningKind::Unavailable,
             "Codex sessions root is missing or not a directory".into(),
@@ -110,7 +133,7 @@ pub fn discover_codex(config: &Config) -> Result<Discovery, ProviderError> {
         });
     }
     let mut sources = Vec::new();
-    walk(root, 0, &mut sources, &mut warnings);
+    walk(root, 0, Provider::Codex, &mut sources, &mut warnings);
     sources.sort_by(|a, b| {
         b.modified
             .cmp(&a.modified)
@@ -120,9 +143,60 @@ pub fn discover_codex(config: &Config) -> Result<Discovery, ProviderError> {
         let omitted = sources.len() - config.max_sessions;
         sources.truncate(config.max_sessions);
         warnings.push(warning(
+            Provider::Codex,
             root.display().to_string(),
             WarningKind::Unsupported,
             format!("{omitted} older Codex sessions omitted by the session cap"),
+            u32::try_from(omitted).unwrap_or(u32::MAX),
+        ));
+    }
+    Ok(Discovery { sources, warnings })
+}
+
+/// Lists Claude project JSONL sources without following links.
+pub fn discover_claude(config: &Config) -> Result<Discovery, ProviderError> {
+    let mut warnings = Vec::new();
+    let Some(root) = config.providers.claude.root.as_deref() else {
+        warnings.push(warning(
+            Provider::Claude,
+            "claude".into(),
+            WarningKind::Unavailable,
+            "no Claude projects root could be determined".into(),
+            1,
+        ));
+        return Ok(Discovery {
+            sources: Vec::new(),
+            warnings,
+        });
+    };
+    if !fs::metadata(root).is_ok_and(|m| m.is_dir()) {
+        warnings.push(warning(
+            Provider::Claude,
+            root.display().to_string(),
+            WarningKind::Unavailable,
+            "Claude projects root is missing or not a directory".into(),
+            1,
+        ));
+        return Ok(Discovery {
+            sources: Vec::new(),
+            warnings,
+        });
+    }
+    let mut sources = Vec::new();
+    walk(root, 0, Provider::Claude, &mut sources, &mut warnings);
+    sources.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    if sources.len() > config.max_sessions {
+        let omitted = sources.len() - config.max_sessions;
+        sources.truncate(config.max_sessions);
+        warnings.push(warning(
+            Provider::Claude,
+            root.display().to_string(),
+            WarningKind::Unsupported,
+            format!("{omitted} older Claude sessions omitted by the session cap"),
             u32::try_from(omitted).unwrap_or(u32::MAX),
         ));
     }
