@@ -94,7 +94,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
 ];
 
 /// Aggregates only; no extension, file, or text-producing functions.
-const ALLOWED_FUNCTIONS: &[&str] = &["count", "max", "min", "substr"];
+const ALLOWED_FUNCTIONS: &[&str] = &["count", "max", "min", "substr", "length", "coalesce"];
 
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
@@ -273,6 +273,7 @@ struct Pass {
     processed: usize,
     cap: usize,
     total: usize,
+    oversized: usize,
 }
 
 pub struct OpenCodeScanner {
@@ -380,20 +381,23 @@ impl OpenCodeScanner {
         let mut pass = match self.pass.take() {
             Some(pass) => pass,
             None => {
-                let total: i64 = conn
-                    .query_row(
-                        &format!("SELECT count(*) FROM {}", tables.session),
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(map_error)?;
-                let total = usize::try_from(total).unwrap_or(0);
+                let count = |sql: String| -> Result<usize, ProviderError> {
+                    let n: i64 = conn.query_row(&sql, [], |r| r.get(0)).map_err(map_error)?;
+                    Ok(usize::try_from(n).unwrap_or(0))
+                };
+                let all = count(format!("SELECT count(*) FROM {}", tables.session))?;
+                let total = count(format!(
+                    "SELECT count(*) FROM {} s WHERE {}",
+                    tables.session,
+                    eligible_ids(&tables)
+                ))?;
                 Pass {
                     cursor: None,
                     seen: HashSet::new(),
                     processed: 0,
                     cap: total.min(self.config.max_sessions),
                     total,
+                    oversized: all - total.min(all),
                 }
             }
         };
@@ -454,6 +458,15 @@ impl OpenCodeScanner {
                 if !keep && let Some(summary) = self.known.remove(&id) {
                     removed.push(summary.key);
                 }
+            }
+            if pass.oversized > 0 {
+                let mut w = self.warning(
+                    "oversized-id",
+                    WarningKind::Unsupported,
+                    "sessions skipped: identifier too long to key exactly",
+                );
+                w.count = u32::try_from(pass.oversized).unwrap_or(u32::MAX);
+                warnings.push(w);
             }
             if pass.total > pass.cap {
                 let mut w = self.warning(
@@ -573,7 +586,14 @@ fn model_detail(raw: &str) -> Option<ModelDetail> {
         }
         Ok(Value::String(s)) => short(&s).map(bare_model),
         Ok(_) => None,
-        Err(_) => short(raw).map(bare_model),
+        Err(_) => {
+            let t = raw.trim_start();
+            if t.starts_with(['{', '[', '"']) {
+                None
+            } else {
+                short(raw).map(bare_model)
+            }
+        }
     }
 }
 
@@ -585,12 +605,28 @@ fn bare_model(id: String) -> ModelDetail {
     }
 }
 
-/// Per-column SQL bounds so one oversized value can never be materialised whole.
-const ID_CHARS: usize = 512;
+/// Display strings are cut in SQL so one oversized value is never materialised whole.
+/// Identifiers are never cut: identity, cache keys, and keyset cursors need exact
+/// values, so sessions whose id/parent/fork exceed `ID_MAX` chars are skipped (and
+/// counted in a warning) instead of being truncated into colliding keys.
+const ID_MAX: usize = 4096;
+const MODEL_MAX: usize = 65_536;
 const TEXT_CHARS: usize = 1024;
 const PATH_CHARS: usize = 4096;
-const MODEL_CHARS: usize = 4096;
 const VERSION_CHARS: usize = 128;
+
+/// SQL predicate (alias `s`) selecting sessions with exact, bounded identifiers.
+fn eligible_ids(tables: &Tables) -> String {
+    let mut sql =
+        format!("length(s.id) <= {ID_MAX} AND coalesce(length(s.parent_id), 0) <= {ID_MAX}");
+    if tables.fork != "NULL" {
+        sql.push_str(&format!(
+            " AND coalesce(length({}), 0) <= {ID_MAX}",
+            tables.fork
+        ));
+    }
+    sql
+}
 
 fn row_bytes(row: &Row) -> usize {
     let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
@@ -632,28 +668,32 @@ fn read_page(
     let fork = if tables.fork == "NULL" {
         "NULL".to_owned()
     } else {
-        format!("substr({}, 1, {ID_CHARS})", tables.fork)
+        tables.fork.to_owned()
     };
+    // Whole JSON or nothing: a cut fragment must never be read as a model id.
     let model = if tables.model == "NULL" {
         "NULL".to_owned()
     } else {
-        format!("substr({}, 1, {MODEL_CHARS})", tables.model)
+        format!(
+            "CASE WHEN length({m}) <= {MODEL_MAX} THEN {m} END",
+            m = tables.model
+        )
     };
+    let eligible = eligible_ids(tables);
     let sql = format!(
-        "SELECT substr(s.id, 1, {ID_CHARS}), substr(s.title, 1, {TEXT_CHARS}), \
+        "SELECT s.id, substr(s.title, 1, {TEXT_CHARS}), \
             substr(s.directory, 1, {PATH_CHARS}), {project_name}, \
-            substr(s.parent_id, 1, {ID_CHARS}), \
+            s.parent_id, \
             EXISTS(SELECT 1 FROM {t} x WHERE x.id = s.parent_id), {fork}, \
-            EXISTS(SELECT 1 FROM {t} y WHERE y.id = {fork_raw}), {model}, \
+            EXISTS(SELECT 1 FROM {t} y WHERE y.id = {fork}), {model}, \
             substr(s.version, 1, {VERSION_CHARS}), \
             s.time_created, s.time_updated, s.time_archived, \
             (SELECT max(m.time_updated) FROM {m} m WHERE m.session_id = s.id) \
          FROM {t} s {project_join} \
-         WHERE s.time_updated < ?1 OR (s.time_updated = ?1 AND s.id < ?2) \
+         WHERE {eligible} AND (s.time_updated < ?1 OR (s.time_updated = ?1 AND s.id < ?2)) \
          ORDER BY s.time_updated DESC, s.id DESC LIMIT ?3",
         t = tables.session,
         m = tables.message,
-        fork_raw = tables.fork,
     );
     let (after_time, after_id) = match cursor {
         Some((time, id)) => (*time, id.as_str()),

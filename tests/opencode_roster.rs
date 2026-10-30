@@ -785,3 +785,95 @@ fn read_only_directory_with_required_sidecar_shows_unavailable() {
     }
     drop(writer);
 }
+
+#[test]
+fn long_ids_sharing_a_prefix_stay_distinct_and_page_correctly() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    let prefix = "p".repeat(1000);
+    let ids: Vec<String> = (0..4).map(|i| format!("{prefix}{i}")).collect();
+    {
+        let w = create_v2(&db);
+        // Same time_updated so the keyset cursor must order by the exact id.
+        for id in &ids {
+            insert_session(&w, &Session::new(id, 1, 50));
+        }
+        let mut child = Session::new("child", 1, 40);
+        child.parent_id = Some(&ids[2]);
+        insert_session(&w, &child);
+    }
+    let mut scanner = scanner_for(&db);
+    let one = RefreshBudget {
+        max_records: 1,
+        ..BIG
+    };
+    let mut seen = vec![];
+    loop {
+        let d = scanner.scan_roster(NOW, one).unwrap();
+        seen.extend(d.sessions.into_iter().map(|s| s.key));
+        if d.scan.done {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 5, "no collision, no skipped row");
+    let got: std::collections::HashSet<_> =
+        seen.iter().map(|k| k.provider_session_id.clone()).collect();
+    assert_eq!(got.len(), 5);
+    for id in &ids {
+        assert!(got.contains(id), "exact id preserved");
+    }
+    let out = scan(&mut scanner_for(&db), BIG);
+    match &out.sessions["child"].lineage.parent {
+        Some(SessionLink::Resolved(k)) => assert_eq!(k.provider_session_id, ids[2]),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn identifiers_too_long_to_key_exactly_are_skipped_with_a_warning() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create_v2(&db);
+        insert_session(&w, &Session::new(&"z".repeat(5000), 1, 9));
+        insert_session(&w, &Session::new("ok", 1, 8));
+    }
+    let out = scan(&mut scanner_for(&db), BIG);
+    assert_eq!(out.sessions.len(), 1);
+    assert!(out.sessions.contains_key("ok"));
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.count == 1 && w.message.contains("identifier"))
+    );
+}
+
+#[test]
+fn long_model_json_is_whole_or_unknown_never_a_fragment() {
+    let dir = tmp();
+    let db = dir.path().join("opencode.db");
+    {
+        let w = create_v2(&db);
+        // Valid JSON whose variant exceeds the old 4096-char cut.
+        let long = model_json("gpt-5", "openai", &"v".repeat(10_000));
+        let mut a = Session::new("a", 1, 3);
+        a.model = Some(&long);
+        insert_session(&w, &a);
+        // Beyond any sane size: Unknown, not a fabricated id.
+        let huge = model_json("gpt-5", "openai", &"v".repeat(200_000));
+        let mut b = Session::new("b", 1, 2);
+        b.model = Some(&huge);
+        insert_session(&w, &b);
+        // Malformed JSON is never read as a bare id.
+        let mut c = Session::new("c", 1, 1);
+        c.model = Some("{\"id\":\"cut");
+        insert_session(&w, &c);
+    }
+    let out = scan(&mut scanner_for(&db), BIG);
+    let a = &out.sessions["a"];
+    assert_eq!(a.models, vec!["gpt-5".to_string()]);
+    assert_eq!(a.model_details[0].provider.as_deref(), Some("openai"));
+    assert!(a.model_details[0].variant.as_ref().unwrap().len() <= 1024);
+    assert!(out.sessions["b"].models.is_empty());
+    assert!(out.sessions["c"].models.is_empty());
+}
