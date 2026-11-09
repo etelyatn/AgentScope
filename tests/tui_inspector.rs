@@ -2144,6 +2144,39 @@ fn header_has_three_lines_with_dash_for_missing_cost() {
 }
 
 #[test]
+fn replies_render_markdown_and_prompts_stay_as_typed() {
+    let mut app = app_with(summary(2));
+    let events = vec![
+        event(0, EventKind::UserPrompt, "Please fix **this** `bug`"),
+        event(
+            1,
+            EventKind::AssistantMessage,
+            "## Summary\n\nFixed **two** bugs in `parser.rs`:\n\n- one\n- two\n\n```\nlet x = 1;\n```",
+        ),
+    ];
+    open(&mut app, page(events, None, false));
+    let out = draw(&app, 110, 30);
+
+    assert!(
+        out.contains("Please fix **this** `bug`"),
+        "prompt is raw:\n{out}"
+    );
+    assert!(out.contains("Summary"), "{out}");
+    assert!(
+        !out.contains("## Summary"),
+        "heading marks are rendered:\n{out}"
+    );
+    // Without color, inline code keeps its backticks as the only cue.
+    assert!(out.contains("Fixed two bugs in `parser.rs`:"), "{out}");
+    assert!(out.contains("• one") && out.contains("• two"), "{out}");
+    assert!(
+        out.contains("▌ ▌   let x = 1;"),
+        "code keeps its indent:\n{out}"
+    );
+    assert!(!out.contains("```"), "fences are not shown:\n{out}");
+}
+
+#[test]
 fn renders_conversation_turns() {
     let mut app = app_with(summary(6));
     let mut tool = event(4, EventKind::Tool, "");

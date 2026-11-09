@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 chrono = { version = "0.4.45", features = ["clock"] }
 crossterm = "0.29.0"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30.2"
 regex = "1.13.1"
 rusqlite = { version = "0.41.1", features = ["bundled", "hooks"] }

@@ -5,6 +5,7 @@
 
 mod details;
 mod inspector;
+mod markdown;
 mod panels;
 mod preview;
 mod roster;

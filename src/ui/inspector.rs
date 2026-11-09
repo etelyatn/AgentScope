@@ -22,6 +22,7 @@ use crate::ingest::text::display_safe;
 use crate::time::{format_local, format_local_short, relative_label};
 
 use super::RosterContext;
+use super::markdown;
 use super::preview::status_age;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
 use super::session::{cost_fact, speed_fact, tokens_fact};
@@ -566,11 +567,17 @@ fn turn_text_lines(event: &Event, expanded: bool, prompt: bool, ctx: RowCtx) -> 
         display_safe(&t.preview).trim_end_matches('\n').to_string()
     });
     let text_width = width.min(TEXT_MAX_W).saturating_sub(prefix).max(1);
-    let wrapped = wrap_text_widths(&text, text_width, text_width);
-    let (body, cut) = if expanded {
-        capped(wrapped, MAX_DETAIL_LINES)
+    let cap = if expanded {
+        MAX_DETAIL_LINES
     } else {
-        capped(wrapped, COLLAPSED_TEXT_LINES)
+        COLLAPSED_TEXT_LINES
+    };
+    // Prompts stay as typed; replies are rendered as the Markdown agents write.
+    let (body, cut) = if prompt {
+        let (lines, cut) = capped(wrap_text_widths(&text, text_width, text_width), cap);
+        (lines.into_iter().map(Line::from).collect(), cut)
+    } else {
+        markdown::render(&text, text_width, !expanded, cap, ctx.palette)
     };
 
     let bar = || Span::styled("▌", bar_style);
@@ -595,12 +602,13 @@ fn turn_text_lines(event: &Event, expanded: bool, prompt: bool, ctx: RowCtx) -> 
     };
     let mut lines = vec![head];
     for line in body {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             marker_span(ctx.selected, false, ctx.palette),
             bar(),
             Span::raw(" "),
-            Span::raw(line),
-        ]));
+        ];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
     }
     if cut {
         lines.push(Line::from(vec![
