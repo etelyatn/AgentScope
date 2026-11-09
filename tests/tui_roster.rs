@@ -255,7 +255,10 @@ fn non_tty_exits_with_a_message_without_entering_raw_mode() {
 fn help_and_version_exit_zero_without_starting_the_tui() {
     for (flag, want) in [
         ("--help", "--codex-sessions"),
-        ("--version", "agentscope 0.1.0"),
+        (
+            "--version",
+            concat!("agentscope ", env!("CARGO_PKG_VERSION")),
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_agentscope"))
             .arg(flag)
