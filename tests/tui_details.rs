@@ -283,7 +283,14 @@ fn details_wraps_at_word_boundaries() {
             "word {word:?} was split across rows in:\n{out}"
         );
     }
-    assert!(out.contains("- alpha"), "the bullet is kept:\n{out}");
+    assert!(
+        out.contains("• alpha"),
+        "the Markdown bullet is rendered:\n{out}"
+    );
+    assert!(
+        out.lines().any(|line| line.starts_with("    papa")),
+        "the wrapped item hangs under its marker:\n{out}"
+    );
     assert!(out.contains("whiskey"), "{out}");
 }
 

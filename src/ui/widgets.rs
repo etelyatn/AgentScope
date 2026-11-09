@@ -382,6 +382,17 @@ impl Palette {
         self.colored(Color::Yellow).add_modifier(Modifier::BOLD)
     }
 
+    /// Inline code and code blocks in rendered Markdown. Without color, inline
+    /// code keeps its backticks instead.
+    pub fn code(&self) -> Style {
+        self.colored(Color::Yellow)
+    }
+
+    /// Markdown headings: bold, so they read as headings without color.
+    pub fn heading(&self) -> Style {
+        self.colored(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
+
     pub fn title(&self) -> Style {
         Style::default().add_modifier(Modifier::BOLD)
     }

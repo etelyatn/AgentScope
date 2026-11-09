@@ -50,6 +50,8 @@ The roster loads the newest **50 top-level groups** at a time; children, forks, 
 
 The inspector opens at the newest event with follow mode on: a three-line header, then conversation rows with `▌ You`/`▌ Agent`, tool rows (`✓` completed, `✗` error, `…` pending, `?` unknown), persisted reasoning summaries and folded auxiliary calls. `Enter` expands a row in place with recorded argument, output and reasoning previews ending `recorded preview · v opens the source`; while following, appended events move to and expand the latest row. `o` opens a resolved child's transcript and `Esc` pops back.
 
+Agent replies are rendered as Markdown in the inspector and in details: headings, emphasis, inline code and code blocks, lists and task lists, quotes, tables, rules, and links with their target shown after the text. Raw HTML is shown literally, never interpreted, and the text is sanitized and redacted before rendering. Prompts, reasoning and tool output stay as recorded, and `v` always shows the unrendered source record. With `NO_COLOR`, inline code keeps its backticks.
+
 `d` opens event details: a badge header with time, relative age and `event N of M loaded`, `[`/`]` for the previous/next loaded event, and content beside `USAGE`/`COST`/`SOURCE` at 110 columns (stacked below). `i` opens session info: the same header and `TOKENS`, `COST`, `TIME & SPEED`, `CONTEXT`, `FAMILY` and `PROCESS` panels in two columns at 90 columns (stacked below), with `m` for older compactions and `Space` for summaries.
 
 ## Keys

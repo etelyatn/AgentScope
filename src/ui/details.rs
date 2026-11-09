@@ -19,6 +19,7 @@ use crate::time::{format_local, relative_label};
 
 use super::RosterContext;
 use super::inspector::{REASONING_LABEL, money_text};
+use super::markdown;
 use super::roster::{MIN_HEIGHT, MIN_WIDTH};
 use super::widgets::{Palette, SHELL_TOOLS, fit, tokens_text};
 
@@ -167,8 +168,12 @@ fn age_text(app: &App, ts: Option<Timestamp>) -> String {
     )
 }
 
-/// One styled row of the details body: plain text plus its style.
-type Row = (String, Style);
+/// One styled row of the details body, already wrapped to the body width.
+type Row = Line<'static>;
+
+fn row(text: impl Into<String>, style: Style) -> Row {
+    Line::styled(text.into(), style)
+}
 
 fn styled_row(parts: Vec<(String, Style)>, width: usize) -> Line<'static> {
     let mut spans = Vec::new();
@@ -302,7 +307,7 @@ fn push_wrapped(rows: &mut Vec<Row>, text: &str, width: usize, style: Style) -> 
         for word in body.split_whitespace() {
             let word_w = word.width();
             if used > 0 && used + 1 + word_w > wrap {
-                rows.push((line, style));
+                rows.push(row(line, style));
                 if rows.len() >= MAX_ROWS {
                     return true;
                 }
@@ -311,7 +316,7 @@ fn push_wrapped(rows: &mut Vec<Row>, text: &str, width: usize, style: Style) -> 
             }
             if word_w > wrap {
                 if used > 0 {
-                    rows.push((line, style));
+                    rows.push(row(line, style));
                     if rows.len() >= MAX_ROWS {
                         return true;
                     }
@@ -321,7 +326,7 @@ fn push_wrapped(rows: &mut Vec<Row>, text: &str, width: usize, style: Style) -> 
                 for ch in word.chars() {
                     let ch_w = ch.width().unwrap_or(0);
                     if used + ch_w > wrap && used > 0 {
-                        rows.push((line, style));
+                        rows.push(row(line, style));
                         if rows.len() >= MAX_ROWS {
                             return true;
                         }
@@ -340,16 +345,16 @@ fn push_wrapped(rows: &mut Vec<Row>, text: &str, width: usize, style: Style) -> 
             line.push_str(word);
             used += word_w;
         }
-        rows.push((line, style));
+        rows.push(row(line, style));
     }
     rows.len() >= MAX_ROWS
 }
 
 fn push_section(rows: &mut Vec<Row>, label: &str, palette: Palette) {
     if !rows.is_empty() {
-        rows.push((String::new(), Style::default()));
+        rows.push(row(String::new(), Style::default()));
     }
-    rows.push((label.to_string(), palette.section()));
+    rows.push(row(label.to_string(), palette.section()));
 }
 
 fn push_bounded(
@@ -362,6 +367,35 @@ fn push_bounded(
         return push_wrapped(rows, "not recorded", width, palette.quiet());
     };
     let mut capped = push_wrapped(rows, &display_safe(&text.preview), width, Style::default());
+    capped |= push_truncation_note(rows, text, capped, width, palette);
+    capped
+}
+
+/// A reply's recorded text rendered as Markdown, within the row cap.
+fn push_markdown(
+    rows: &mut Vec<Row>,
+    text: Option<&BoundedText>,
+    width: usize,
+    palette: Palette,
+) -> bool {
+    let Some(text) = text else {
+        return push_wrapped(rows, "not recorded", width, palette.quiet());
+    };
+    let room = MAX_ROWS.saturating_sub(rows.len());
+    let (lines, cut) = markdown::render(&display_safe(&text.preview), width, false, room, palette);
+    rows.extend(lines);
+    let capped = cut || rows.len() >= MAX_ROWS;
+    capped | push_truncation_note(rows, text, capped, width, palette)
+}
+
+fn push_truncation_note(
+    rows: &mut Vec<Row>,
+    text: &BoundedText,
+    capped: bool,
+    width: usize,
+    palette: Palette,
+) -> bool {
+    let mut capped = capped;
     if text.truncated && !capped {
         let note = format!(
             "[truncated: showing {} of {} bytes]",
@@ -409,7 +443,7 @@ fn tool_rows(
     palette: Palette,
 ) -> bool {
     let mut capped = false;
-    rows.push((tool_meta(tool), palette.quiet()));
+    rows.push(row(tool_meta(tool), palette.quiet()));
     let shell = SHELL_TOOLS
         .iter()
         .any(|name| tool.name.eq_ignore_ascii_case(name));
@@ -436,8 +470,8 @@ fn tool_rows(
             .is_some_and(|raw| raw.trim() != summary.trim())
     {
         if !summary.is_empty() {
-            rows.push((String::new(), Style::default()));
-            rows.push(("recorded arguments".into(), palette.quiet()));
+            rows.push(row(String::new(), Style::default()));
+            rows.push(row("recorded arguments", palette.quiet()));
         }
         capped |= push_bounded(rows, tool.input.as_ref(), width, palette);
     }
@@ -445,10 +479,10 @@ fn tool_rows(
     push_section(rows, "output (recorded preview)", palette);
     match (&tool.output, tool.status) {
         (None, ToolStatus::Pending) => {
-            rows.push(("pending (no result yet)".into(), palette.quiet()));
+            rows.push(row("pending (no result yet)", palette.quiet()));
         }
         (None, _) => {
-            rows.push(("not recorded".into(), palette.quiet()));
+            rows.push(row("not recorded", palette.quiet()));
         }
         (Some(_), _) => capped |= push_bounded(rows, tool.output.as_ref(), width, palette),
     }
@@ -486,7 +520,11 @@ fn text_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette)
         EventKind::Lifecycle | EventKind::Tool => "event (recorded preview)",
     };
     push_section(rows, label, palette);
-    push_bounded(rows, event.text.as_ref(), width, palette)
+    if event.kind == EventKind::AssistantMessage {
+        push_markdown(rows, event.text.as_ref(), width, palette)
+    } else {
+        push_bounded(rows, event.text.as_ref(), width, palette)
+    }
 }
 
 fn content_rows(
@@ -501,8 +539,8 @@ fn content_rows(
         None => text_rows(&mut rows, event, width, palette),
     };
     if capped {
-        rows.push((
-            "[display limited: more content exists in the source record (v)]".into(),
+        rows.push(row(
+            "[display limited: more content exists in the source record (v)]",
             palette.quiet(),
         ));
     }
@@ -550,12 +588,12 @@ fn usage_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette
         || "USAGE".to_string(),
         |usage| format!("USAGE ({})", scope_name(usage.scope)),
     );
-    rows.push((label, palette.section()));
+    rows.push(row(label, palette.section()));
     let Some(usage) = usage else {
         push_wrapped(rows, "not recorded", width, palette.quiet());
         return;
     };
-    rows.push((
+    rows.push(row(
         usage.categories.total.map_or_else(
             || "total not recorded".to_string(),
             |total| {
@@ -591,7 +629,7 @@ fn usage_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette
     for (label, value) in categories {
         if let Some(value) = value {
             recorded = true;
-            rows.push((category_line(label, value, max), Style::default()));
+            rows.push(row(category_line(label, value, max), Style::default()));
         }
     }
     if !recorded {
@@ -600,7 +638,7 @@ fn usage_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette
 }
 
 fn cost_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette) {
-    rows.push(("COST".to_string(), palette.section()));
+    rows.push(row("COST".to_string(), palette.section()));
     let Some(usage) = event.usage.as_ref() else {
         push_wrapped(rows, "not recorded", width, palette.quiet());
         return;
@@ -608,21 +646,24 @@ fn cost_rows(rows: &mut Vec<Row>, event: &Event, width: usize, palette: Palette)
     let money = &usage.money;
     let mut recorded = false;
     if let Some(fact) = &money.reported_api {
-        rows.push((
+        rows.push(row(
             format!("{} reported", money_text(fact.usd)),
             palette.value(),
         ));
         recorded = true;
     }
     if let Some(fact) = &money.saved_estimate {
-        rows.push((
+        rows.push(row(
             format!("~{} saved estimate", money_text(fact.usd)),
             palette.value(),
         ));
         recorded = true;
     }
     if let Some(usd) = money.unverified_usd {
-        rows.push((format!("{} unverified", money_text(usd)), palette.quiet()));
+        rows.push(row(
+            format!("{} unverified", money_text(usd)),
+            palette.quiet(),
+        ));
         recorded = true;
     }
     if !recorded {
@@ -651,7 +692,7 @@ fn locator_kind_text(locator: &SourceLocator) -> String {
 }
 
 fn source_rows(rows: &mut Vec<Row>, event: &Event, app: &App, width: usize, palette: Palette) {
-    rows.push(("SOURCE".to_string(), palette.section()));
+    rows.push(row("SOURCE".to_string(), palette.section()));
     push_wrapped(
         rows,
         &display_safe(&event.provenance.record_type),
@@ -683,9 +724,9 @@ fn source_rows(rows: &mut Vec<Row>, event: &Event, app: &App, width: usize, pale
 fn side_rows(event: &Event, app: &App, width: usize, palette: Palette) -> Vec<Row> {
     let mut rows = Vec::new();
     usage_rows(&mut rows, event, width, palette);
-    rows.push((String::new(), Style::default()));
+    rows.push(row(String::new(), Style::default()));
     cost_rows(&mut rows, event, width, palette);
-    rows.push((String::new(), Style::default()));
+    rows.push(row(String::new(), Style::default()));
     source_rows(&mut rows, event, app, width, palette);
     rows
 }
@@ -714,16 +755,17 @@ fn status_text(app: &App, event: &Event, selected: usize, total: usize) -> Strin
 }
 
 /// One body row with the content margin applied and padded to `width`.
-fn margin_line(text: &str, style: Style, width: usize, margin: usize) -> Line<'static> {
-    let text = fit(text, width.saturating_sub(margin));
-    if margin == 0 {
-        Line::styled(text, style)
-    } else {
-        Line::from(vec![
-            Span::raw(" ".repeat(margin)),
-            Span::styled(text, style),
-        ])
+fn margin_line(row: &Row, width: usize, margin: usize) -> Line<'static> {
+    let parts = row
+        .spans
+        .iter()
+        .map(|span| (span.content.to_string(), row.style.patch(span.style)))
+        .collect();
+    let mut line = styled_row(parts, width.saturating_sub(margin));
+    if margin > 0 {
+        line.spans.insert(0, Span::raw(" ".repeat(margin)));
     }
+    line
 }
 
 /// Draw the visible slice of styled rows without touching the scroll extent.
@@ -735,7 +777,7 @@ fn draw_styled_at(frame: &mut Frame, rows: &[Row], scroll: usize, body: Rect, ma
         .iter()
         .skip(start)
         .take(height)
-        .map(|(text, style)| margin_line(text, *style, body.width as usize, margin))
+        .map(|row| margin_line(row, body.width as usize, margin))
         .collect();
     frame.render_widget(Paragraph::new(shown), body);
 }
@@ -805,12 +847,12 @@ pub fn render_details(frame: &mut Frame, app: &App, ctx: &RosterContext) {
             .iter()
             .skip(side_scroll)
             .take(f.body.height as usize)
-            .map(|(text, style)| margin_line(text, *style, SIDE_WIDTH, 0))
+            .map(|row| margin_line(row, SIDE_WIDTH, 0))
             .collect();
         frame.render_widget(Paragraph::new(shown), right);
     } else {
         let mut rows = content;
-        rows.push((String::new(), Style::default()));
+        rows.push(row(String::new(), Style::default()));
         rows.extend(side_rows(event, app, f.width - CONTENT_MARGIN, palette));
         draw_styled(
             frame,
@@ -854,9 +896,9 @@ pub fn render_source(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         REDACTED_NOTICE.to_string()
     };
     match &view.state {
-        SourceState::Loading => rows.push(("Loading source record…".into(), palette.quiet())),
-        SourceState::Failed => rows.push((
-            "The source record could not be loaded.".into(),
+        SourceState::Loading => rows.push(row("Loading source record…", palette.quiet())),
+        SourceState::Failed => rows.push(row(
+            "The source record could not be loaded.",
             palette.warning(),
         )),
         SourceState::Unavailable(reason) => {
@@ -874,7 +916,7 @@ pub fn render_source(frame: &mut Frame, app: &App, ctx: &RosterContext) {
             if wrap_into(&mut wrapped, text, f.width) || *truncated {
                 note = format!("{note}  [record truncated for display]");
             }
-            rows.extend(wrapped.into_iter().map(|line| (line, Style::default())));
+            rows.extend(wrapped.into_iter().map(|line| row(line, Style::default())));
         }
     }
     draw_styled(frame, app, &rows, view.scroll, f.body, 0);
@@ -937,7 +979,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     let row = app.session(transcript.key());
     let mut head: Vec<Row> = Vec::new();
     push_section(&mut head, "OVERVIEW", f.palette);
-    head.push((
+    head.push(Line::styled(
         format!(
             "Hidden records: {}",
             row.as_ref().map_or_else(
@@ -947,7 +989,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         ),
         Style::default(),
     ));
-    head.push((
+    head.push(Line::styled(
         format!(
             "Source available: {}",
             row.as_ref().map_or_else(
@@ -961,7 +1003,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
         ),
         Style::default(),
     ));
-    head.push((
+    head.push(Line::styled(
         format!("Entries listed: {}", entries.len()),
         Style::default(),
     ));
@@ -969,14 +1011,14 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     match row.as_ref() {
         Some(row) if !row.session.warnings.is_empty() => {
             for w in row.session.warnings.iter().take(MAX_WARNINGS) {
-                head.push((
+                head.push(Line::styled(
                     format!("Warning ×{}: {}", w.count, display_safe(&w.message)),
                     f.palette.warning(),
                 ));
             }
         }
-        Some(_) => head.push(("— none".into(), f.palette.quiet())),
-        None => head.push(("—".into(), f.palette.quiet())),
+        Some(_) => head.push(Line::styled("— none", f.palette.quiet())),
+        None => head.push(Line::styled("—", f.palette.quiet())),
     }
     push_section(&mut head, "RECORDS", f.palette);
 
@@ -984,7 +1026,7 @@ pub fn render_diagnostics(frame: &mut Frame, app: &App, ctx: &RosterContext) {
     let mut lines: Vec<Line<'static>> = head
         .iter()
         .take(height)
-        .map(|(text, style)| margin_line(text, *style, f.width, 0))
+        .map(|row| margin_line(row, f.width, 0))
         .collect();
     let room = height.saturating_sub(lines.len());
     if entries.is_empty() {
